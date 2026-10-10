@@ -1,0 +1,17 @@
+{
+  "name": "vibe-agent-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本地化 Vibe Coding Agent 的桌面客户端（薄壳：起后端 + 开窗口 + 管进程）",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "electron": "^44.4.5"
+  }
+}

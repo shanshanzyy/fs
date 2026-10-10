@@ -1,0 +1,35 @@
+# Agent 运行时产物
+.vibe/
+
+# 治理面运行时数据：内含 JWT 签名私钥 jwt.key —— 绝不入库
+.vibe-governance/
+.tmp-check/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.tmp-*/
+*.log
+
+# Node / Electron（桌面壳只有 electron 一个依赖，但体积近 400MB）
+node_modules/
+out/
+
+# 编辑器 / 本地助手
+.idea/
+.vscode/
+.trae/
+.workbuddy/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db

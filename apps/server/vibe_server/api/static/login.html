@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- 不引用任何外部资源：登录页自带 CSP（default-src 'self'），
+       外链会被浏览器拦掉，写了也是白写。 -->
+  <title>登录 · Vibe 治理面</title>
+  <style>
+    :root {
+      --bg: #0d1117; --panel: #161b22; --raise: #21262d;
+      --fg: #e6edf3; --fg-dim: #8b949e; --accent: #2f81f7;
+      --danger: #f85149; --ok: #3fb950; --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: var(--bg); color: var(--fg);
+      font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    .card {
+      width: 360px; max-width: calc(100vw - 32px); padding: 28px 26px;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    }
+    h1 { margin: 0 0 4px; font-size: 18px; }
+    .sub { margin: 0 0 22px; color: var(--fg-dim); font-size: 12.5px; }
+    label { display: block; margin: 0 0 6px; color: var(--fg-dim); font-size: 12.5px; }
+    input {
+      width: 100%; padding: 9px 11px; margin: 0 0 16px;
+      background: var(--bg); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; font-size: 14px;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    button {
+      width: 100%; padding: 10px; border: 0; border-radius: 6px;
+      background: var(--accent); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    button:disabled { opacity: .55; cursor: default; }
+    button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+    .divider { display: flex; align-items: center; gap: 10px; margin: 18px 0; color: var(--fg-dim); font-size: 12px; }
+    .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+    .msg { min-height: 18px; margin: 14px 0 0; font-size: 12.5px; }
+    .msg.error { color: var(--danger); }
+    .msg.ok { color: var(--ok); }
+    .ok-panel { text-align: center; }
+    .ok-panel .sub { margin-bottom: 0; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div id="login-view">
+      <h1>登录治理面</h1>
+      <p class="sub">用组织账号登录，登录后治理策略与配额才会生效。</p>
+
+      <form id="login-form" autocomplete="on">
+        <label for="email">邮箱</label>
+        <input id="email" name="email" type="email" autocomplete="username" required>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button id="submit" type="submit">登录</button>
+      </form>
+
+      <div class="divider">或</div>
+      <button id="sso" type="button" class="secondary">用 SSO 登录</button>
+
+      <p id="msg" class="msg" role="status" aria-live="polite"></p>
+    </div>
+
+    <div id="ok-view" class="ok-panel" hidden>
+      <h1>登录成功</h1>
+      <p class="sub" id="ok-sub">凭据已保存到本浏览器会话（sessionStorage）。</p>
+    </div>
+  </main>
+
+  <!-- 登录逻辑放在同源脚本里，页面本身不含任何业务判断 -->
+  <script src="/assets/login.js"></script>
+</body>
+</html>

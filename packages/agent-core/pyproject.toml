@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibe-agent-core"
+version = "0.1.0"
+description = "本地化 Vibe Coding Agent 的核心引擎（核心链路零强制依赖）"
+readme = "README.md"
+requires-python = ">=3.10"
+# 核心链路零强制依赖：仅用标准库实现 HTTP / 分词估算 / patch 应用 / 符号抽取，
+# 保证在内网、离线、无 pip 源的环境下也能直接跑起来。
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# build：仅打包分发时才需要（scripts/build_desktop.py）。运行期不需要它。
+build = ["pyinstaller>=6"]
+# precise：可选的精准符号解析（repo_map 的 tree-sitter 后端）。
+# 装了它 repo_map 能给出函数签名/继承/import；不装则自动回退内置正则，功能不失效。
+# 注意：tree-sitter-languages 已停止维护且与 tree-sitter 0.26 不兼容，不要回退到它；
+# 无语法包环境会自动降级，因此这里只列维护中的 language-pack。
+precise = ["tree-sitter>=0.26", "tree-sitter-language-pack"]
+
+[project.scripts]
+vibe-agent = "agent_core.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

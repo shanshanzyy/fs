@@ -1,0 +1,85 @@
+name: CI
+
+# 门禁：任何一步失败即整体变红。三条独立跑道互不阻塞（fail-fast 关），
+# 便于一眼看出是「内核」「服务端」还是「桌面壳」坏了。
+on:
+  push:
+  pull_request:
+
+# 只用得到仓库读权限 —— 最小权限原则，CI 不需要写回任何东西。
+permissions:
+  contents: read
+
+# 同一个分支连推多次时，取消上一次未跑完的，省机器也省等待。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 核心引擎：显式支持 3.10+，所以在两端都跑（见 packages/agent-core/pyproject.toml）。
+  agent-core:
+    name: agent-core (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装测试依赖
+        run: python -m pip install --upgrade pip pytest
+      # 核心链路零强制依赖：这里只装 pytest，不装任何运行期依赖 ——
+      # 顺带证明「不装第三方包也能跑起来」这条承诺没被破坏。
+      - name: 跑内核测试
+        working-directory: packages/agent-core
+        run: python -m pytest tests -q
+
+  # 治理面：同样零第三方依赖，与内核等价的一条跑道。
+  server:
+    name: server (py3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 安装测试依赖
+        run: python -m pip install --upgrade pip pytest
+      - name: 跑服务端测试
+        working-directory: apps/server
+        run: python -m pytest tests -q
+
+  # 桌面壳：Node 侧没有测试套件，门禁做两件事 ——
+  # 1) npm ci 验证 lockfile 与 package.json 一致（依赖漂移拦截）；
+  # 2) 全量语法检查。host UI 是浏览器原生 ESM，`node --check` 需 .mjs 后缀，
+  #    故先复制再查（--check 只解析语法，不解析 import 路径）。
+  desktop:
+    name: desktop (node20)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: 安装桌面壳依赖
+        working-directory: apps/desktop
+        run: npm ci
+      - name: 语法检查（主进程 + preload）
+        working-directory: apps/desktop
+        run: |
+          for f in src/*.js; do
+            node --check "$f"
+          done
+      - name: 语法检查（host UI，ESM）
+        run: |
+          mkdir -p /tmp/esmcheck
+          for f in packages/agent-core/agent_core/host/ui/*.js; do
+            base="$(basename "$f" .js)"
+            cp "$f" "/tmp/esmcheck/$base.mjs"
+            node --check "/tmp/esmcheck/$base.mjs"
+          done

@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vibe Coding Agent</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚡</text></svg>">
+</head>
+<body data-mode="ide">
+
+<!-- ═══════════════════ 标题栏 ═══════════════════ -->
+<header class="titlebar">
+  <div class="tb-left">
+    <span class="brand-mark">⚡</span>
+    <span class="brand-name">Vibe Coding</span>
+    <button type="button" class="tb-workspace" id="tb-workspace" title="工作区 —— 点击打开其他文件夹作为工作区">—</button>
+    <!-- 布局模式：IDE=左树/中编辑器/右对话；SOLO=左对话为主/右窄树（选择记在本地） -->
+    <div class="mode-switch" id="mode-switch" role="group" aria-label="布局模式">
+      <button class="mode-btn is-active" data-mode="ide" title="IDE 布局：左侧文件树 · 中间编辑器 · 右侧对话">IDE</button>
+      <button class="mode-btn" data-mode="solo" title="SOLO 布局：对话占主区 · 编辑器居中夹出 · 文件树收在右端">SOLO</button>
+    </div>
+  </div>
+  <div class="tb-center" id="tb-chips">
+    <span class="chip" id="chip-vibe" hidden title="已加载项目规则文件 VIBE.md，Agent 会遵守其中的团队约定">VIBE</span>
+  </div>
+  <div class="tb-right">
+    <span class="chip chip-clickable" id="chip-model" role="button" tabindex="0" title="点击配置模型">—</span>
+    <span class="chip chip-gov" id="chip-gov" hidden title="治理面状态">治理面</span>
+    <span class="chip chip-state" id="chip-state" data-state="idle">空闲</span>
+    <!-- 命令面板入口（P2-13）：让鼠标用户也能发现 Ctrl/Cmd+Shift+P -->
+    <button class="tbtn" id="btn-palette" title="命令面板（Ctrl/Cmd+Shift+P）">⌘K</button>
+    <button class="tbtn" id="btn-interrupt" disabled title="中断当前任务（在当前步骤结束后生效）">■ 中断</button>
+    <button class="tbtn" id="btn-rollback" title="把工作区回滚到某轮改动开始前（回滚本身可撤销）">⟲ 回滚</button>
+    <button class="tbtn" id="btn-reset" title="清空对话历史（审计日志不受影响）">＋ 新会话</button>
+  </div>
+</header>
+
+<div class="workbench">
+
+  <!-- ═══════════════════ 活动栏 ═══════════════════ -->
+  <nav class="activitybar">
+    <button class="act is-active" data-panel="explorer" title="资源管理器（Ctrl+1）">
+      <svg viewBox="0 0 16 16"><path d="M2 2h5l1.2 2H14v10H2V2zm1 2v8h10V5H7.6L6.4 3H3z" fill="currentColor"/></svg>
+      <em id="act-badge-files" hidden></em>
+    </button>
+    <button class="act" data-panel="changes" title="改动（Ctrl+2）">
+      <svg viewBox="0 0 16 16"><path d="M3 2h7l3 3v9H3V2zm2 4h6v1H5V6zm0 3h6v1H5V9zm0 3h4v1H5v-1z" fill="currentColor"/></svg>
+      <em class="act-badge" id="act-badge-changes" hidden>0</em>
+    </button>
+    <button class="act" data-panel="tools" title="工具箱（Ctrl+3）">
+      <svg viewBox="0 0 16 16"><path d="M9.5 2 14 6.5 8.5 12l-2 2L2 9.5l2-2L9.5 2zM4.7 8.2 3.4 9.5l3.1 3.1 1.3-1.3-3.1-3.1zM7 6l3 3 2.6-2.6-3-3L7 6z" fill="currentColor"/></svg>
+    </button>
+    <button class="act" data-panel="audit" title="审计（Ctrl+4）">
+      <svg viewBox="0 0 16 16"><path d="M8 1l6 2.5v4c0 3.5-2.5 6.5-6 7.5-3.5-1-6-4-6-7.5v-4L8 1zm0 1.6L3 4.7v2.8c0 2.8 2 5.3 5 6.2 3-.9 5-3.4 5-6.2V4.7L8 2.6zM7 8.6l3.5-3.5.9.9L7 10.4 4.9 8.3l.9-.9L7 8.6z" fill="currentColor"/></svg>
+    </button>
+    <button class="act" data-panel="history" title="历史会话（Ctrl+5）">
+      <svg viewBox="0 0 16 16"><path d="M8 2a6 6 0 1 1-5.7 7.8l1.4-.4A4.5 4.5 0 1 0 8 3.5c-1.4 0-2.7.7-3.6 1.7L6 7H2V3l1.7 1.7A6 6 0 0 1 8 2zm-.7 3h1.2v3.2l2.3 2.3-.9.9L7.3 8.8V5z" fill="currentColor"/></svg>
+    </button>
+    <button class="act" data-panel="git" title="Git（Ctrl+6）">
+      <svg viewBox="0 0 16 16"><path d="M7 1.5 9.5 4 8.2 5.3 6.9 4 4.4 6.5 2 4.1 3.3 2.8 4.4 3.9 6.9 1.4 7 1.5zM4.4 9.5 6.9 12l1.3-1.3 1.3 1.3L7.3 14.5 4.4 11.6l-1.1 1.1L2 11.4 4.4 9zM9.5 6.5 12 4l1.1 1.1-1.1 1.1 2.4 2.4-1.3 1.3L10.7 7.5 9.5 6.5zM8 5.6a2.4 2.4 0 1 1 0 4.8 2.4 2.4 0 0 1 0-4.8z" fill="currentColor"/></svg>
+    </button>
+    <button class="act" data-panel="tests" title="测试（Ctrl+7）">
+      <svg viewBox="0 0 16 16"><path d="M6.5 1.5h3v1h-.75v2.9l3.44 6.02A1.25 1.25 0 0 1 11.1 13.5H4.9a1.25 1.25 0 0 1-1.09-1.88L7.25 5.4V2.5H6.5v-1zM6 11.5h4l-.4-.7H6.4L6 11.5z" fill="currentColor"/></svg>
+      <em class="act-badge" id="act-badge-tests" hidden>0</em>
+    </button>
+    <button class="act" data-panel="memory" title="记忆（Ctrl+8）">
+      <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 0 1 7 7 7 7 0 0 1-7 7 7 7 0 0 1-2.1-.32l-3.4 1.13 1.1-3.2A7 7 0 0 1 1 8a7 7 0 0 1 7-7zm0 1.5A5.5 5.5 0 0 0 2.5 8c0 1 .27 1.94.74 2.75l.28.48-.7 2.05 2.12-.7.5.28A5.5 5.5 0 1 0 8 2.5zM6 6.5h4v1H6v-1zm0 2.5h3v1H6v-1z" fill="currentColor"/></svg>
+      <em class="act-badge" id="act-badge-memory" hidden>0</em>
+    </button>
+    <span class="act-spring"></span>
+    <button class="act" data-panel="welcome" title="开始（欢迎页）">
+      <svg viewBox="0 0 16 16"><path d="M8 1.5 15 8l-7 6.5L1 8l7-6.5zM8 3.6 3.1 8 8 12.4 12.9 8 8 3.6zM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4z" fill="currentColor"/></svg>
+    </button>
+  </nav>
+
+  <!-- ═══════════════════ 侧边面板 ═══════════════════ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-head"><span id="sb-title">资源管理器</span>
+      <button class="icon-btn" id="btn-tree-refresh" title="刷新">⟳</button>
+    </div>
+
+    <section class="sb-body" data-body="explorer">
+      <div class="sb-caption">工作区</div>
+      <div class="tree" id="tree"><div class="empty">加载中…</div></div>
+    </section>
+
+    <section class="sb-body" data-body="changes" hidden>
+      <!-- 两种口径必须能分开看：「本会话」是 Agent 的账本（可回滚），
+           「相对 Git」含你自己在编辑器/终端里的改动 —— 合成一个列表会让人误判谁改的 -->
+      <div class="mode-switch" id="changes-mode" role="group" aria-label="改动视图">
+        <button class="mode-btn is-active" data-cmode="session" title="只看本次会话里 Agent 改过的文件（对应 /api/diffs）">本会话</button>
+        <button class="mode-btn" data-cmode="git" title="相对 git 的改动，含你在编辑器/终端里的改动与未跟踪文件">相对 Git</button>
+      </div>
+      <div class="sb-caption"><span id="changes-caption">本次会话的改动</span> <span class="badge" id="badge-changes">0</span></div>
+      <div id="changes-list"><div class="empty">加载中…</div></div>
+    </section>
+
+    <section class="sb-body" data-body="git" hidden>
+      <div class="sb-caption">仓库状态</div>
+      <div class="git-head" id="git-head"><div class="empty">加载中…</div></div>
+      <div class="git-actions">
+        <button class="btn btn-small" id="btn-commit-msg" title="让模型根据当前改动起草一条提交信息；只生成文本，不会替你提交">生成提交信息</button>
+        <button class="btn btn-small" id="btn-git-refresh" title="刷新仓库状态">刷新</button>
+      </div>
+      <!-- 生成结果默认收起：不生成时不占位置 -->
+      <div id="git-msg" hidden>
+        <div class="sb-caption">提交信息 <button class="icon-btn" id="btn-copy-msg" title="复制到剪贴板">⧉</button></div>
+        <pre class="git-msg-text" id="git-msg-text"></pre>
+      </div>
+      <div class="sb-caption">改动 <span class="badge" id="badge-git">0</span></div>
+      <div id="git-list"><div class="empty">加载中…</div></div>
+    </section>
+
+    <section class="sb-body" data-body="tools" hidden>
+      <div class="sb-caption">Agent 可用的工具与风险分级</div>
+      <div id="tools-list"><div class="empty">加载中…</div></div>
+    </section>
+
+    <section class="sb-body" data-body="audit" hidden>
+      <div class="sb-caption">审计链</div>
+      <div id="audit-view"><div class="empty">点击时校验并加载。</div></div>
+    </section>
+
+    <section class="sb-body" data-body="history" hidden>
+      <div class="sb-caption">历史会话</div>
+      <div id="history-list"><div class="empty">加载中…</div></div>
+    </section>
+
+    <!-- 测试树（K/P2-14）：命令来自用户配置，界面只做收集 / 触发 / 渲染结果。
+         用例级点跑；失败项点击开编辑器并定位到失败行。 -->
+    <section class="sb-body" data-body="tests" hidden>
+      <div class="tests-actions">
+        <button class="btn btn-small" id="btn-tests-run-all" title="把收集到的全部用例跑一遍">跑全部</button>
+        <button class="btn btn-small" id="btn-tests-run-failed" title="只重跑上一次失败 / 出错的用例">只跑失败</button>
+        <button class="btn btn-small" id="btn-tests-refresh" title="重新收集用例（会起一次 pytest --collect-only）">刷新</button>
+      </div>
+      <div class="tests-summary" id="tests-summary"></div>
+      <div class="tests-tree" id="tests-tree"><div class="empty">加载中…</div></div>
+    </section>
+
+    <!-- 跨会话记忆（P2-15）：用户级记忆库。写入是「用户本人动作」（ADR-011）；
+         模型侧只能提议（remember 工具恒人审）。记忆会作为不可信内容被检索注入。 -->
+    <section class="sb-body" data-body="memory" hidden>
+      <div class="sb-caption">跨会话记忆 <span class="badge" id="badge-memory">0</span></div>
+      <div class="mem-add">
+        <textarea id="mem-input" class="mem-input" rows="2" placeholder="记一条偏好或约束（如「本仓库用 pytest -q 跑测试」）"></textarea>
+        <div class="mem-add-row">
+          <input id="mem-tags" class="mem-input mem-tags" type="text" placeholder="标签（可选，逗号分隔）" />
+          <button class="btn btn-small" id="btn-mem-add" title="把这条内容存进本地记忆库（仅本机）">记住</button>
+        </div>
+      </div>
+      <div id="mem-list"><div class="empty">加载中…</div></div>
+    </section>
+  </aside>
+
+  <div class="sb-resizer" id="sb-resizer" title="拖动调整宽度"></div>
+
+  <!-- ═══════════════════ 编辑器区 ═══════════════════ -->
+  <main class="editor-stack" id="editor-stack">
+    <div class="edtabs" id="edtabs"></div>
+    <div class="edtoolbar" id="edtoolbar" hidden>
+      <span class="ed-path" id="ed-path"></span>
+      <span class="spacer"></span>
+      <span class="chip" id="ed-meta"></span>
+      <!-- 语言服务器（E7）：诊断计数 / 不可用原因。只读视图的行号会按级别着色 -->
+      <span class="chip" id="ed-lsp" hidden></span>
+      <button class="tbtn is-toggle" id="btn-md-toggle" hidden>
+        <span data-m="code">原文</span>
+      </button>
+      <!-- 网页预览（O/P1-11）：只对可渲染的网页文件出现，点了开一个 preview 标签 -->
+      <button class="tbtn" id="btn-preview" hidden
+              title="在编辑器内预览这个网页（iframe，沙箱只读源码）">预览</button>
+      <!-- 编辑面（D1）：只读仍是默认，要显式点「编辑」才能改文件 -->
+      <button class="tbtn is-toggle" id="btn-edit-toggle" hidden
+              title="编辑模式：Tab 接受补全 / Ctrl+K 改写选区">编辑</button>
+      <button class="tbtn" id="btn-save" hidden title="保存（Ctrl+S，乐观锁防覆盖）">保存</button>
+    </div>
+    <div class="editor-host" id="editor-host">
+      <!-- 欢迎页（默认标签） -->
+      <div class="editor is-active" data-ed="welcome">
+        <div class="welcome">
+          <h1>Vibe Coding Agent</h1>
+          <p class="welcome-sub">本地编码智能体 · 代码不离开这台机器，高危动作必须先经你审批</p>
+          <div class="welcome-grid">
+            <div class="welcome-card">
+              <h3>开始</h3>
+              <p>在右侧对话框描述任务，Agent 会自己读代码、改文件、跑命令。</p>
+              <div class="hints">
+                <button class="hint" data-fill="看看这个项目的结构，说明它是做什么的">了解项目结构</button>
+                <button class="hint" data-fill="跑一遍测试，如果有失败的用例就修掉">跑测试并修复失败用例</button>
+                <button class="hint" data-fill="补一份 README，说明如何安装和使用">补一份 README</button>
+              </div>
+            </div>
+            <div class="welcome-card">
+              <h3>使用要点</h3>
+              <ul class="welcome-ul">
+                <li>左侧<b>资源管理器</b>可打开文件查看，Markdown 文件支持渲染预览</li>
+                <li>Agent 的每一步都会出现在右侧对话流与底部<b>输出</b>里</li>
+                <li>底部<b>终端</b>页签是你自己的交互式终端，与 Agent 通道互不干扰</li>
+                <li>改完的文件在<b>改动</b>面板里审查 diff，可整体回滚</li>
+                <li>审批弹窗出现时 Agent 会暂停等你决定，<kbd>Esc</kbd> 拒绝、<kbd>Ctrl+Enter</kbd> 批准</li>
+              </ul>
+            </div>
+          </div>
+          <p class="foot" id="welcome-foot"></p>
+        </div>
+      </div>
+      <!-- 动态编辑器标签由 app.js 插入 -->
+    </div>
+
+    <!-- 行内改写（D9）：Ctrl+K 在选区上浮出。结果以 hunk 卡片呈现，
+         默认全勾，可逐块取消，底部「应用选中」只落选中的那几块。 -->
+    <div class="rewrite-bar" id="rewrite-bar" hidden>
+      <div class="rw-head">
+        <span class="rw-title">行内改写</span>
+        <span class="chip" id="rewrite-range"></span>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="btn-rewrite-close" title="关闭（Esc）">🞫</button>
+      </div>
+      <div class="rw-body">
+        <input type="text" id="rewrite-input" placeholder="描述要怎么改这段代码…（Enter 生成）">
+        <button class="tbtn" id="btn-rewrite-run">生成</button>
+      </div>
+      <div class="hunk-list" id="hunk-list"></div>
+      <div class="rw-foot">
+        <span class="rw-hint" id="rewrite-hint"></span>
+        <span class="spacer"></span>
+        <button class="tbtn" id="btn-rewrite-apply" disabled>应用选中</button>
+      </div>
+    </div>
+
+    <!-- 重命名（E7）：F2 在编辑区触发。语言服务器给出跨文件编辑，
+         这里按文件呈现 diff，确认后一次性落盘（复用 hunk 卡片样式）。 -->
+    <div class="rewrite-bar" id="rename-bar" hidden>
+      <div class="rw-head">
+        <span class="rw-title">重命名符号</span>
+        <span class="chip" id="rename-target"></span>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="btn-rename-close" title="关闭（Esc）">🞫</button>
+      </div>
+      <div class="rw-body">
+        <input type="text" id="rename-input" placeholder="输入新名称…（Enter 生成预览）">
+        <button class="tbtn" id="btn-rename-run">生成预览</button>
+      </div>
+      <div class="hunk-list" id="rename-list"></div>
+      <div class="rw-foot">
+        <span class="rw-hint" id="rename-hint"></span>
+        <span class="spacer"></span>
+        <button class="tbtn" id="btn-rename-apply" disabled>应用重命名</button>
+      </div>
+    </div>
+
+    <!-- 底部面板：终端 / 输出 -->
+    <div class="bottom-panel" id="bottom-panel">
+      <div class="bp-head">
+        <button class="bp-tab" data-bp="terminal">终端</button>
+        <button class="bp-tab is-active" data-bp="output">输出</button>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="btn-term-clear" title="清空当前面板">🞫</button>
+        <button class="icon-btn" id="btn-bottom-toggle" title="收起/展开（Ctrl+`）">▾</button>
+      </div>
+      <div class="bp-body bp-body-term" data-bp="terminal" hidden>
+        <div class="term-bar">
+          <button class="tbtn" id="btn-term-open">开启终端</button>
+          <span class="term-chip" id="term-mode" hidden></span>
+          <span class="spacer"></span>
+          <span class="term-note" id="term-note">点击下方空白处即可开始输入</span>
+          <button class="icon-btn" id="btn-term-close" title="关闭终端" hidden>⏻</button>
+        </div>
+        <!-- 交互式终端（P1-7）：用户自己敲命令的 PTY，与 Agent 通道隔离 -->
+        <div class="term term-interactive" id="term" tabindex="0"></div>
+      </div>
+      <div class="bp-body" data-bp="output" hidden>
+        <div class="term" id="output"><div class="term-line is-dim">系统通知与运行日志会显示在这里。</div></div>
+      </div>
+    </div>
+  </main>
+
+  <div class="chat-resizer" id="chat-resizer" title="拖动调整宽度"></div>
+
+  <!-- ═══════════════════ 右：AI 对话 ═══════════════════ -->
+  <aside class="chatpane" id="chatpane">
+    <div class="chat-head">
+      <span class="chat-title">对话</span>
+      <span class="chat-mode">AGENT</span>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="btn-chat-clear" title="清空当前视图（不影响后端会话）">🞫</button>
+    </div>
+
+    <div class="stream" id="stream">
+      <div class="chat-welcome" id="chat-welcome">
+        <p>把任务描述清楚，剩下的交给 Agent。</p>
+        <p class="is-dim">所有高危动作都会先弹审批。</p>
+      </div>
+    </div>
+
+    <div class="composer">
+      <!-- 计划卡片（P2-12）：只在模型调用过 update_plan 时出现。
+           不使用该工具时这个节点始终 hidden，界面与今天逐字节一致。 -->
+      <div class="plan-card" id="plan-card" hidden>
+        <button class="plan-head" id="plan-head" type="button"
+                title="展开 / 收起计划（状态由模型驱动，点某一步可手动标注完成）">
+          <span class="plan-caret" id="plan-caret">▾</span>
+          <span class="plan-title">计划</span>
+          <span class="plan-progress" id="plan-progress"></span>
+        </button>
+        <ol class="plan-list" id="plan-list"></ol>
+      </div>
+      <div class="approval-banner" id="approval-banner" hidden>
+        <span class="dot"></span>
+        <span>有 1 个动作正在等你确认，Agent 已暂停</span>
+        <button class="btn btn-small" id="btn-goto-approval">返回审批</button>
+      </div>
+      <!-- 已选中的引用（P0-A）：只存「意图」({type,value})，正文由后端经 PathGuard 解析 -->
+      <div class="refs-bar" id="refs-bar" hidden></div>
+      <div class="composer-box">
+        <!-- `@` 引用候选浮层：绝对定位在输入框上方，避免把输入框往下顶 -->
+        <div class="mention-pop" id="mention-pop" hidden>
+          <div class="mention-head" id="mention-head"></div>
+          <div class="mention-list" id="mention-list"></div>
+        </div>
+        <textarea id="input" rows="1" placeholder="描述你想让 Agent 做的事…（Enter 发送，@ 引用文件/符号/目录）"></textarea>
+        <!-- 多模态输入（P1-10）：仅在 VIBE_VISION 非 off 时显示；也可直接粘贴图片 -->
+        <button class="btn btn-small" id="btn-image" type="button" hidden
+                title="选一张图片（需 VIBE_VISION 开启；也可直接粘贴图片）">选图</button>
+        <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+        <button class="btn btn-primary" id="btn-send" disabled>发送</button>
+      </div>
+      <!-- 上下文预算条（P2-17）：只在配了 VIBE_CONTEXT_BUDGET_TOKENS 时出现。
+           未配该变量的部署（budgetTokens=0）始终 hidden —— 那时裁剪仍按字符口径，
+           画一条按 token 的进度条只会误导。 -->
+      <div class="ctx-bar" id="ctx-bar" hidden>
+        <div class="ctx-track" id="ctx-track"></div>
+        <span class="ctx-label" id="ctx-label"></span>
+        <span class="ctx-cache" id="ctx-cache" hidden></span>
+      </div>
+      <div class="composer-foot">
+        <span id="composer-status">就绪</span>
+        <span class="spacer"></span>
+        <span id="composer-stats"></span>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- ═══════════════════ 状态栏 ═══════════════════ -->
+<footer class="statusbar">
+  <span class="sb-item sb-state" id="sb-state" data-state="idle">● 空闲</span>
+  <span class="sb-item" id="sb-iter" hidden></span>
+  <span class="sb-item" id="sb-files" hidden>改动 0 个文件</span>
+  <span class="sb-spring"></span>
+  <span class="sb-item" id="sb-session" title="会话 ID"></span>
+  <span class="sb-item" id="sb-audit" title="审计日志位置"></span>
+  <span class="sb-item" id="sb-model"></span>
+</footer>
+
+<!-- 审批浮层：整个 M1 的安全核心，样式上刻意做得无法被忽略 -->
+<div class="modal-backdrop" id="modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head">
+      <span class="risk-badge" id="modal-risk">REVIEW</span>
+      <h2 id="modal-title">需要你确认</h2>
+      <span class="modal-tool" id="modal-tool"></span>
+    </div>
+    <div class="modal-reason" id="modal-reason"></div>
+    <div class="modal-summary" id="modal-summary"></div>
+    <div class="modal-preview" id="modal-preview"></div>
+    <div class="modal-foot">
+      <div class="modal-hint" id="modal-hint">
+        <span><kbd>Ctrl</kbd>+<kbd>Enter</kbd> 批准</span>
+        <span><kbd>Esc</kbd> 拒绝（默认动作，最安全）</span>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-minimize" title="先看看代码再决定（Agent 会一直等你）">先看看</button>
+        <button class="btn btn-danger" id="btn-deny-all" title="拒绝本次，并在本会话内禁止再次调用该工具">拒绝并禁用</button>
+        <button class="btn" id="btn-deny">拒绝</button>
+        <button class="btn" id="btn-approve-all" title="本会话内自动放行该工具的所有后续调用">全部放行</button>
+        <button class="btn btn-primary" id="btn-approve">批准并执行</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 回滚浮层（B1） -->
+<div class="modal-backdrop" id="cp-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cp-title">
+    <div class="modal-head">
+      <span class="risk-badge" data-r="REVIEW">ROLLBACK</span>
+      <h2 id="cp-title">回滚工作区</h2>
+      <span class="modal-tool">检查点</span>
+    </div>
+    <div class="modal-reason">
+      选择一个检查点，工作区将回到该轮改动开始前的状态。
+      回滚前会自动为当前内容留反向快照 —— 回滚本身可以撤销。
+    </div>
+    <div class="cp-list" id="cp-list"><div class="empty">加载中…</div></div>
+    <div class="modal-foot">
+      <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-cp-close">关闭</button>
+        <button class="btn btn-primary" id="btn-cp-confirm" disabled>确认回滚</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 切换工作区（W1）：真正干活的是后端的工作区接口（重建整套上下文）。
+     目录选择有两条路：桌面壳里可以用系统目录对话框（走 preload 的 vibeShell.pickFolder，
+     那个按钮只在壳内显示）；浏览器里没有这个能力，改用下面的「浏览目录」——
+     它由 host 的只读列目录接口 /api/fs/dirs 驱动，同样能逐级点进任意本地目录。 -->
+<div class="modal-backdrop" id="ws-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ws-title">
+    <div class="modal-head">
+      <span class="risk-badge" data-r="REVIEW">WORKSPACE</span>
+      <h2 id="ws-title">切换工作区</h2>
+      <span class="modal-tool">本机目录</span>
+    </div>
+    <div class="modal-reason" id="ws-warning">
+      切换会<b>重启后端上下文</b>：新建会话、审计链改指向新工作区的 .vibe/ 目录，
+      当前对话与改动视图会清空。工作区里的文件不受影响，回滚点也不会被删。
+    </div>
+    <div class="ws-body">
+      <div class="sb-caption">最近打开</div>
+      <div class="ws-list" id="ws-list"><div class="empty">加载中…</div></div>
+      <div class="ws-path-row">
+        <label class="ws-label" for="ws-path">目录路径</label>
+        <button type="button" class="ws-pick" id="btn-ws-pick" hidden
+                title="调起系统目录对话框（仅桌面壳可用）">从磁盘选择…</button>
+      </div>
+      <input class="ws-input" id="ws-path" type="text" spellcheck="false" autocomplete="off"
+             placeholder="例如 E:\projects\my-app 或 /home/me/app">
+      <div class="ws-browse">
+        <div class="ws-browse-head">
+          <span class="sb-caption">浏览目录</span>
+          <span class="ws-cwd" id="ws-cwd"></span>
+          <button type="button" class="ws-up" id="btn-ws-up" disabled
+                  title="回到上一级；已在盘符根时回到盘符列表">↑ 上级</button>
+        </div>
+        <div class="ws-dirs" id="ws-dirs"><div class="empty">…</div></div>
+      </div>
+      <div class="ws-error" id="ws-error" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span><span><kbd>Enter</kbd> 切换</span></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-ws-close">关闭</button>
+        <button class="btn btn-primary" id="btn-ws-open">切换并重启</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 模型设置：改模型名 / 接入地址 / API Key，保存后**热生效并保留当前对话**
+     （后端换客户端引用，不重建会话）；运行中保存会被拒（409）。
+     校验、连通性检测、可用模型列表都走 host 的 /api/settings|/api/model/test|/api/models。
+     解释器段只在桌面壳里出现（window.vibeShell），保存走壳的配置桥 + 重启应用；
+     浏览器里没有那座桥，该段整体隐藏。 -->
+<div class="modal-backdrop" id="settings-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="set-title">
+    <div class="modal-head">
+      <span class="risk-badge" data-r="SAFE">MODEL</span>
+      <h2 id="set-title">模型设置</h2>
+      <span class="modal-tool" id="set-path">—</span>
+    </div>
+    <div class="modal-reason" id="set-warning">
+      保存后<b>立即生效</b>并保留当前对话；任务执行中不可修改。这里写的是本机用户级设置
+      （环境变量优先级更高，被锁定的字段已置灰）。
+    </div>
+    <div class="ws-body">
+      <div class="sb-caption">服务商预设</div>
+      <div class="set-presets" id="set-presets">
+        <button type="button" class="set-preset" data-preset="ollama">Ollama（本地）</button>
+        <button type="button" class="set-preset" data-preset="openai">OpenAI</button>
+        <button type="button" class="set-preset" data-preset="deepseek">DeepSeek</button>
+        <button type="button" class="set-preset" data-preset="custom">自定义</button>
+      </div>
+
+      <label class="ws-label" for="set-model">模型名</label>
+      <div class="set-row">
+        <input class="ws-input" id="set-model" type="text" list="set-model-list"
+               spellcheck="false" autocomplete="off" placeholder="例如 qwen2.5-coder:7b">
+        <button type="button" class="ws-pick" id="btn-set-models"
+                title="从接入地址拉取可用模型（即服务可达性）">刷新列表</button>
+      </div>
+      <datalist id="set-model-list"></datalist>
+
+      <label class="ws-label" for="set-baseurl">接入地址（OpenAI 兼容，通常以 /v1 结尾）</label>
+      <input class="ws-input" id="set-baseurl" type="text" spellcheck="false" autocomplete="off"
+             placeholder="http://127.0.0.1:11434/v1">
+
+      <label class="ws-label" for="set-apikey">API Key</label>
+      <input class="ws-input" id="set-apikey" type="password" spellcheck="false" autocomplete="off"
+             placeholder="留空保持不变">
+
+      <div class="set-row">
+        <button type="button" class="ws-pick" id="btn-set-test">测试连接</button>
+        <span class="set-msg" id="set-msg"></span>
+      </div>
+
+      <label class="ws-label" for="set-workspace">工作区（留空保持不变）</label>
+      <div class="ws-path-row">
+        <span class="set-note">切换工作区会重启上下文：新建会话、审计链改向新目录</span>
+        <button type="button" class="ws-pick" id="btn-set-ws-pick" hidden
+                title="调起系统目录对话框（仅桌面壳可用）">从磁盘选择…</button>
+      </div>
+      <input class="ws-input" id="set-workspace" type="text" spellcheck="false" autocomplete="off"
+             placeholder="留空保持不变">
+
+      <div id="set-interp" hidden>
+        <div class="sb-caption">解释器（仅桌面端 · 保存后需重启应用）</div>
+        <label class="ws-label" for="set-python">Python 解释器路径（留空 = 自动探测）</label>
+        <input class="ws-input" id="set-python" type="text" spellcheck="false" autocomplete="off"
+               placeholder="留空 = 自动探测 python.exe / python / py">
+        <label class="ws-label" for="set-backendbin">后端二进制路径（留空 = 用内嵌后端）</label>
+        <input class="ws-input" id="set-backendbin" type="text" spellcheck="false" autocomplete="off"
+               placeholder="留空 = 内嵌二进制">
+      </div>
+
+      <div class="ws-error" id="set-error" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span><span><kbd>Enter</kbd> 保存</span></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-set-close">关闭</button>
+        <button class="btn" id="btn-set-restart" hidden>保存解释器并重启</button>
+        <button class="btn btn-primary" id="btn-set-save">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 命令面板（P2-13）：Ctrl/Cmd+Shift+P 打开。可搜索、可执行所有界面动作。
+     列表分组显示；↑↓ 移动、Enter 执行、Esc 关闭、点击遮罩关闭。 -->
+<div class="palette-backdrop" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="命令面板">
+    <input type="text" id="palette-input" autocomplete="off" spellcheck="false"
+           placeholder="输入命令…（↑↓ 选择 · Enter 执行 · Esc 关闭）">
+    <div class="palette-list" id="palette-list"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
