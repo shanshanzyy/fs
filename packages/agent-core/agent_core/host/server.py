@@ -52,6 +52,7 @@ from .files import (
 from .security import Forbidden, HostGuard
 from .session import BusyError, Session, StaleFileError
 from .settings import (
+    effective_completion_overrides,
     effective_model_overrides,
     env_locked_fields,
     load_settings,
@@ -64,6 +65,23 @@ from . import protocol as P
 UI_DIR = Path(__file__).parent / "ui"
 MAX_BODY_BYTES = 1 << 20  # 1 MiB
 KEEPALIVE_SECONDS = 15
+
+
+def _require_bool(value: Any, field: str) -> bool:
+    """设置项里的布尔字段：只收真正的 JSON bool，不吃 "true" / 1 这类松散写法。"""
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} 必须是 true 或 false")
+    return value
+
+
+def _require_int_range(value: Any, field: str, low: int, high: int) -> int:
+    """设置项里的整数字段：必须是 [low, high] 内的整数（显式拒绝 bool 混入）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} 必须是整数")
+    if not (low <= value <= high):
+        raise ValueError(f"{field} 需在 {low}~{high} 之间")
+    return value
+
 
 # 界面的内容安全策略。
 # 界面里会渲染 Agent 读到的代码、模型输出 —— 这些内容本质上不可信，
@@ -380,6 +398,22 @@ class ServerContext:
             changes["base_url"] = base_url
         if api_key:
             changes["api_key"] = api_key
+        # 补全参数（D3+）：按**显式存在**判断 —— False / 0 都是合法值，不能用
+        # 「空串 = 不改」的规则；非法值直接报错（外层转 400），不做静默钳制。
+        if "fimEnabled" in body:
+            changes["fim_enabled"] = _require_bool(body["fimEnabled"], "fimEnabled")
+        if "completionMaxTokens" in body:
+            changes["completion_max_tokens"] = _require_int_range(
+                body["completionMaxTokens"], "completionMaxTokens", 16, 4096
+            )
+        if "completionPrefixChars" in body:
+            changes["completion_prefix_chars"] = _require_int_range(
+                body["completionPrefixChars"], "completionPrefixChars", 0, 100_000
+            )
+        if "completionSuffixChars" in body:
+            changes["completion_suffix_chars"] = _require_int_range(
+                body["completionSuffixChars"], "completionSuffixChars", 0, 100_000
+            )
         if not changes and not workspace:
             raise ValueError("没有需要修改的配置项")
 
@@ -405,6 +439,8 @@ class ServerContext:
                 current.config = new_config
                 current.agent.config = new_config
                 current._client = client
+                # 补全缓存里存的是「按旧配置算出的结果」，配置一变即失效。
+                current.invalidate_completion_cache()
 
         # 落盘：只写显式给出的非空字段（save_settings 本身忽略空值）。
         if changes:
@@ -1235,6 +1271,11 @@ class VibeHandler(BaseHTTPRequestHandler):
                 "apiKeySet": bool(key),
                 "workspace": str(cfg.workspace),
                 "settingsPath": str(settings_path()),
+                # 补全参数（D3+）：面板回填用；envLocked 已自动带上这四个键
+                "fimEnabled": cfg.fim_enabled,
+                "completionMaxTokens": cfg.completion_max_tokens,
+                "completionPrefixChars": cfg.completion_prefix_chars,
+                "completionSuffixChars": cfg.completion_suffix_chars,
                 "envLocked": env_locked_fields(),
                 "governance": session.governance is not None,
             }
@@ -1768,6 +1809,8 @@ def main(argv: list[str] | None = None) -> int:
     overrides: dict[str, object] = dict(
         effective_model_overrides(os.environ, load_settings(), cli_overrides)
     )
+    # 补全参数（D3+）与模型字段同一优先级链：环境变量 > settings.json > 内核默认。
+    overrides.update(effective_completion_overrides(os.environ, load_settings()))
 
     try:
         config = Config.load(args.workspace, **overrides)

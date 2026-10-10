@@ -498,6 +498,20 @@
         <span class="set-msg" id="set-msg"></span>
       </div>
 
+      <div class="sb-caption">补全（FIM）</div>
+      <label class="ws-label ws-check" for="set-fim">
+        <input type="checkbox" id="set-fim"> 启用 FIM 补全（关闭则回退 chat 补全）
+      </label>
+      <label class="ws-label" for="set-completion-tokens">单次补全输出 token 上限</label>
+      <input class="ws-input" id="set-completion-tokens" type="number" min="16" max="4096"
+             step="16" placeholder="256">
+      <label class="ws-label" for="set-completion-prefix">光标前上下文窗口（字符，0 = 不截断）</label>
+      <input class="ws-input" id="set-completion-prefix" type="number" min="0" max="100000"
+             step="500" placeholder="4000">
+      <label class="ws-label" for="set-completion-suffix">光标后上下文窗口（字符，0 = 不截断）</label>
+      <input class="ws-input" id="set-completion-suffix" type="number" min="0" max="100000"
+             step="500" placeholder="2000">
+
       <label class="ws-label" for="set-workspace">工作区（留空保持不变）</label>
       <div class="ws-path-row">
         <span class="set-note">切换工作区会重启上下文：新建会话、审计链改向新目录</span>

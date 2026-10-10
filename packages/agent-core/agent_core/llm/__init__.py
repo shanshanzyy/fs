@@ -14,6 +14,7 @@ from .base import (
     clean_completion_text,
     parse_arguments,
     parse_text_tool_calls,
+    window_completion_context,
 )
 from .openai_compat import OpenAICompatClient, probe_endpoint
 
@@ -28,4 +29,5 @@ __all__ = [
     "parse_arguments",
     "parse_text_tool_calls",
     "probe_endpoint",
+    "window_completion_context",
 ]

@@ -60,6 +60,7 @@ from ..llm import (
     build_completion_prompt,
     build_rewrite_prompt,
     clean_completion_text,
+    window_completion_context,
 )
 from ..loop import Agent, AgentHooks, ApprovalRequest, RunStats
 from ..memory import MemoryStore
@@ -97,6 +98,24 @@ MAX_PREVIEW_BYTES = 200_000
 # 宁可让用户缩小选区，也不要产出一份没法审阅的巨型 diff。
 MAX_REWRITE_CHARS = 60_000
 REWRITE_CONTEXT_LINES = 20
+
+# 补全去重缓存（D3+）。只吃「打字停顿后重复触发」这一小段窗口；条目数封顶防无界增长。
+# 只在内存、随会话消亡，绝不落盘 —— 补全正文不长期留存（ADR-006）。
+COMPLETION_CACHE_TTL = 30.0  # 秒
+COMPLETION_CACHE_MAX = 32
+
+
+def _completion_cache_key(
+    rel: str, prefix: str, suffix: str, limit: int, fim: bool
+) -> str:
+    """补全缓存键：把「影响结果的全部输入」并进指纹。
+
+    开关 FIM / 改 token 上限 / 换上下文都改变结果，因此必须一起参与哈希 ——
+    否则改了配置却命中旧缓存，用户会看到「设置没生效」。换模型由调用方
+    `invalidate_completion_cache()` 覆盖。
+    """
+    return digest(f"{rel}\x00{prefix}\x00{suffix}\x00{limit}\x00{int(fim)}")
+
 
 # 重命名新名称的长度上限。标识符没这么长，设上限是为了挡住「整段代码当名字」。
 MAX_RENAME_NAME = 64
@@ -271,6 +290,9 @@ class Session:
         # 重命名草稿缓存（E5）：token -> 服务端缓存的逐文件编辑结果。
         # 与 `_rewrites` 同一理由：前端回传正文一律不被信任，token 才是唯一凭据。
         self._renames: dict[str, dict[str, Any]] = {}
+        # 补全去重缓存（D3+）：digest -> (monotonic_ts, payload)。仅内存、不落盘、
+        # 不跨会话；命中直接复用，省掉一次模型调用（详见 complete()）。
+        self._completions: dict[str, tuple[float, dict[str, Any]]] = {}
         # 会话标题（A2）取用户原文，而不是带引用块的前置提示 ——
         # 否则每条会话的标题都会变成「[引用上下文] 用户引用了 N 项内容」。
         self._title_hint: str = ""
@@ -453,6 +475,10 @@ class Session:
                 "stream": cfg.stream_enabled,
                 # 补全能力（D）：fimEnabled=false 时界面可提示「已禁用 FIM，走 chat 回退」
                 "fimEnabled": cfg.fim_enabled,
+                # 补全参数（D3+）：前端据此算截断窗口，并把面板回填成当前值
+                "completionMaxTokens": cfg.completion_max_tokens,
+                "completionPrefixChars": cfg.completion_prefix_chars,
+                "completionSuffixChars": cfg.completion_suffix_chars,
                 # 交互式终端（M/P1-7）：false（VIBE_TERM=0）时界面隐藏整个终端入口
                 "terminalEnabled": cfg.terminal_enabled,
                 # 多模态输入（N/P1-10）：off（默认）时界面隐藏贴图/选图入口并提示开法；
@@ -813,6 +839,15 @@ class Session:
 
         与改写/保存不同，这里**不设运行中 409**：补全只产文本，不与 Agent 的写盘
         路径争用，任务跑着时给用户补全反而是想要的行为。
+
+        增强（D3+）三件事：
+
+        - **上下文窗口截断**：只把光标附近 `completion_prefix_chars` /
+          `completion_suffix_chars` 个字符喂给模型，大文件不再整份上送（行对齐）。
+        - **token 上限回退**：调用方没给 `max_tokens` 时用 `cfg.completion_max_tokens`，
+          `VIBE_COMPLETION_MAX_TOKENS` 因此真正生效。
+        - **请求去重缓存**：相同（路径 + 截断后上下文 + 上限 + FIM 开关）在 TTL 内
+          直接复用，不重复调模型；缓存只在内存、随会话消亡，绝不落盘。
         """
         cfg = self.agent.config
         paths = self.agent.paths
@@ -821,10 +856,25 @@ class Session:
         if not abs_path.is_file():
             raise ValueError(f"{paths.relative(abs_path)} 不存在或不是普通文件")
 
+        rel = paths.relative(abs_path)
+        # 截断：只把光标附近上下文发出去（前端也会先截一道，这里是权威口径）
+        prefix, suffix, truncated = window_completion_context(
+            prefix,
+            suffix,
+            prefix_chars=cfg.completion_prefix_chars,
+            suffix_chars=cfg.completion_suffix_chars,
+        )
+        limit = max_tokens if (max_tokens and max_tokens > 0) else cfg.completion_max_tokens
+
+        key = _completion_cache_key(rel, prefix, suffix, limit, cfg.fim_enabled)
+        cached = self._completion_cache_get(key)
+        if cached is not None:
+            return cached
+
         client = self.agent.client
         complete_fn = getattr(client, "complete", None)
         if callable(complete_fn):
-            text, backend = complete_fn(prefix, suffix, max_tokens, fim=cfg.fim_enabled)
+            text, backend = complete_fn(prefix, suffix, limit, fim=cfg.fim_enabled)
         else:
             # 客户端没有 complete（治理网关等）：退化为一次 chat，行为一致
             response = client.chat(
@@ -833,7 +883,6 @@ class Session:
             )
             text, backend = clean_completion_text(response.content or ""), "chat"
 
-        rel = paths.relative(abs_path)
         self.agent.audit.record(
             "edit.complete",
             path=rel,
@@ -843,7 +892,39 @@ class Session:
             backend=backend,
             # 补全正文不入审计（ADR-006）：只留指纹与长度
         )
-        return {"text": text, "backend": backend, "path": rel, "chars": len(text)}
+        payload: dict[str, Any] = {
+            "text": text,
+            "backend": backend,
+            "path": rel,
+            "chars": len(text),
+            "truncated": truncated,
+            "cached": False,
+        }
+        self._completion_cache_put(key, payload)
+        return payload
+
+    def _completion_cache_get(self, key: str) -> dict[str, Any] | None:
+        """取缓存；过期视为未命中。命中标记 `cached=true`（只进响应、不进审计）。"""
+        with self._lock:
+            hit = self._completions.get(key)
+        if hit is None or time.monotonic() - hit[0] > COMPLETION_CACHE_TTL:
+            return None
+        payload = dict(hit[1])
+        payload["cached"] = True
+        return payload
+
+    def _completion_cache_put(self, key: str, payload: dict[str, Any]) -> None:
+        """写缓存并在超出上限时淘汰最旧条目（补全不必 LRU 那么精细）。"""
+        with self._lock:
+            self._completions[key] = (time.monotonic(), dict(payload))
+            while len(self._completions) > COMPLETION_CACHE_MAX:
+                oldest = min(self._completions, key=lambda k: self._completions[k][0])
+                self._completions.pop(oldest, None)
+
+    def invalidate_completion_cache(self) -> None:
+        """清空补全去重缓存。换模型 / 改补全参数后调用，避免给出过期补全。"""
+        with self._lock:
+            self._completions.clear()
 
     def rewrite(
         self,
@@ -1882,6 +1963,7 @@ class Session:
             self._notices.clear()
             self._rewrites.clear()
             self._renames.clear()
+            self._completions.clear()
             self._answer = ""
             self._error = ""
             self._run_seq = 0

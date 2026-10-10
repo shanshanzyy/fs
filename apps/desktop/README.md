@@ -113,6 +113,7 @@ npm start -- E:/path/to/your/project
 | 服务商预设 | Ollama / OpenAI / DeepSeek / 自定义 | 一键填好接入地址与常用模型名，省去手打 |
 | 模型接入 | 模型名 / 接入地址 / API Key | 走 host 的 `GET` + `POST /api/settings`；「测试连接」打 `POST /api/model/test`，「拉取模型列表」打 `GET /api/models` |
 | 工作区 | 工作区路径 | 留空 = 保持不变；填了就顺手切换（走同一条 `POST /api/workspaces/open` 链路） |
+| 补全（FIM） | 启用 FIM / 输出 token 上限 / 光标前窗口 / 光标后窗口 | 走同一条 `GET` + `POST /api/settings`；前 / 后窗口为行对齐截断的字符数（`0` = 不截断），数值留空 = 不修改；保存后后端会清空补全缓存 |
 | 解释器 | Python 解释器路径 / 后端二进制路径 | **仅桌面壳**：写进 `config.json` 并重启应用；浏览器里整段隐藏 |
 
 几条关键语义：
@@ -121,7 +122,9 @@ npm start -- E:/path/to/your/project
   生效优先级 **环境变量 > `settings.json` > `config.json` > 内核默认**。
 - **热替换、留对话**：后端只换掉 LLM 客户端的引用（`agent.client`），**不重建会话** ——
   当前对话、检查点、审计链都原样保留。执行中改会被拒（409），请先中断或等任务结束。
-- **环境变量锁**：字段被 `VIBE_MODEL` / `VIBE_BASE_URL` / `VIBE_API_KEY` 设过时，
+- **环境变量锁**：字段被 `VIBE_MODEL` / `VIBE_BASE_URL` / `VIBE_API_KEY`（补全则是
+  `VIBE_FIM` / `VIBE_COMPLETION_MAX_TOKENS` / `VIBE_COMPLETION_PREFIX_CHARS` /
+  `VIBE_COMPLETION_SUFFIX_CHARS`）设过时，
   面板里对应输入框置灰（`envLocked`），改了也不生效 —— 这是刻意的：运维用环境变量
   钉死的值，不该被界面悄悄改掉。
 - **治理面接管时不可改**：`serverUrl` 配了治理网关时，模型接入由治理面决定，

@@ -22,7 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_core.config import Config  # noqa: E402
 from agent_core.errors import LLMError  # noqa: E402
 from agent_core.host.server import HostServer  # noqa: E402
-from agent_core.llm import ChatResponse, OpenAICompatClient  # noqa: E402
+from agent_core.llm import (  # noqa: E402
+    ChatResponse,
+    OpenAICompatClient,
+    window_completion_context,
+)
 
 
 class CompleteClient:
@@ -45,6 +49,20 @@ class CompleteClient:
     def chat(self, messages, tools=None, temperature=None):
         self.chat_calls += 1
         return ChatResponse(content="```\nchat-回退补全\n```")
+
+
+class _RecordingClient:
+    """记录每次 complete 收到的参数：验证后端截断与 token 上限回退。"""
+
+    def __init__(self, text: str = "rec-补全"):
+        self.text = text
+        self.calls: list[dict] = []
+
+    def complete(self, prefix, suffix="", max_tokens=None, fim=True):
+        self.calls.append(
+            {"prefix": prefix, "suffix": suffix, "max_tokens": max_tokens, "fim": fim}
+        )
+        return self.text, "fim"
 
 
 class _RewriteClient:
@@ -117,6 +135,40 @@ def _read_json(response):
     return json.loads(response.read().decode("utf-8"))
 
 
+class WindowContextTests(unittest.TestCase):
+    """D3+ 上下文窗口截断：按整行对齐，绝不把半行喂给模型。"""
+
+    def test_no_truncation_within_window(self) -> None:
+        prefix, suffix, truncated = window_completion_context(
+            "ab", "cd", prefix_chars=10, suffix_chars=10
+        )
+        self.assertEqual((prefix, suffix, truncated), ("ab", "cd", False))
+
+    def test_zero_means_no_truncation(self) -> None:
+        prefix, suffix, truncated = window_completion_context(
+            "x" * 100, "y" * 100, prefix_chars=0, suffix_chars=0
+        )
+        self.assertEqual(len(prefix), 100)
+        self.assertEqual(len(suffix), 100)
+        self.assertFalse(truncated)
+
+    def test_prefix_keeps_trailing_whole_lines(self) -> None:
+        text = "line1\nline2\nline3"  # len 17
+        prefix, _, truncated = window_completion_context(
+            text, "", prefix_chars=8, suffix_chars=0
+        )
+        self.assertTrue(truncated)
+        self.assertEqual(prefix, "line3")  # 从窗口内首个换行之后开始
+
+    def test_suffix_keeps_leading_whole_lines(self) -> None:
+        text = "aaa\nbbb\nccc"  # len 11
+        _, suffix, truncated = window_completion_context(
+            "", text, prefix_chars=0, suffix_chars=6
+        )
+        self.assertTrue(truncated)
+        self.assertEqual(suffix, "aaa\n")  # 只保留窗口内最后一个完整行
+
+
 class CompletionApiTests(unittest.TestCase):
     """真实 HTTP：补全 / 改写 / 保存 三条链路。"""
 
@@ -140,8 +192,15 @@ class CompletionApiTests(unittest.TestCase):
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def tearDown(self) -> None:
+        if getattr(self, "_old_client", None) is not None:
+            self.host.ctx.session.agent.client = self._old_client
         self.host.shutdown()
         self._tmp.cleanup()
+
+    def _swap_client(self, client) -> None:
+        """换成记录型假客户端；tearDown 负责还原（不影响 Agent 的其它状态）。"""
+        self._old_client = self.host.ctx.session.agent.client
+        self.host.ctx.session.agent.client = client
 
     def post(self, path: str, body: dict) -> dict:
         request = urllib.request.Request(
@@ -219,6 +278,68 @@ class CompletionApiTests(unittest.TestCase):
         self.assertIn("prefix_digest", entry)
         self.assertIn("suffix_digest", entry)
         self.assertIn("backend", entry)
+
+    # ---- 补全增强（D3+） ---------------------------------------------------
+    def test_complete_truncates_long_context(self) -> None:
+        """大文件不整份上送：后端按行对齐裁到窗口内，并标出 truncated。"""
+        client = _RecordingClient()
+        self._swap_client(client)
+        big = "".join(f"line{i}\n" for i in range(2000))  # 远超默认 4000 字符
+        data = self.post("/api/complete", {"path": "demo.py", "prefix": big, "suffix": big})
+        self.assertTrue(data["truncated"])
+        call = client.calls[-1]
+        self.assertLessEqual(len(call["prefix"]), 4000)
+        self.assertLessEqual(len(call["suffix"]), 2000)
+        self.assertTrue(big.endswith(call["prefix"]))    # 前缀取原文尾部
+        self.assertTrue(big.startswith(call["suffix"]))  # 后缀取原文头部
+
+    def test_complete_max_tokens_falls_back_to_config(self) -> None:
+        """调用方没给 maxTokens 时用 completion_max_tokens（该配置不再形同虚设）。"""
+        client = _RecordingClient()
+        self._swap_client(client)
+        self.post("/api/complete", {"path": "demo.py", "prefix": "a\n", "suffix": ""})
+        expected = self.host.ctx.session.agent.config.completion_max_tokens
+        self.assertEqual(client.calls[-1]["max_tokens"], expected)
+
+    def test_complete_max_tokens_override_wins(self) -> None:
+        client = _RecordingClient()
+        self._swap_client(client)
+        self.post(
+            "/api/complete",
+            {"path": "demo.py", "prefix": "a\n", "suffix": "", "maxTokens": 64},
+        )
+        self.assertEqual(client.calls[-1]["max_tokens"], 64)
+
+    def test_complete_cache_hit_avoids_second_call(self) -> None:
+        """相同请求在 TTL 内直接命中内存缓存，不重复调模型。"""
+        client = _RecordingClient("dup")
+        self._swap_client(client)
+        body = {"path": "demo.py", "prefix": "a\n", "suffix": "b"}
+        first = self.post("/api/complete", body)
+        second = self.post("/api/complete", body)
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["text"], "dup")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_complete_cache_invalidated_on_config_change(self) -> None:
+        client = _RecordingClient("dup")
+        self._swap_client(client)
+        body = {"path": "demo.py", "prefix": "a\n", "suffix": "b"}
+        self.post("/api/complete", body)
+        self.host.ctx.session.invalidate_completion_cache()
+        again = self.post("/api/complete", body)
+        self.assertFalse(again["cached"])
+        self.assertEqual(len(client.calls), 2)
+
+    def test_complete_cache_dropped_on_reset(self) -> None:
+        client = _RecordingClient("dup")
+        self._swap_client(client)
+        body = {"path": "demo.py", "prefix": "a\n", "suffix": "b"}
+        self.post("/api/complete", body)
+        self.host.ctx.session.reset()
+        again = self.post("/api/complete", body)
+        self.assertFalse(again["cached"])
 
     def get(self, path: str):
         request = urllib.request.Request(self.base + path)

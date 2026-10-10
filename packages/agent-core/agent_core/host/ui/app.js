@@ -1638,6 +1638,33 @@ function closeRenameBar() {
    ========================================================================== */
 
 const COMPLETION_DELAY = 400;   // 打字停顿多久才请求补全，避免逐字符打满模型
+// 前端截断窗口兜底值。大文件不能整份上送，否则 token 不可控、首字变慢；
+// 后端还有一道权威截断，这里先裁一遍能省掉上行带宽与序列化开销。
+const DEFAULT_PREFIX_CHARS = 4000;
+const DEFAULT_SUFFIX_CHARS = 2000;
+
+/* 光标前后上下文的行对齐截断 —— 与后端 window_completion_context 同一算法：
+   prefix 从窗口内第一个换行之后开始（丢弃被切断的首行残段），suffix 只保留
+   窗口内最后一个完整行（丢弃尾部残行）。limit <= 0 表示不截断。 */
+function trimPrefixWindow(text, limit) {
+  if (!limit || limit <= 0 || text.length <= limit) return text;
+  const start = text.length - limit;
+  const newline = text.indexOf('\n', start);
+  return newline === -1 ? text.slice(start) : text.slice(newline + 1);
+}
+
+function trimSuffixWindow(text, limit) {
+  if (!limit || limit <= 0 || text.length <= limit) return text;
+  const newline = text.lastIndexOf('\n', limit);
+  return newline === -1 ? text.slice(0, limit) : text.slice(0, newline + 1);
+}
+
+/** 取当前会话的补全窗口设置（拿不到就退回默认值）。 */
+function completionWindow(name, fallback) {
+  const cfg = (S.session && S.session.config) || {};
+  const value = cfg[name];
+  return Number.isFinite(value) ? value : fallback;
+}
 
 /* 建编辑视图：gutter（行号）+ textarea + ghost 层。
    textarea 用 white-space:pre（不折行）——折行会让行号 gutter 与视觉行错位，
@@ -1739,8 +1766,8 @@ async function requestCompletion(entry) {
   const index = area.selectionStart;
   if (index !== area.selectionEnd) return;      // 有选区时是在选代码，不补全
   const value = area.value;
-  const prefix = value.slice(0, index);
-  const suffix = value.slice(index);
+  const prefix = trimPrefixWindow(value.slice(0, index), completionWindow('completionPrefixChars', DEFAULT_PREFIX_CHARS));
+  const suffix = trimSuffixWindow(value.slice(index), completionWindow('completionSuffixChars', DEFAULT_SUFFIX_CHARS));
   if (!prefix.trim()) return;                    // 空文件/行首空白没什么可接的
   entry.completionSeq += 1;
   const seq = entry.completionSeq;
@@ -3702,6 +3729,15 @@ async function openSettingsModal() {
     lockField('set-model', locked.model);
     lockField('set-baseurl', locked.base_url);
     lockField('set-apikey', locked.api_key);
+    // 补全（FIM）参数回填：布尔用 checked，数值留空表示「保持当前」
+    $('set-fim').checked = info.fimEnabled !== false;
+    $('set-completion-tokens').value = info.completionMaxTokens ?? '';
+    $('set-completion-prefix').value = info.completionPrefixChars ?? '';
+    $('set-completion-suffix').value = info.completionSuffixChars ?? '';
+    lockField('set-fim', locked.fim_enabled);
+    lockField('set-completion-tokens', locked.completion_max_tokens);
+    lockField('set-completion-prefix', locked.completion_prefix_chars);
+    lockField('set-completion-suffix', locked.completion_suffix_chars);
     if (bridge) {
       try {
         const cfg = (await bridge.readDesktopConfig()) || {};
@@ -3786,7 +3822,29 @@ async function saveSettings() {
     apiKey: $('set-apikey').disabled ? '' : $('set-apikey').value.trim(),
     workspace: $('set-workspace').value.trim(),
   };
-  if (!body.model && !body.baseUrl && !body.apiKey && !body.workspace) {
+  // 补全（FIM）参数：置灰的字段跳过（被环境变量锁定），数值留空表示「不修改」。
+  // 布尔按「是否可改」决定 —— 可改时始终提交当前勾选状态。
+  const completionFields = [
+    ['fimEnabled', $('set-fim'), false],
+    ['completionMaxTokens', $('set-completion-tokens'), true],
+    ['completionPrefixChars', $('set-completion-prefix'), true],
+    ['completionSuffixChars', $('set-completion-suffix'), true],
+  ];
+  for (const [key, node, isNumber] of completionFields) {
+    if (node.disabled) continue;
+    if (!isNumber) { body[key] = node.checked; continue; }
+    const raw = node.value.trim();
+    if (!raw) continue;
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      $('set-error').hidden = false;
+      $('set-error').textContent = '补全参数必须是非负整数。';
+      return;
+    }
+    body[key] = parsed;
+  }
+  const hasCompletion = completionFields.some(([key]) => key in body);
+  if (!body.model && !body.baseUrl && !body.apiKey && !body.workspace && !hasCompletion) {
     $('set-error').hidden = false;
     $('set-error').textContent = '没有需要修改的配置项。';
     return;

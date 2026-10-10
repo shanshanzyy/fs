@@ -80,6 +80,41 @@ def clean_completion_text(text: str) -> str:
     return _strip_fences(text)
 
 
+def window_completion_context(
+    prefix: str,
+    suffix: str,
+    *,
+    prefix_chars: int,
+    suffix_chars: int,
+) -> tuple[str, str, bool]:
+    """把补全上下文截到光标附近（**行对齐**），返回 ``(prefix, suffix, truncated)``。
+
+    大文件整份上送会让 token 不可控、首字变慢，因此只保留光标前 ``prefix_chars``
+    与光标后 ``suffix_chars`` 个字符；两者为 ``0`` 时各自不截断。截断按行对齐：
+    前缀丢掉被切断的**首行残段**（保留紧邻光标的整行）、后缀丢掉**尾部残行**
+    （保留从光标起的完整行），避免把半行代码喂给模型。
+
+    刻意不做 token 估算 —— 那需要第三方分词器，与「核心链路零依赖」红线冲突；
+    按字符数切是 O(1) 且足够稳。
+    """
+    truncated = False
+    if prefix_chars > 0 and len(prefix) > prefix_chars:
+        start = len(prefix) - prefix_chars
+        newline = prefix.find("\n", start)
+        if newline != -1:
+            start = newline + 1  # 从下一整行开始，丢弃首行残段
+        prefix = prefix[start:]
+        truncated = True
+    if suffix_chars > 0 and len(suffix) > suffix_chars:
+        end = suffix_chars
+        newline = suffix.rfind("\n", 0, end)
+        if newline != -1:
+            end = newline + 1  # 只保留完整行，丢弃尾部残行
+        suffix = suffix[:end]
+        truncated = True
+    return prefix, suffix, truncated
+
+
 # ---- 行内改写（D8）：把选区按指令改写，只产替换文本 ------------------------
 _REWRITE_INSTRUCTIONS = (
     "你是代码改写引擎。按 <INSTRUCTION> 改写 <SELECTION> 中的代码。\n"

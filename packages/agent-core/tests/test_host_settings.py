@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent_core.config import Config  # noqa: E402
 from agent_core.host.server import HostServer  # noqa: E402
 from agent_core.host.settings import (  # noqa: E402
+    effective_completion_overrides,
     effective_model_overrides,
     env_locked_fields,
     load_settings,
@@ -133,6 +134,39 @@ class SettingsReadWriteTests(unittest.TestCase):
         save_settings({"model": "m1"}, nested)
         self.assertTrue(nested.exists())
 
+    def test_typed_keys_roundtrip(self) -> None:
+        """补全字段（D3+）与字符串三件套共享同一个 settings.json，按「显式存在」落盘。"""
+        saved = save_settings(
+            {
+                "fim_enabled": False,
+                "completion_max_tokens": 512,
+                "completion_prefix_chars": 0,
+                "completion_suffix_chars": 2048,
+            },
+            self.path,
+        )
+        self.assertFalse(saved["fim_enabled"])
+        # 0 是合法值，绝不能被「空串 = 不改」的规则误伤
+        self.assertEqual(saved["completion_prefix_chars"], 0)
+        loaded = load_settings(self.path)
+        self.assertEqual(loaded["completion_max_tokens"], 512)
+        self.assertEqual(loaded["completion_suffix_chars"], 2048)
+
+    def test_load_rejects_bad_typed_values_keywise(self) -> None:
+        """类型不对 / 负数 / bool 混入整数 → 逐键忽略，不整份作废。"""
+        self.path.write_text(
+            json.dumps(
+                {
+                    "model": "m1",
+                    "fim_enabled": "yes",           # 非 JSON bool
+                    "completion_max_tokens": True,  # bool 混入 int
+                    "completion_prefix_chars": -1,  # 负数
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(load_settings(self.path), {"model": "m1"})
+
 
 class EnvLockTests(unittest.TestCase):
     def test_env_locked_reflects_non_empty_env(self) -> None:
@@ -140,8 +174,26 @@ class EnvLockTests(unittest.TestCase):
             {"VIBE_MODEL": "qwen2.5-coder:7b", "VIBE_BASE_URL": "   ", "VIBE_API_KEY": ""}
         )
         self.assertEqual(
-            locked, {"model": True, "base_url": False, "api_key": False}
+            locked,
+            {
+                "model": True,
+                "base_url": False,
+                "api_key": False,
+                "fim_enabled": False,
+                "completion_max_tokens": False,
+                "completion_prefix_chars": False,
+                "completion_suffix_chars": False,
+            },
         )
+
+    def test_env_locked_covers_completion_fields(self) -> None:
+        """补全字段同样受环境变量锁定；值即使为 "0" 也算「已设置」。"""
+        locked = env_locked_fields(
+            {"VIBE_FIM": "1", "VIBE_COMPLETION_PREFIX_CHARS": "0"}
+        )
+        self.assertTrue(locked["fim_enabled"])
+        self.assertTrue(locked["completion_prefix_chars"])
+        self.assertFalse(locked["completion_max_tokens"])
 
 
 class EffectiveOverridesTests(unittest.TestCase):
@@ -178,6 +230,28 @@ class EffectiveOverridesTests(unittest.TestCase):
             env={}, settings={}, cli={"base_url": "http://127.0.0.1:11434/v1/"}
         )
         self.assertEqual(result["base_url"], "http://127.0.0.1:11434/v1")
+
+
+class EffectiveCompletionOverridesTests(unittest.TestCase):
+    """补全参数的优先级推导，纪律与模型字段完全一致。"""
+
+    def test_env_wins_and_is_not_overridden(self) -> None:
+        result = effective_completion_overrides(
+            env={"VIBE_COMPLETION_MAX_TOKENS": "1024"},
+            settings={"completion_max_tokens": 256, "completion_prefix_chars": 4000},
+        )
+        self.assertNotIn("completion_max_tokens", result)  # 让 Config.load 自己读环境变量
+        self.assertEqual(result["completion_prefix_chars"], 4000)
+
+    def test_settings_used_when_env_absent(self) -> None:
+        result = effective_completion_overrides(
+            env={}, settings={"fim_enabled": False, "completion_suffix_chars": 0}
+        )
+        self.assertFalse(result["fim_enabled"])
+        self.assertEqual(result["completion_suffix_chars"], 0)  # 0 要能原样传下去
+
+    def test_empty_settings_yields_nothing(self) -> None:
+        self.assertEqual(effective_completion_overrides({}, {}), {})
 
 
 class SettingsEndpointTests(unittest.TestCase):
@@ -232,8 +306,22 @@ class SettingsEndpointTests(unittest.TestCase):
         self.assertTrue(data["apiKeySet"])
         self.assertNotEqual(data["apiKeyMasked"], "ollama")  # 只回掩码，绝不回明文
         self.assertEqual(
-            data["envLocked"], {"model": False, "base_url": False, "api_key": False}
+            data["envLocked"],
+            {
+                "model": False,
+                "base_url": False,
+                "api_key": False,
+                "fim_enabled": False,
+                "completion_max_tokens": False,
+                "completion_prefix_chars": False,
+                "completion_suffix_chars": False,
+            },
         )
+        # 补全参数也随 GET 回传，供面板回填
+        self.assertIn("fimEnabled", data)
+        self.assertIn("completionMaxTokens", data)
+        self.assertIn("completionPrefixChars", data)
+        self.assertIn("completionSuffixChars", data)
 
     def test_post_settings_hot_swaps_and_persists(self) -> None:
         with self._request(
@@ -254,6 +342,43 @@ class SettingsEndpointTests(unittest.TestCase):
     def test_post_settings_empty_body_is_400(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._request("/api/settings", method="POST", body={})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_post_settings_persists_completion_fields(self) -> None:
+        with self._request(
+            "/api/settings",
+            method="POST",
+            body={
+                "fimEnabled": False,
+                "completionMaxTokens": 512,
+                "completionPrefixChars": 0,
+            },
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["session"]["config"]["fimEnabled"])
+        self.assertEqual(data["session"]["config"]["completionMaxTokens"], 512)
+        # 0 是合法值：既落盘、也生效
+        self.assertEqual(data["session"]["config"]["completionPrefixChars"], 0)
+        stored = load_settings(self.settings_file)
+        self.assertFalse(stored["fim_enabled"])
+        self.assertEqual(stored["completion_max_tokens"], 512)
+        self.assertEqual(stored["completion_prefix_chars"], 0)
+
+    def test_post_settings_only_completion_is_accepted(self) -> None:
+        """只改补全参数也应被接受 —— 「空检查」必须把补全字段算进去。"""
+        with self._request(
+            "/api/settings", method="POST", body={"fimEnabled": True}
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(data["ok"])
+
+    def test_post_settings_rejects_out_of_range_completion(self) -> None:
+        """越界 / 类型不对 → 400，不做静默钳制。"""
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request(
+                "/api/settings", method="POST", body={"completionMaxTokens": 4}
+            )
         self.assertEqual(ctx.exception.code, 400)
 
     def test_get_models_returns_shape(self) -> None:

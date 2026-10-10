@@ -53,8 +53,8 @@
 |---|---|
 | `GET  /api/health` | 就绪探测（Electron 主进程靠它决定何时加载页面） |
 | `GET  /api/state` | 会话快照：配置、工具清单、风险分级、当前运行状态 |
-| `GET  /api/settings` | 模型设置（可编辑部分）：`{model, baseUrl, apiKeyMasked, apiKeySet, workspace, settingsPath, envLocked{model,base_url,api_key}, governance}`；密钥只回末 4 位掩码，`envLocked` 标出被环境变量锁死、界面改不动的字段 |
-| `POST /api/settings` | 保存模型设置：`{model?, baseUrl?, apiKey?, workspace?}`（字段留空 = 保留原值）→ `{ok, switched, settingsPath, settings, session}`；**空闲态**热替换 LLM 客户端并保留当前对话（执行中 409，治理面接管时 400）。真源为用户级 `~/.vibe/settings.json`（`VIBE_SETTINGS` 可覆盖路径） |
+| `GET  /api/settings` | 模型 / 补全设置（可编辑部分）：`{model, baseUrl, apiKeyMasked, apiKeySet, workspace, settingsPath, fimEnabled, completionMaxTokens, completionPrefixChars, completionSuffixChars, envLocked{model,base_url,api_key,fim_enabled,completion_max_tokens,completion_prefix_chars,completion_suffix_chars}, governance}`；密钥只回末 4 位掩码，`envLocked` 标出被环境变量锁死、界面改不动的字段 |
+| `POST /api/settings` | 保存模型 / 补全设置：`{model?, baseUrl?, apiKey?, workspace?, fimEnabled?, completionMaxTokens?, completionPrefixChars?, completionSuffixChars?}`（字符串字段留空 = 保留原值；补全字段仅在显式给出时落盘，`0`/`false` 均为合法值）→ `{ok, switched, settingsPath, settings, session}`；**空闲态**热替换 LLM 客户端并保留当前对话（执行中 409，治理面接管时 400），补全设置变更同时清空补全缓存。真源为用户级 `~/.vibe/settings.json`（`VIBE_SETTINGS` 可覆盖路径） |
 | `GET  /api/models?baseUrl=&apiKey=` | 列出端点可用模型名：`{baseUrl, models[]}`；`list_models()` 吞错返回空，**不代表不可达**（判可达性请用 `POST /api/model/test`） |
 | `POST /api/model/test` | 连通性探测（不落盘、无副作用）：`{baseUrl?, apiKey?}` → `{ok, message, baseUrl, models[]}`；先 `probe_endpoint()`（不吞错）确认可达，再 `list_models()`（吞错返回空） |
 | `POST /api/run` | `{text, refs?}` 提交任务；已有任务在跑时返回 409 |
@@ -65,7 +65,7 @@
 | `GET  /api/file?path=` | 读取单个文件（经路径沙箱，敏感文件会被拒）；返回含 `digest`（乐观锁指纹） |
 | `GET  /api/diffs` | 本会话累计产生的所有 diff |
 | `GET  /api/refs?type=&q=&limit=` | 上下文引用（P0-A）候选：type ∈ file/symbol/folder，上限 50 |
-| `POST /api/complete` | 内联补全（D5）：`{path, prefix, suffix, maxTokens?}` → `{text, backend, path, chars}` |
+| `POST /api/complete` | 内联补全（D5）：`{path, prefix, suffix, maxTokens?}` → `{text, backend, path, chars, truncated, cached}`；后端按 `completionPrefixChars`/`completionSuffixChars` 对前后文做行对齐截断（`truncated` 标出是否发生截断），`maxTokens` 缺省回退 `completionMaxTokens`；相同 `(path,prefix,suffix,limit,fim)` 在 TTL 30s 内直接命中内存缓存（`cached=true`） |
 | `POST /api/rewrite` | 行内改写预览（D8）：`{path, startLine, endLine, instruction}` → `{token, hunks[], noChange, …}` |
 | `POST /api/rewrite/apply` | 应用勾选的 hunk（D8）：`{token, accepted[]}` → `{ok, changed, applied, total, …}` |
 | `POST /api/edit/save` | 编辑模式保存（D11）：`{path, content, expectedDigest}` → `{ok, changed, digest, …}` |

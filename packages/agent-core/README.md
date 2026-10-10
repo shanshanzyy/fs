@@ -85,6 +85,8 @@ python -m agent_core -w /path/to/repo --check
 | `VIBE_SEMANTIC_MAX_FILES`（B5） | `semantic_max_files` | `800` | 单次建索引最多读多少个文件 | 防超大仓库把内存与耗时拉爆 |
 | `VIBE_FIM`（D3） | `fim_enabled` | `true` | 内联补全是否优先走 FIM（`/completions` + `suffix`） | `0` = 跳过 FIM 直接 `chat()`；上游不支持 FIM 时也自动回退（`_fim_supported` 缓存，见 ADR-012） |
 | `VIBE_COMPLETION_MAX_TOKENS`（D3） | `completion_max_tokens` | `256` | 单次补全的输出 token 上限 | 补全贵在"快"，给太大反而拖慢首字 |
+| `VIBE_COMPLETION_PREFIX_CHARS`（D3+） | `completion_prefix_chars` | `4000` | 喂给模型的光标**前**上下文字符数（行对齐截断） | `0` = 不截断；大文件整份上送会让 token 不可控、首字变慢 |
+| `VIBE_COMPLETION_SUFFIX_CHARS`（D3+） | `completion_suffix_chars` | `2000` | 喂给模型的光标**后**上下文字符数（行对齐截断） | `0` = 不截断；截断按整行对齐，避免把半行喂给模型 |
 | `VIBE_LSP`（E4） | `lsp_mode` | `auto` | 语言服务器开关：`auto` / `on` / `off` | 非法值**启动前报错**；`off` = 不探测、不启动子进程；探测不到时端点回 `available:false` 及原因（**不做远端回退**，ADR-014） |
 | `VIBE_LSP_IDLE`（E4） | `lsp_idle_seconds` | `300` | 空闲多少秒后自动 shutdown 语言服务器（**不常驻**） | `0` = 不自动回收 |
 

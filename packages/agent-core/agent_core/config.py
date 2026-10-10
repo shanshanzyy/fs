@@ -180,6 +180,10 @@ class Config:
     fim_enabled: bool = True
     # 单次补全的输出 token 上限。补全贵在「快」，给太大反而拖慢首字。
     completion_max_tokens: int = 256
+    # 补全时喂给模型的光标前/后上下文字符数（行对齐截断）。大文件不能整份上送，
+    # 否则 token 不可控、首字变慢。0 = 不截断。
+    completion_prefix_chars: int = 4000
+    completion_suffix_chars: int = 2000
 
     # --- 语言服务器（E）---
     # auto = 探测到就启用、探测不到就降级（默认）；on = 强制要求（探测不到时端点
@@ -337,6 +341,12 @@ class Config:
             fim_enabled=_env_bool("VIBE_FIM", cls.fim_enabled),
             completion_max_tokens=_env_int(
                 "VIBE_COMPLETION_MAX_TOKENS", cls.completion_max_tokens
+            ),
+            completion_prefix_chars=_env_int(
+                "VIBE_COMPLETION_PREFIX_CHARS", cls.completion_prefix_chars
+            ),
+            completion_suffix_chars=_env_int(
+                "VIBE_COMPLETION_SUFFIX_CHARS", cls.completion_suffix_chars
             ),
             # 语言服务器（E）
             lsp_mode=_env_lsp_mode("VIBE_LSP", cls.lsp_mode),
