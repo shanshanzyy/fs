@@ -180,6 +180,7 @@ class EnvLockTests(unittest.TestCase):
                 "base_url": False,
                 "api_key": False,
                 "fim_enabled": False,
+                "mcp_enabled": False,
                 "completion_max_tokens": False,
                 "completion_prefix_chars": False,
                 "completion_suffix_chars": False,
@@ -312,6 +313,7 @@ class SettingsEndpointTests(unittest.TestCase):
                 "base_url": False,
                 "api_key": False,
                 "fim_enabled": False,
+                "mcp_enabled": False,
                 "completion_max_tokens": False,
                 "completion_prefix_chars": False,
                 "completion_suffix_chars": False,
@@ -322,6 +324,8 @@ class SettingsEndpointTests(unittest.TestCase):
         self.assertIn("completionMaxTokens", data)
         self.assertIn("completionPrefixChars", data)
         self.assertIn("completionSuffixChars", data)
+        # MCP 开关（L 管理面）也随 GET 回传
+        self.assertIn("mcpEnabled", data)
 
     def test_post_settings_hot_swaps_and_persists(self) -> None:
         with self._request(

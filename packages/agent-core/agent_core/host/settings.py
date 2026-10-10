@@ -27,13 +27,16 @@ _SETTINGS_KEYS: tuple[str, ...] = ("model", "base_url", "api_key")
 
 # 类型化设置（D3+）：补全参数，与字符串三件套共享同一个 settings.json。
 # 它们不能套用「空串=不改」的规则 —— 0 / False 都是合法值，必须按「显式存在」判断。
-_BOOL_KEYS: tuple[str, ...] = ("fim_enabled",)
+_BOOL_KEYS: tuple[str, ...] = ("fim_enabled", "mcp_enabled")
 _INT_KEYS: tuple[str, ...] = (
     "completion_max_tokens",
     "completion_prefix_chars",
     "completion_suffix_chars",
 )
 _TYPED_KEYS: tuple[str, ...] = _BOOL_KEYS + _INT_KEYS
+# 补全参数专用键集（不含 MCP 开关）—— completion overrides 只处理这一组，
+# 免得把 mcp_enabled 也塞进「补全」的覆盖项里。
+_COMPLETION_TYPED_KEYS: tuple[str, ...] = ("fim_enabled", *_INT_KEYS)
 
 # 字段 -> 对应的环境变量名（环境变量恒为最高优先级）。
 _ENV_FOR_FIELD: dict[str, str] = {
@@ -43,6 +46,7 @@ _ENV_FOR_FIELD: dict[str, str] = {
 }
 _ENV_FOR_TYPED: dict[str, str] = {
     "fim_enabled": "VIBE_FIM",
+    "mcp_enabled": "VIBE_MCP",
     "completion_max_tokens": "VIBE_COMPLETION_MAX_TOKENS",
     "completion_prefix_chars": "VIBE_COMPLETION_PREFIX_CHARS",
     "completion_suffix_chars": "VIBE_COMPLETION_SUFFIX_CHARS",
@@ -165,9 +169,25 @@ def effective_completion_overrides(
     传入的 ``settings`` 应是 ``load_settings()`` 的结果（已过类型校验）。
     """
     result: dict[str, Any] = {}
-    for field in _TYPED_KEYS:
+    for field in _COMPLETION_TYPED_KEYS:
         if str(env.get(_ENV_FOR_TYPED[field]) or "").strip():
             continue
         if field in settings:
             result[field] = settings[field]
     return result
+
+
+def effective_mcp_overrides(
+    env: Mapping[str, str],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """算出 MCP 开关（``mcp_enabled``）的覆盖项。
+
+    纪律同模型/补全：环境变量（``VIBE_MCP``）已设 → **不传** override，把最高
+    优先级留给 ``Config.load`` 自己；否则用 settings.json 里的合法 boolean。
+    """
+    if str(env.get(_ENV_FOR_TYPED["mcp_enabled"]) or "").strip():
+        return {}
+    if isinstance(settings.get("mcp_enabled"), bool):
+        return {"mcp_enabled": settings["mcp_enabled"]}
+    return {}

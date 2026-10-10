@@ -922,6 +922,20 @@ def _sample_locals() -> dict[str, dict]:
             "args_text": '{"path": "src/main.py"}',
             "ms": 35,
         },
+        # MCP 管理面（L）：形状与 host/session.py 的 mcp_upsert_server /
+        # mcp_delete_server 调用点一致。只记 server 名 / transport / argc。
+        "mcp.server_added": {
+            "event": "mcp.server_added",
+            "server": "fs",
+            "transport": "stdio",
+            "argc": 1,
+        },
+        "mcp.server_removed": {
+            "event": "mcp.server_removed",
+            "server": "fs",
+            "transport": "stdio",
+            "argc": 1,
+        },
         # 计划视图（P2-12）：形状与 host/session.py 的 plan_toggle 调用点一致
         "plan.toggle": {
             "event": "plan.toggle",

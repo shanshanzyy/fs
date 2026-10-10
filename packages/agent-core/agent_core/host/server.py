@@ -53,6 +53,7 @@ from .security import Forbidden, HostGuard
 from .session import BusyError, Session, StaleFileError
 from .settings import (
     effective_completion_overrides,
+    effective_mcp_overrides,
     effective_model_overrides,
     env_locked_fields,
     load_settings,
@@ -414,6 +415,9 @@ class ServerContext:
             changes["completion_suffix_chars"] = _require_int_range(
                 body["completionSuffixChars"], "completionSuffixChars", 0, 100_000
             )
+        # MCP 开关（L 管理面）：按显式存在判断 —— false 也必须能落盘（关闭）。
+        if "mcpEnabled" in body:
+            changes["mcp_enabled"] = _require_bool(body["mcpEnabled"], "mcpEnabled")
         if not changes and not workspace:
             raise ValueError("没有需要修改的配置项")
 
@@ -423,6 +427,11 @@ class ServerContext:
                 raise BusyError("任务执行中，无法修改模型设置，请先中断或等任务结束")
             if current.governance is not None:
                 raise ValueError("治理面已接管模型接入，界面不支持修改模型配置")
+            # MCP 开关真的变了才重建实例：不变时保持进程原样，避免无谓重启。
+            mcp_changed = (
+                "mcp_enabled" in changes
+                and changes["mcp_enabled"] != current.config.mcp_enabled
+            )
             if changes:
                 new_config = replace(current.config, **changes)
                 client = OpenAICompatClient(
@@ -441,6 +450,10 @@ class ServerContext:
                 current._client = client
                 # 补全缓存里存的是「按旧配置算出的结果」，配置一变即失效。
                 current.invalidate_completion_cache()
+            # MCP 开关切换：清掉全部实例并按新配置重建 `mcp__*` 工具清单
+            # （关→摘除、开→并入）。读的是刚更新的 current.agent.config。
+            if mcp_changed:
+                current.mcp_reload()
 
         # 落盘：只写显式给出的非空字段（save_settings 本身忽略空值）。
         if changes:
@@ -995,6 +1008,44 @@ class VibeHandler(BaseHTTPRequestHandler):
             self._send_json(result)
             return
 
+        # ---- MCP 管理写入（L 管理面）：增 / 改 / 删 / 测连接 -------------------
+        # 「用户本人动作」（ADR-011）：不弹审批浮层，但执行中 409、治理面 400；
+        # 只写配置文件、**不拼命令**（argv 仍只来自受信配置，ADR-015）。
+        if path == "/api/mcp/servers":
+            body = self._read_json()
+            try:
+                result = session.mcp_upsert_server(body)
+            except BusyError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json(result)
+            return
+
+        # 删除走 POST：`_dispatch` 只认 GET/POST/OPTIONS，没有 DELETE 分支。
+        if path == "/api/mcp/servers/remove":
+            body = self._read_json()
+            try:
+                result = session.mcp_delete_server(str(body.get("name") or ""))
+            except BusyError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json(result)
+            return
+
+        if path == "/api/mcp/test":
+            body = self._read_json()
+            try:
+                result = session.mcp_test_server(str(body.get("name") or ""))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json(result)
+            return
+
         # ---- 测试树（K/P2-14）：跑指定用例（结果走 SSE 事件）----------------
         # 「用户本人动作」：不走审批浮层、不落盘（ADR-011），但记审计；
         # Agent 跑着时也**不** 409（不与写盘争用）。并发跑第二批才 409 ——
@@ -1276,6 +1327,8 @@ class VibeHandler(BaseHTTPRequestHandler):
                 "completionMaxTokens": cfg.completion_max_tokens,
                 "completionPrefixChars": cfg.completion_prefix_chars,
                 "completionSuffixChars": cfg.completion_suffix_chars,
+                # MCP 开关（L 管理面）：面板回填用；envLocked 已自动带上 mcp_enabled
+                "mcpEnabled": bool(getattr(cfg, "mcp_enabled", False)),
                 "envLocked": env_locked_fields(),
                 "governance": session.governance is not None,
             }
@@ -1811,6 +1864,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     # 补全参数（D3+）与模型字段同一优先级链：环境变量 > settings.json > 内核默认。
     overrides.update(effective_completion_overrides(os.environ, load_settings()))
+    # MCP 开关（L 管理面）：与模型/补全同一优先级链；关闭时不 spawn 任何子进程。
+    overrides.update(effective_mcp_overrides(os.environ, load_settings()))
 
     try:
         config = Config.load(args.workspace, **overrides)

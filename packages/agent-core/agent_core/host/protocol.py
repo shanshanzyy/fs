@@ -74,8 +74,11 @@
 | `GET  /api/lsp/definition?path=&line=&char=` | 跳转定义（E）：`{available, locations[]}` |
 | `POST /api/lsp/rename/preview` | 重命名预览（E）：`{path, line, char, newName}` → `{token, files[]{path,diff,added,removed,edits}}`，**不落盘** |
 | `POST /api/lsp/rename/apply` | 应用重命名（E）：`{token}` → `{ok, changed, files, paths[], added, removed}` |
-| `GET  /api/mcp/status` | 外部 MCP server 状态（P1-6）：`{enabled, configPath, servers[]{name,transport,command,url,available,reason,running,tools[]}, configError}` |
+| `GET  /api/mcp/status` | 外部 MCP server 状态（P1-6）：`{enabled, configPath, servers[]{name,transport,command,args[],env{},url,available,reason,running,tools[]}, configError}`（`command`/`args`/`env` 回完整值，供界面原地编辑） |
 | `POST /api/mcp/reload` | 重读 MCP servers 配置（P1-6）：不落盘、不 409；重建 `mcp__*` 工具清单后返回最新 status |
+| `POST /api/mcp/servers` | 新增 / 替换一个 MCP server（L 管理面）：`{server{name,transport,command,args,url,env}}` → 最新 status；只写配置文件、不拼命令；未启用 400、执行中 409、治理面 400、非法 400 |
+| `POST /api/mcp/servers/remove` | 删除一个 MCP server（L 管理面）：`{name}` → 最新 status；不存在 400；写后自动 reload 并记 `mcp.server_removed` |
+| `POST /api/mcp/test` | 测一个 MCP server 的连接（L 管理面）：`{name}` → `{ok, name, count, tools[]}` 或 `{ok:false, error}`；首次调用惰性启动该 server |
 | `POST /api/plan/toggle` | 人工标注计划中某一步（P2-12）：`{id, status}` → `{ok, id, status, steps[], revision}` |
 | `GET  /api/context/stats` | 上下文用量（P2-17）：`{budgetTokens, usedTokens, segments{}, estimator, trimmedLastRun, cache}`；只读无副作用 |
 | `GET  /api/index/status` | 增量索引健康度（P1-9）：`{watching, interval, files, chunks, edges, lastUpdate, pending}`；**只读**，`index_watch` 关时如实回 0（不因此建索引） |
@@ -216,6 +219,9 @@ LSP 只做三件事：**看看有什么诊断、跳到定义、改名**。三条
    子进程 `shell=False`、`cwd` 锁工作区、`env` 过 `scrub_env()`；命令仅来自
    `.vibe/mcp.json`（或 `VIBE_MCP_CONFIG`），**不接受运行时用户输入拼命令**；
    与内置工具（或彼此之间）**名字冲突时拒绝启动该 server** 并给原因。
+   界面里的「新增 / 编辑 / 删除 server」也**只写这份配置文件**（`POST /api/mcp/servers`
+   / `.../remove`），同样不拼命令；写入前后各记一条 `mcp.server_added` / `mcp.server_removed`
+   （仅元数据：server 名、transport、argc）。
 3. **审计只记 digest 与计数** —— `mcp.call` / `mcp.server_start` 记
    `{server, tool, ok, argc, args_digest, ms}`，**参数正文只留本机**（ADR-006）；
    调用结果经 `wrap_untrusted` 包裹，模型据此知其为外部内容。默认

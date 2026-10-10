@@ -305,6 +305,18 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "args_digest": "digest",
         "ms": "int",
     },
+    # MCP 管理面（L）：用户在界面新增 / 删除 MCP server 配置。只收元数据
+    # （server 名 / 传输方式 / 参数个数），命令与参数正文一律不出机（ADR-006）。
+    "mcp.server_added": {
+        "server": "str",
+        "transport": "str",
+        "argc": "int",
+    },
+    "mcp.server_removed": {
+        "server": "str",
+        "transport": "str",
+        "argc": "int",
+    },
     # 测试树（P2-14）：用户本人点「跑测试」的计数汇总。失败**正文**
     # （断言信息、traceback）只留本机，这里只收计数与首个失败的位置元数据。
     "test.run": {

@@ -136,6 +136,29 @@ npm start -- E:/path/to/your/project
 
 ---
 
+## MCP 管理面板
+
+侧栏的 **MCP** 图标（`Ctrl+9`）打开，用来启停与维护外部 MCP server —— 不必再手改
+`<工作区>/.vibe/mcp.json`。
+
+| 区域 | 说明 |
+|---|---|
+| 启用 MCP | 复用 `GET` + `POST /api/settings` 的 `mcpEnabled`；被 `VIBE_MCP` 环境变量锁定时置灰 |
+| server 列表 | 名称、传输（stdio / http）、状态（运行中 / 未启动 / 不可用 + 原因）、工具数 |
+| 增 / 改 / 删 | `POST /api/mcp/servers` / `POST /api/mcp/servers/remove`；弹窗与「模型设置」同范式 |
+| 测试连接 | `POST /api/mcp/test`，起一次该 server 并列工具，失败就地提示（不报 5xx） |
+| 重载 | `POST /api/mcp/reload`，重读配置并重建 `mcp__*` 工具清单 |
+
+几条关键语义：
+
+- **只写配置文件**：命令 / 参数只落 `<工作区>/.vibe/mcp.json`，界面**从不**把它们拼进 argv
+  （ADR-015）；`command` / `args` 始终只取自该受信配置文件。
+- **未启用不可管理**：MCP 未开启时写入被拒（400）——先勾「启用 MCP」再管理 server。
+- **外部工具恒人审**：`mcp__*` 工具恒 `Risk.REVIEW`、每次调用都弹审批浮层，不可配置放行。
+- **执行中改不了**：任务运行中增删改会被拒（409）；治理面接管时同样拒绝（400）。
+
+---
+
 ## 它是怎么和后端说话的
 
 不通过 Electron 的 IPC，而是走**本机 HTTP + SSE**：

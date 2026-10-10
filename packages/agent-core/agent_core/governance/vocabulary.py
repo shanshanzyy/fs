@@ -587,6 +587,26 @@ _RULES: dict[str, Rule] = {
         note="一次外部 MCP 工具调用。**外部工具恒 REVIEW**（ADR-015），"
         "这里回答「哪个 server 的哪个工具被调了多少次、成没成」",
     ),
+    "mcp.server_added": Rule(
+        upload="mcp.server_added",
+        fields={
+            "server": ("server", "str"),
+            "transport": ("transport", "str"),
+            "argc": ("argc", "int"),
+        },
+        note="用户在界面里新增 / 替换了一个外部 MCP server 的配置。"
+        "只上传 server 名、传输方式与参数个数（ADR-006）；**命令与参数正文不出机**，"
+        "写入只落本地配置文件",
+    ),
+    "mcp.server_removed": Rule(
+        upload="mcp.server_removed",
+        fields={
+            "server": ("server", "str"),
+            "transport": ("transport", "str"),
+            "argc": ("argc", "int"),
+        },
+        note="用户在界面里删除了一个外部 MCP server 的配置。字段口径同 mcp.server_added",
+    ),
     "plan.toggle": Rule(
         upload="plan.toggle",
         fields={

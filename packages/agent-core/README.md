@@ -190,6 +190,16 @@ python -m agent_core -w /path/to/repo --check
 |---|---|---|
 | `GET /api/mcp/status` | —— | `{enabled, configPath, servers[]{name,transport,command,url,available,reason,running,tools[]}, configError}` |
 | `POST /api/mcp/reload` | —— | 重读配置并重建 `mcp__*` 工具清单，返回最新 status |
+| `POST /api/mcp/servers` | `{server{name,transport,command?,args?,url?,env?}}` | 写回一条 server 配置并 reload，返回最新 status（未启用 / 配置非法 / 治理面接管 400，任务执行中 409） |
+| `POST /api/mcp/servers/remove` | `{name}` | 移除一条 server 并 reload（不存在 400） |
+| `POST /api/mcp/test` | `{name}` | `{ok, name, count?, tools?, error?}`（连接失败不报 5xx，回 `ok:false`） |
+
+**MCP 管理面板**（侧栏 `MCP`，快捷键 `Ctrl+9`）：可视化地**启用开关**（复用
+`GET` + `POST /api/settings` 的 `mcpEnabled`，被 `VIBE_MCP` 锁定时置灰）、查看 server 列表与
+状态、**增 / 改 / 删 server**、**测试连接**（`/api/mcp/test`）与**重载**（`/api/mcp/reload`）。
+写入**只落** `<工作区>/.vibe/mcp.json` —— 界面从不把命令拼进 argv，`command`/`args` 始终只取自该
+受信配置文件（ADR-015）。启用开关本身是「用户本人动作」（ADR-011）：走既有设置接口、不落审批，
+但**外部 MCP 工具恒 `Risk.REVIEW`**、每次调用仍需人工审批。
 
 三条信任边界（**ADR-015**）：**外部工具恒 `Risk.REVIEW`**（每次调用都走审批，不可配置放行）；
 工具名 `mcp__<server>__<tool>` **前缀隔离**，与内置工具或彼此**名字冲突时拒绝启动该 server**

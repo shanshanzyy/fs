@@ -71,6 +71,8 @@ from ..mcp.registry import (
     NAME_PREFIX as MCP_NAME_PREFIX,
     load_servers as load_mcp_servers,
     merge_mcp,
+    save_servers as save_mcp_servers,
+    _to_server as _parse_mcp_server,
 )
 from ..sandbox import Risk
 from ..terminal.manager import (
@@ -1163,6 +1165,102 @@ class Session:
         if servers:
             merge_mcp(self.registry, servers, audit=self.agent.audit, manager=manager)
         return self.mcp_status()
+
+    def _mcp_write_guard(self) -> None:
+        """MCP 管理写入的前置闸门：未启用 400、执行中 409、治理面接管 400。
+
+        与 ``apply_settings`` 同一纪律：**先过闸门再落盘**，绝不留下
+        「文件改了、运行时没改」的错位。MCP 未启用时也拒绝写入 —— 否则用户会
+        配好一堆 server 却发现一个都不生效（``_mcp_registration`` 直接返回 None）。
+        """
+        if not getattr(self.agent.config, "mcp_enabled", False):
+            raise ValueError("MCP 未启用（VIBE_MCP）；请先在设置里开启后再管理 server")
+        if self.state != P.STATE_IDLE:
+            raise BusyError("任务执行中，无法修改 MCP server 配置，请先中断或等任务结束")
+        if self.governance is not None:
+            raise ValueError("治理面已接管，界面不支持修改 MCP server 配置")
+
+    def _mcp_load_existing(self) -> dict[str, Any]:
+        """读取既有 servers（按 name 建索引）。坏配置抛 ``ValueError``，绝不覆盖。"""
+        try:
+            return {s.name: s for s in load_mcp_servers(self.agent.config.mcp_config_path)}
+        except McpClientError as exc:
+            raise ValueError(f"MCP 配置文件无法读取，已拒绝写入：{exc}") from exc
+
+    def mcp_upsert_server(self, body: dict[str, Any]) -> dict[str, Any]:
+        """`POST /api/mcp/servers`：新增 / 替换一个 server 配置（用户本人动作，ADR-011）。
+
+        只**写配置文件**、不拼命令：argv 仍只来自受信配置文件（ADR-015）。单条
+        先经 ``_to_server()`` 校验，非法即 400 且整份不写（不做部分写入）。成功后
+        记 ``mcp.server_added`` 并自动 reload —— 新 server 的 `mcp__*` 工具即刻可查。
+        """
+        self._mcp_write_guard()
+        item = body.get("server")
+        if not isinstance(item, dict):
+            raise ValueError("缺少 server 对象")
+        parsed = _parse_mcp_server(str(item.get("name") or "").strip(), item)
+        if parsed is None:
+            raise ValueError("server 配置非法：name 不能为空，stdio 需要 command，http 需要 url")
+
+        existing = self._mcp_load_existing()
+        existing[parsed.name] = parsed
+        save_mcp_servers(existing.values(), self.agent.config.mcp_config_path)
+        self.agent.audit.record(
+            "mcp.server_added",
+            server=parsed.name,
+            transport=parsed.transport,
+            argc=len(parsed.args),
+        )
+        return self.mcp_reload()
+
+    def mcp_delete_server(self, name: str) -> dict[str, Any]:
+        """`POST /api/mcp/servers/remove`：从配置里移除一个 server（用户本人动作）。
+
+        不存在即 400；存在则写回配置文件、关掉实例并 reload —— 该 server 的
+        `mcp__*` 工具随之从 registry 消失。只记 ``mcp.server_removed`` 元数据。
+        """
+        self._mcp_write_guard()
+        server_name = str(name or "").strip()
+        if not server_name:
+            raise ValueError("缺少 name")
+        existing = self._mcp_load_existing()
+        removed = existing.pop(server_name, None)
+        if removed is None:
+            raise ValueError(f"server 不存在：{server_name}")
+        save_mcp_servers(existing.values(), self.agent.config.mcp_config_path)
+        self.agent.audit.record(
+            "mcp.server_removed",
+            server=server_name,
+            transport=removed.transport,
+            argc=len(removed.args),
+        )
+        # reload 内部 detach_all() 会连该 server 的实例一并关掉，并从清单摘除工具。
+        return self.mcp_reload()
+
+    def mcp_test_server(self, name: str) -> dict[str, Any]:
+        """`POST /api/mcp/test`：起一次该 server 并列工具（复用 manager 惰性启动）。
+
+        与 ``list_tools`` 同路径：首次调用即 spawn + 握手；失败**不抛**，如实回
+        `{ok:false, error}` 供界面就地提示。这次动作的审计由 ``mcp.server_start``
+        覆盖（manager 里记账），无需新事件。
+        """
+        server_name = str(name or "").strip()
+        if not server_name:
+            raise ValueError("缺少 name")
+        manager = get_mcp_manager()
+        try:
+            tools = manager.list_tools(server_name)
+        except McpClientError as exc:
+            return {"ok": False, "name": server_name, "error": str(exc), "tools": []}
+        return {
+            "ok": True,
+            "name": server_name,
+            "count": len(tools),
+            "tools": [
+                f"{MCP_NAME_PREFIX}{server_name}__{str(t.get('name') or '')}"
+                for t in tools
+            ],
+        }
 
     # ------------------------------------------------------------------ 多模态图片（N/P1-10）
     def upload_image(

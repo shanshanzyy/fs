@@ -31,7 +31,12 @@ from agent_core.config import Config  # noqa: E402
 from agent_core.host.session import Session  # noqa: E402
 from agent_core.mcp import McpManager, McpServerConfig, load_servers, merge_mcp  # noqa: E402
 from agent_core.mcp.manager import set_manager  # noqa: E402
-from agent_core.mcp.registry import NAME_PREFIX, sanitize_schema  # noqa: E402
+from agent_core.mcp.registry import (  # noqa: E402
+    NAME_PREFIX,
+    dump_servers,
+    sanitize_schema,
+    save_servers,
+)
 from agent_core.sandbox import CommandGuard, PathGuard, Risk  # noqa: E402
 from agent_core.tools import ToolContext, ToolRegistry, ToolResult, ToolSpec  # noqa: E402
 from agent_core.tools.base import UNTRUSTED_BEGIN  # noqa: E402
@@ -274,6 +279,47 @@ class ConfigFileTests(_ServerFixture):
 
     def test_missing_file_is_not_an_error(self) -> None:
         self.assertEqual(load_servers(self.ws / "nope.json"), [])
+
+
+class RegistryWriteTests(_ServerFixture):
+    """A：`dump_servers` / `save_servers` —— 导出形态、往返等值、原子写。"""
+
+    def test_dump_load_roundtrip(self) -> None:
+        configs = [
+            McpServerConfig(name="fs", command="node", args=("server.js", "--x")),
+            McpServerConfig(name="web", transport="http", url="http://127.0.0.1:9/mcp"),
+            McpServerConfig(name="env", command="npx", env={"A": "1", "B": "2"}),
+        ]
+        path = self.ws / "out" / "mcp.json"  # 目标目录不存在，save 应自建
+        save_servers(configs, path)
+        self.assertTrue(path.is_file())
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(set(doc["mcpServers"]), {"fs", "web", "env"})
+        back = {s.name: s for s in load_servers(path)}
+        self.assertEqual(back["fs"].args, ("server.js", "--x"))
+        self.assertEqual(back["web"].transport, "http")
+        self.assertEqual(back["web"].url, "http://127.0.0.1:9/mcp")
+        self.assertEqual(dict(back["env"].env), {"A": "1", "B": "2"})
+
+    def test_dump_omits_empty_fields(self) -> None:
+        item = dump_servers([McpServerConfig(name="fs", command="node")])["mcpServers"]["fs"]
+        self.assertNotIn("args", item)
+        self.assertNotIn("env", item)
+        self.assertNotIn("url", item)
+
+    def test_save_is_atomic_on_failure(self) -> None:
+        from unittest import mock
+
+        path = self.ws / "mcp.json"
+        save_servers([McpServerConfig(name="a", command="node")], path)
+        before = path.read_text(encoding="utf-8")
+        with mock.patch("agent_core.mcp.registry.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                save_servers([McpServerConfig(name="b", command="npx")], path)
+        # 中途失败：目标文件保持原样，绝不留半截 JSON。
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual([s.name for s in load_servers(path)], ["a"])
 
 
 class SessionWiringTests(_ServerFixture):

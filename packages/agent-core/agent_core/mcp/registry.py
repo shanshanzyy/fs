@@ -25,10 +25,11 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from ..sandbox import Risk
 from ..tools.base import ToolContext, ToolResult, ToolSpec, ToolPreview, wrap_untrusted
@@ -59,11 +60,19 @@ class McpServerConfig:
     url: str = ""                     # http：JSON-RPC 端点
 
     def to_api(self) -> dict[str, Any]:
+        """回**完整**配置：界面既要看「接的是哪个 server」，也要能**原地编辑**。
+
+        `command` 回全路径、`args` / `env` 一并回传 —— 否则「编辑」浮层无法回填，
+        一保存就会把 argv 抹掉（把绝对路径换成 basename、把参数清空）。这不改变
+        信任边界：配置文件本就躺在用户自己的 `<workspace>/.vibe/mcp.json` 里，
+        同源令牌保护的界面读到的只是同一份内容；**治理面上传**仍只记元数据（ADR-006）。
+        """
         return {
             "name": self.name,
             "transport": self.transport,
-            # 只回可执行文件名，不回完整 argv —— 界面要的是「接的是哪个 server」
-            "command": Path(self.command).name if self.command else "",
+            "command": self.command,
+            "args": list(self.args),
+            "env": dict(self.env),
             "url": self.url,
         }
 
@@ -138,6 +147,44 @@ def _to_server(fallback_name: str, item: dict[str, Any]) -> McpServerConfig | No
     return McpServerConfig(
         name=name, transport=transport, command=command, args=args, env=env, url=url
     )
+
+
+def dump_servers(configs: Iterable[McpServerConfig]) -> dict[str, Any]:
+    """把 server 配置导出成落盘文档：``{"version": 1, "mcpServers": {...}}``。
+
+    字段顺序稳定、只写非空字段 —— 与 ``load_servers()`` 的读取口径对称：
+    写出去的文档再读回来应当逐字段等值。文档形态与 Claude Desktop 的
+    `mcpServers` 一致，用户可以手改，也可以被本函数覆盖。
+    """
+    servers: dict[str, Any] = {}
+    for cfg in configs:
+        item: dict[str, Any] = {"transport": cfg.transport}
+        if cfg.transport == "http":
+            item["url"] = cfg.url
+        else:
+            item["command"] = cfg.command
+            if cfg.args:
+                item["args"] = list(cfg.args)
+        if cfg.env:
+            item["env"] = dict(cfg.env)
+        servers[cfg.name] = item
+    return {"version": 1, "mcpServers": servers}
+
+
+def save_servers(configs: Iterable[McpServerConfig], path: str | Path) -> dict[str, Any]:
+    """原子写 servers 配置：同目录 ``.tmp`` + ``os.replace``。
+
+    中途失败不会留下半截 JSON —— 与 ``host/settings.py::save_settings`` 同一纪律。
+    调用方负责先校验（见 ``_to_server``）：这里不做部分写入，写入的永远是一份
+    完整合法的文档。**argv 仍只来自受信配置文件**，本函数只是把它落盘（ADR-015）。
+    """
+    document = dump_servers(configs)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, target)
+    return document
 
 
 # --------------------------------------------------------------------------- schema
@@ -372,8 +419,10 @@ __all__ = [
     "NAME_PREFIX",
     "McpServerConfig",
     "build_server_specs",
+    "dump_servers",
     "load_servers",
     "make_spec",
     "merge_mcp",
     "sanitize_schema",
+    "save_servers",
 ]

@@ -2108,6 +2108,7 @@ const PANEL_TITLES = {
   git: 'Git',
   tests: '测试',
   memory: '记忆',
+  mcp: 'MCP',
   welcome: '开始',
 };
 
@@ -2126,6 +2127,7 @@ function switchPanel(name) {
   if (name === 'history') loadHistory();
   if (name === 'tests') refreshTestsTree();
   if (name === 'memory') refreshMemories();
+  if (name === 'mcp') refreshMcpPanel();
   if (name === 'welcome') activateEditor('welcome');
 }
 
@@ -3416,6 +3418,202 @@ function addRememberButton(node, text) {
   node.appendChild(btn);
 }
 
+/* ---- 外部 MCP server（L 管理面） ----
+   写入只落 <工作区>/.vibe/mcp.json：命令 / 参数只取自该受信配置文件，
+   界面**从不**把它们拼进 argv（ADR-015）。外部工具恒 REVIEW、每次调用都经审批浮层。 */
+async function refreshMcpPanel() {
+  const list = $('mcp-list');
+  if (!list) return;
+  const addBtn = $('btn-mcp-add');
+  try {
+    const status = await api.get('/api/mcp/status');
+    // 开关状态 / 环境变量锁定（复用既有设置接口，字段按显式存在提交）
+    try {
+      const info = await api.get('/api/settings');
+      const box = $('mcp-enabled');
+      box.checked = info.mcpEnabled === true;
+      lockField('mcp-enabled', (info.envLocked || {}).mcp_enabled);
+    } catch {
+      /* 读不到设置不影响 status 的展示 */
+    }
+    addBtn.disabled = status.enabled === false;
+    if (status.enabled === false) {
+      list.replaceChildren(
+        el('div', 'empty', 'MCP 未启用。勾选上方「启用 MCP」后即可管理 server。')
+      );
+      return;
+    }
+    const servers = status.servers || [];
+    const nodes = [];
+    if (status.configError) {
+      nodes.push(el('div', 'empty', '配置文件有问题：' + status.configError));
+    }
+    if (!servers.length) {
+      nodes.push(el('div', 'empty', '还没有配置 server。点「新增 server」添加一个。'));
+    } else {
+      nodes.push(...servers.map((s) => mcpRow(s)));
+    }
+    list.replaceChildren(...nodes);
+  } catch (err) {
+    list.replaceChildren(el('div', 'empty', '加载失败：' + err.message));
+  }
+}
+
+function mcpRow(server) {
+  const row = el('div', 'mcp-item');
+  const head = el('div', 'mcp-head');
+  head.appendChild(el('span', 'mcp-name', server.name || '(未命名)'));
+  head.appendChild(el('span', 'mcp-transport', server.transport || 'stdio'));
+  if (server.running) head.appendChild(el('span', 'mcp-state is-running', '运行中'));
+  else if (server.available === false) head.appendChild(el('span', 'mcp-state is-bad', '不可用'));
+  else head.appendChild(el('span', 'mcp-state is-idle', '未启动'));
+  head.appendChild(el('span', 'mcp-tools', `${(server.tools || []).length} 工具`));
+  row.appendChild(head);
+
+  const target = server.transport === 'http' ? server.url : server.command;
+  if (target) row.appendChild(el('div', 'mcp-target', target));
+  if (server.available === false && server.reason) {
+    row.appendChild(el('div', 'mcp-reason', server.reason));
+  }
+
+  const acts = el('div', 'mcp-actions');
+  const test = el('button', 'btn btn-small', '测试');
+  test.type = 'button';
+  test.addEventListener('click', () => testMcpServer(server.name));
+  const edit = el('button', 'btn btn-small', '编辑');
+  edit.type = 'button';
+  edit.addEventListener('click', () => openMcpModal(server));
+  const del = el('button', 'btn btn-small', '删除');
+  del.type = 'button';
+  del.addEventListener('click', () => removeMcpServer(server.name));
+  acts.append(test, edit, del);
+  row.appendChild(acts);
+  return row;
+}
+
+function openMcpModal(server) {
+  $('mcp-modal').hidden = false;
+  $('mcp-error').hidden = true;
+  $('mcp-msg').textContent = '';
+  $('mcp-modal-title').textContent = server ? `编辑 server：${server.name}` : '新增 server';
+  $('mcp-f-name').value = server ? server.name || '' : '';
+  // 编辑时名称只读：改名会被后端当作「新增」而留下旧的同名项，容易困惑。
+  $('mcp-f-name').disabled = !!server;
+  if (server) $('mcp-f-name').title = '编辑时不可改名（如需改名请先删除再新增）';
+  else $('mcp-f-name').removeAttribute('title');
+  $('mcp-f-transport').value = server ? server.transport || 'stdio' : 'stdio';
+  $('mcp-f-command').value = server ? server.command || '' : '';
+  $('mcp-f-args').value = server && Array.isArray(server.args) ? server.args.join('\n') : '';
+  $('mcp-f-url').value = server ? server.url || '' : '';
+  const env = (server && server.env) || {};
+  $('mcp-f-env').value = Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n');
+  syncMcpTransportFields();
+  $('mcp-f-name').focus();
+}
+
+function closeMcpModal() {
+  $('mcp-modal').hidden = true;
+}
+
+/** 按传输类型禁用无关字段：stdio 用不上 URL，http 用不上 command/args。 */
+function syncMcpTransportFields() {
+  const http = $('mcp-f-transport').value === 'http';
+  $('mcp-f-url').disabled = !http;
+  $('mcp-f-command').disabled = http;
+  $('mcp-f-args').disabled = http;
+}
+
+function showMcpError(message) {
+  const box = $('mcp-error');
+  box.hidden = false;
+  box.textContent = message || '';
+}
+
+async function saveMcpServer() {
+  const name = $('mcp-f-name').value.trim();
+  const transport = $('mcp-f-transport').value === 'http' ? 'http' : 'stdio';
+  if (!name) { showMcpError('请填写 server 名称'); return; }
+  const server = { name, transport };
+  if (transport === 'http') {
+    const url = $('mcp-f-url').value.trim();
+    if (!url) { showMcpError('http 传输需要填写 URL'); return; }
+    server.url = url;
+  } else {
+    const command = $('mcp-f-command').value.trim();
+    if (!command) { showMcpError('stdio 传输需要填写命令'); return; }
+    server.command = command;
+    const args = $('mcp-f-args').value.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (args.length) server.args = args;
+  }
+  const env = {};
+  for (const line of $('mcp-f-env').value.split('\n')) {
+    const text = line.trim();
+    const eq = text.indexOf('=');
+    if (eq > 0) env[text.slice(0, eq).trim()] = text.slice(eq + 1).trim();
+  }
+  if (Object.keys(env).length) server.env = env;
+
+  const btn = $('btn-mcp-save');
+  btn.disabled = true;
+  $('mcp-error').hidden = true;
+  try {
+    await api.post('/api/mcp/servers', { server });
+    toast('已保存', 'ok');
+    closeMcpModal();
+    refreshMcpPanel();
+  } catch (err) {
+    // 409 = 任务执行中；400 = 后端校验原文（未启用 / 配置非法 / 治理面接管）
+    showMcpError(err.message);
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function removeMcpServer(name) {
+  if (!confirm(`删除 server「${name}」？`)) return;
+  try {
+    await api.post('/api/mcp/servers/remove', { name });
+    toast('已删除', 'ok');
+    refreshMcpPanel();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function testMcpServer(name) {
+  try {
+    const res = await api.post('/api/mcp/test', { name });
+    if (res.ok) toast(`连接成功，${res.count} 个工具`, 'ok');
+    else toast(res.error || '连接失败', 'error');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function reloadMcpServers() {
+  try {
+    await api.post('/api/mcp/reload', {});
+    toast('已重载', 'ok');
+    refreshMcpPanel();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function toggleMcpEnabled(checked) {
+  const box = $('mcp-enabled');
+  try {
+    // 只提交 mcpEnabled 一项（按显式存在，false 也要落盘为「关闭」）
+    await api.post('/api/settings', { mcpEnabled: checked });
+    toast(checked ? '已启用 MCP' : '已关闭 MCP', 'ok');
+    refreshMcpPanel();
+  } catch (err) {
+    box.checked = !checked; // 失败回滚复选框状态
+    toast(err.message, 'error');
+  }
+}
+
 function replayHistory(messages) {
   for (const m of messages) {
     if (m.role === 'user') {
@@ -3992,6 +4190,7 @@ const KEYMAP = [
   { chord: 'Ctrl+6', id: 'panel.git', label: '打开：Git 面板', group: '面板', run: () => switchPanel('git') },
   { chord: 'Ctrl+7', id: 'panel.tests', label: '打开：测试面板', group: '面板', run: () => switchPanel('tests') },
   { chord: 'Ctrl+8', id: 'panel.memory', label: '打开：记忆面板', group: '面板', run: () => switchPanel('memory') },
+  { chord: 'Ctrl+9', id: 'panel.mcp', label: '打开：MCP 面板', group: '面板', run: () => switchPanel('mcp') },
   { chord: 'Ctrl+`', id: 'panel.bottom', label: '收起/展开底部面板', group: '视图', run: () => toggleBottom($('bottom-panel').classList.contains('is-collapsed')) },
   // 编辑面：改写（Ctrl+K）与保存（Ctrl+S）。旧实现 Shift 不敏感 —— 两个变体都接住。
   { chord: 'Ctrl+k', id: 'edit.rewrite', label: '行内改写选区', group: '编辑', when: rewriteReady, run: () => openRewriteBar(S.editors.get(S.activeEditor)) },
@@ -4005,6 +4204,7 @@ const KEYMAP = [
   { chord: 'Esc', id: 'ui.close-rename', label: '关闭重命名条', palette: false, when: () => !$('rename-bar').hidden && !S.awaiting, run: closeRenameBar },
   { chord: 'Esc', id: 'ui.close-workspace', label: '关闭工作区弹窗', palette: false, when: () => !$('ws-modal').hidden, run: closeWorkspaceModal },
   { chord: 'Esc', id: 'ui.close-settings', label: '关闭模型设置', palette: false, when: () => !$('settings-modal').hidden, run: closeSettingsModal },
+  { chord: 'Esc', id: 'ui.close-mcp', label: '关闭 MCP 浮层', palette: false, when: () => !$('mcp-modal').hidden, run: closeMcpModal },
   { chord: 'Esc', id: 'ui.close-checkpoints', label: '关闭回滚浮层', palette: false, when: () => !$('cp-modal').hidden && !S.awaiting, run: closeCheckpoints },
   { chord: 'Esc', id: 'approval.deny', label: '拒绝审批（默认动作）', palette: false, when: () => !!S.awaiting, run: () => decide('deny') },
   { chord: 'Ctrl+Enter', id: 'approval.approve', label: '批准审批', palette: false, when: () => !!S.awaiting, run: () => decide('approve') },
@@ -4391,6 +4591,24 @@ function bind() {
 
   // 记忆面板（P2-15）：用户本人写入（模型侧写入另走 remember 工具的审批闸门）
   $('btn-mem-add').addEventListener('click', addMemoryFromPanel);
+
+  // MCP 面板（L 管理面）：开关 / 新增 / 重载 / 浮层按钮（写入只落配置文件）
+  $('mcp-enabled').addEventListener('change', (event) => toggleMcpEnabled(event.target.checked));
+  $('btn-mcp-add').addEventListener('click', () => openMcpModal(null));
+  $('btn-mcp-reload').addEventListener('click', reloadMcpServers);
+  $('btn-mcp-cancel').addEventListener('click', closeMcpModal);
+  $('btn-mcp-save').addEventListener('click', saveMcpServer);
+  $('mcp-f-transport').addEventListener('change', syncMcpTransportFields);
+  $('mcp-modal').addEventListener('click', (event) => {
+    if (event.target === $('mcp-modal')) closeMcpModal();
+  });
+  // 浮层内回车保存（文本域保留换行，不触发保存）
+  $('mcp-modal').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && event.target.tagName !== 'BUTTON' && event.target.tagName !== 'TEXTAREA') {
+      event.preventDefault();
+      saveMcpServer();
+    }
+  });
 
   // 编辑器工具条
   $('btn-md-toggle').addEventListener('click', toggleMarkdownMode);

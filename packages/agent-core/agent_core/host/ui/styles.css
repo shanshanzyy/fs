@@ -347,6 +347,32 @@ pre, code, kbd { font-family: var(--mono); }
 .mem-meta .icon-btn { margin-left: auto; }
 .mem-meta .icon-btn:hover { color: var(--danger); }
 
+/* ── MCP 管理面（L） ── */
+.mcp-toggle { padding: 2px 8px 6px; display: flex; flex-direction: column; gap: 4px; }
+.mcp-note { font-size: 11px; color: var(--fg-faint); line-height: 1.5; }
+.mcp-actions-top { display: flex; gap: 6px; padding: 0 6px 8px; }
+.mcp-actions-top .btn { flex: 0 0 auto; }
+.mcp-item {
+  padding: 7px 8px; border-radius: 6px; margin: 0 6px 6px;
+  background: var(--panel-2); border: 1px solid var(--line-soft);
+}
+.mcp-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mcp-name { font-size: 12.5px; color: var(--fg); word-break: break-all; }
+.mcp-transport {
+  padding: 0 5px; border-radius: 6px; background: var(--raise);
+  color: var(--fg-dim); font-size: 10.5px;
+}
+.mcp-state { padding: 0 5px; border-radius: 6px; font-size: 10.5px; background: var(--raise); color: var(--fg-faint); }
+.mcp-state.is-running { color: var(--ok); }
+.mcp-state.is-bad { color: var(--danger); }
+.mcp-tools { margin-left: auto; font-size: 10.5px; color: var(--fg-faint); }
+.mcp-target {
+  margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mcp-reason { margin-top: 3px; font-size: 11.5px; color: var(--danger); word-break: break-word; }
+.mcp-actions { display: flex; gap: 6px; margin-top: 6px; }
+
 /* 对话流里的「记住这条」：默认淡，悬停浮现，别抢正文的注意力 */
 .remember-btn {
   display: block; margin-top: 6px; padding: 2px 8px; border-radius: 6px;
