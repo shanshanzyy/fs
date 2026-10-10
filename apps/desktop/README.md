@@ -223,7 +223,7 @@ python -m agent_core -w <目录> --check
 
 ```bash
 # 1) 打内嵌后端（PyInstaller onefile）并组装分发目录
-python scripts/build_desktop.py --dist
+python scripts/build_desktop.py
 
 # 2) 打包冒烟：两条后端路径各跑一轮，含健康检查 / mock 对话 / 截图 / 残留进程断言
 python scripts/e2e_package.py

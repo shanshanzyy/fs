@@ -138,6 +138,32 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 
 ---
 
+## CI 与发版
+
+**CI 门禁**（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：push / PR 自动跑
+三条独立跑道（互不阻塞），任一失败即整体变红：
+
+| 跑道 | 覆盖 |
+|---|---|
+| `agent-core (py3.10 / py3.13)` | 内核单元与端到端测试 —— **只装 pytest**，顺带证明「零第三方依赖也能跑」 |
+| `server (py3.13)` | 治理面测试 |
+| `desktop (node20)` | `npm ci` 校验 lockfile 与 `package.json` 一致 + 主进程 / preload / host UI 全量语法检查 |
+
+**发版前的打包冒烟刻意不进 CI**：Windows 打包链路重、耗时长且吃额度，挂在每次 push 上
+性价比太低，因此改在**发版时手动执行**。它会打内嵌后端、组装分发目录，再对**真实分发包**
+跑两遍后端来源的端到端验收（内嵌二进制 / 回退系统 Python），含健康检查、mock 对话、截图
+与残留进程断言：
+
+```bash
+cd packages/agent-core
+python scripts/e2e_package.py --build    # 先重新打包再冒烟
+# 产出 dist/desktop/VibeAgent-<版本>-<平台>-<架构>/
+```
+
+步骤与产物结构详见[桌面客户端文档](apps/desktop/README.md) §分发与冒烟。
+
+---
+
 ## 文档
 
 - [整体架构设计](docs/ARCHITECTURE.md) —— 双平面架构、10 条 ADR、5 阶段演进路线、选型矩阵
