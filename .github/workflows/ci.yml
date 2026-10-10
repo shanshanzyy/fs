@@ -35,7 +35,19 @@ jobs:
       # 顺带证明「不装第三方包也能跑起来」这条承诺没被破坏。
       - name: 跑内核测试
         working-directory: packages/agent-core
-        run: python -m pytest tests -q
+        run: |
+          set +e
+          python -m pytest tests -q --tb=line > /tmp/pytest.log 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            # 失败清单抬成 check-run 注解：无需日志下载权限即可从 API 读到，
+            # 便于在无法拉取 job log 的环境里定位 Linux/Windows 环境差异。
+            grep -E "^(FAILED|ERROR)" /tmp/pytest.log | head -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            tail -n 30 /tmp/pytest.log
+          fi
+          exit "$code"
 
   # 治理面：同样零第三方依赖，与内核等价的一条跑道。
   server:
@@ -50,7 +62,17 @@ jobs:
         run: python -m pip install --upgrade pip pytest
       - name: 跑服务端测试
         working-directory: apps/server
-        run: python -m pytest tests -q
+        run: |
+          set +e
+          python -m pytest tests -q --tb=line > /tmp/pytest.log 2>&1
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            grep -E "^(FAILED|ERROR)" /tmp/pytest.log | head -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            tail -n 30 /tmp/pytest.log
+          fi
+          exit "$code"
 
   # 桌面壳：Node 侧没有测试套件，门禁做两件事 ——
   # 1) npm ci 验证 lockfile 与 package.json 一致（依赖漂移拦截）；
