@@ -100,6 +100,9 @@ class FileSecretStoreTests(TempDirTestCase):
     def test_invalid_json_rejected(self) -> None:
         path = self.tmp / "secrets.json"
         path.write_text("{not json", encoding="utf-8")
+        # POSIX 上构造会**先**查权限：不显式收成 0600，umask 给的 0644 会让
+        # 这条用例撞上「权限过宽」而不是它真正要测的 JSON 解析。
+        os.chmod(path, 0o600)
         store = FileSecretStore(path)
         # 解析是**惰性**的：构造只查存在性与权限，内容在首次读取时才解析。
         # doctor 走 names()，所以这条路径同样会在自检里被拦住。
@@ -122,6 +125,7 @@ class FileSecretStoreTests(TempDirTestCase):
     def test_oversized_file_rejected(self) -> None:
         path = self.tmp / "secrets.json"
         path.write_text(json.dumps({"a": "x" * (secrets_mod.MAX_SECRET_BYTES + 1)}), encoding="utf-8")
+        os.chmod(path, 0o600)  # 同 test_invalid_json_rejected：先过权限关，才轮到体积关
         store = FileSecretStore(path)
         with self.assertRaises(ConfigError) as ctx:
             store.names()
@@ -235,6 +239,8 @@ class DoctorSecretTests(TempDirTestCase):
             json.dumps({"cloud-main": "sk-abcdef1234567890", "local-main": "localkey-1234"}),
             encoding="utf-8",
         )
+        # doctor 自检会读真实文件权限：POSIX 上必须收成 0600，否则会被判「权限过宽」。
+        os.chmod(path, 0o600)
         # 只关心密钥托管这一项；全局策略没发布会让 doctor 整体退出 1，故不断言退出码。
         _, output = self._run_doctor(
             VIBE_SRV_SECRETS_PROVIDER="file",

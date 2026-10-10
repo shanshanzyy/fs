@@ -38,10 +38,12 @@ class BuildScriptTests(unittest.TestCase):
     def test_backend_binary_lands_inside_desktop_resources(self) -> None:
         path = build_desktop.backend_binary_path()
         self.assertEqual(path.parent, DESKTOP / "resources" / "backend")
-        # Electron 侧只认 <resources>/backend/<name>，dev 与打包后同一相对位置
+        # Electron 侧只认 <resources>/backend/<name>，dev 与打包后同一相对位置。
+        # 文件名按平台而定（win32 有 .exe，类 Unix 无后缀），故走同一个来源，
+        # 不硬编码 —— 否则这条用例在 Linux/macOS 上必红。
         self.assertEqual(
             path.relative_to(DESKTOP).as_posix(),
-            "resources/backend/vibe-agent-core.exe",
+            f"resources/backend/{build_desktop.embedded_binary_name()}",
         )
 
     def test_dist_dir_name_carries_version(self) -> None:
