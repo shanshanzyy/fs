@@ -164,7 +164,8 @@ class VocabularyContractTests(unittest.TestCase):
             "gateway.request", "gateway.response", "gateway.denied",
             "policy.fetch", "policy.rejected",
         }
-        # 这些是 M2 客户端已实现但尚未接线的事件（见 TODO）
+        # 目前没有「客户端已实现但尚未接线」的事件，故集合留空；
+        # 若将来有，在此登记，避免上面那条反向检查把未接线误报为漂移。
         not_yet_wired: set[str] = set()
 
         produced = {

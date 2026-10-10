@@ -1549,7 +1549,7 @@ E:/VibeCoding/
 │     ├─ checkpoint.py          # ★ M1.5：写前快照 + 链式 restore / redo
 │     ├─ project_rules.py       # ★ M1.5：VIBE.md 项目记忆
 │     ├─ cli.py                 # M0 阶段的入口，现与桌面端并存
-│     ├─ tests/                 # 308 个单元与端到端测试
+│     ├─ tests/                 # 754 个单元与端到端测试（752 通过 / 2 跳过）
 │     └─ scripts/               # 假模型服务 + 会话 / 桌面 / 打包 / 治理面冒烟
 ├─ infra/
 │  ├─ docker-compose.yml        # ✗ 未落盘：E4 定档为「拷目录 + 环境变量」（切换条件见 README §边界）
