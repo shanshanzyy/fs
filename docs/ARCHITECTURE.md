@@ -1398,12 +1398,22 @@ subtest）**变红**，已还原。
 **8 档全绿（退出码 0、无残留进程）**。
 **反向验证（M）**：临时把 `TerminalManager.close()` 的 `backend.close()` 注释掉（退化为
 「关会话但杀不了子进程」）→ `test_close_leaves_no_process` **变红**（`关闭后子进程仍残留`），已还原。
-**环境说明**：本机 Windows ConPTY 调用失败（诊断阶段为 `CreatePseudoConsole` 返回
-`HRESULT 0x80070006` / `E_HANDLE`，`GetLastError=5`；浏览器实测阶段失败点又落在
-`UpdateProcThreadAttribute`），即该环境 ConPTY 不可用 —— 失败即抛「不支持」→ 降级管道模式，
-屏幕/回显用例①显式 skip，降级路径用例⑤覆盖；Unix 上 PTY 正常。属环境限制而非代码缺陷
-（`available()` 只探测 API 存在性，实际可用性由 `spawn` 决定，故失败点会在两个 API 间浮动，
-但都走同一条降级路径）。
+**环境说明与纠偏（2026-10-12）**：M 阶段曾把 Windows ConPTY 起不来记为「环境限制而非代码缺陷」，
+**该结论是错的**。实测定位到两个真缺陷，均已修：
+① `UpdateProcThreadAttribute` 第 3 个形参是 `DWORD_PTR Attribute`（**按值**传属性 ID），原实现写成
+`byref(c_size_t(...))` + `POINTER(c_size_t)`，等于把「临时变量的地址」当属性 ID 送进去，Windows 返回
+`ERROR_NOT_SUPPORTED(50)` —— 同一次运行内的 A/B 对照已证（byref 失败 err=50 / 按值成功 err=0）；
+② 交给 `CreatePseudoConsole` 的输入读端与输出写端，官方示例要求**在 `CreateProcess` 之后**释放
+（`creating-a-pseudoconsole-session` 明确警告句柄生命周期管理不当会死锁/断通道），原实现在
+`CreateProcess` **之前**就关了。`available()` 只探测 API 存在性这一条不变；本机自动化 shell 内 ConPTY
+仍不可用（教科书参考实现在同一环境同样表现为 `CreatePseudoConsole` 时而 `E_HANDLE`、时而成功却读不到
+输出），故屏幕/回显用例①在本机显式 skip，CI 在 Linux 上走 Unix PTY 正常。
+③ 对「起得来、送不出」的哑终端，`_create` 改为**有界自检后降级**：伪终端起来后 `PTY_PROBE_SECONDS`
+（2.5s）内收不到任何输出即丢弃它、如实降级为管道模式并回填 `fallbackReason`；自检期间已读到的开头字节
+经 `warm` 交回 `on_data`，不丢第一屏。管道后端在 Windows 上加 `CREATE_NO_WINDOW`，避免父进程无控制台时
+给子控制台程序新开一个原生终端窗口（桌面壳以 `windowsHide` 拉起后端，正是该场景）。改后实测（本机 +
+端到端 HTTP 探针）：三轮 open→close 全成功、`VIBE_TERM_OK` 回显到达、`mode='pipe'` 且 `fallbackReason`
+如实说明，界面不再弹原生窗口。
 
 **N / O 阶段的验收实测值**：N 收口 agent-core **605 收集 / 603 passed / 2 skipped / 60 subtests**、
 服务端 **262 收集 / 260 passed / 2 skipped / 383 subtests**；O 收口 agent-core **627 收集 /

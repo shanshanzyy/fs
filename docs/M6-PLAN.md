@@ -225,11 +225,23 @@ Windows 能起终端，ConPTY 不可用时**降级管道模式并在界面如实
 `run_command`）；ADR-006（审计只记 `*_digest` / 计数）；核心链路零强制依赖（`dependencies` 保持 `[]`，
 ConPTY 用 `ctypes`、Unix 用标准库 `pty`/`fcntl`）。
 
-**环境说明**：本机 Windows 上 ConPTY 调用失败（诊断阶段见 `CreatePseudoConsole` 返回 `HRESULT 0x80070006`
-`E_HANDLE` / `GetLastError=5`；浏览器实测阶段失败点又落在 `UpdateProcThreadAttribute`），即**该环境 ConPTY
-不可用**——按计划设计，失败即抛「不支持」→ 降级管道模式，屏幕/回显用例①显式 skip、降级路径用例⑤覆盖；
-Unix 上 PTY 正常。这是环境限制而非代码缺陷（`available()` 只探测 API 存在性，实际可用性只能靠 `spawn` 验证，
-故失败点会随运行在 `CreatePseudoConsole` / `UpdateProcThreadAttribute` 之间浮动，但都归入同一降级路径）。
+**环境说明与纠偏（2026-10-12）**：M 收口时本机 ConPTY 起不来，当时记为「该环境 ConPTY 不可用 /
+环境限制而非代码缺陷」—— **该结论是错的**，后续实测定位到两个真缺陷并已修：
+① `pty_windows._build_attr_list` 里 `UpdateProcThreadAttribute` 的属性 ID 形参是 `DWORD_PTR`（按值），
+原实现写成 `byref(c_size_t(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE))` + `POINTER(c_size_t)`，把「临时变量的
+地址」当属性 ID 送进去 → `ERROR_NOT_SUPPORTED(50)`；同一次运行内 A/B 对照：byref 失败 err=50、按值成功
+err=0。
+② 交给 `CreatePseudoConsole` 的输入读端 / 输出写端句柄，官方示例要求在 **`CreateProcess` 之后**释放
+（`creating-a-pseudoconsole-session` 警告句柄生命周期管理不当会死锁/断通道），原实现在 `CreateProcess`
+**之前**就关了。
+修后本机自动化 shell 内 ConPTY 仍跑不通（教科书参考实现在同一环境同样 `CreatePseudoConsole` 时而
+`E_HANDLE`、时而成功却读不到任何输出），故屏幕/回显用例①在本机仍显式 skip、降级路径用例⑤覆盖；CI 在
+Linux 上走 Unix PTY 正常。真机（桌面应用进程上下文）的回显需人工复核一次。
+③ 对「起得来、送不出」的哑终端，`manager._create` 改为**有界自检后降级**：伪终端起来后 `PTY_PROBE_SECONDS`
+（2.5s）内收不到任何输出即丢弃、如实降级为管道模式并回填 `fallbackReason`，自检期间读到的开头字节经
+`warm` 交回 `on_data` 不丢第一屏；管道后端在 Windows 上加 `CREATE_NO_WINDOW`，避免父进程无控制台时给子
+控制台程序新开原生终端窗口。改后端到端 HTTP 探针实测：三轮 open→close 全成功、`VIBE_TERM_OK` 回显到达、
+`mode='pipe'` + `fallbackReason` 如实说明。
 
 ---
 

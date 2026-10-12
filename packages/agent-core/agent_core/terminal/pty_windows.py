@@ -148,10 +148,13 @@ def _load_kernel32():
             ctypes.POINTER(ctypes.c_size_t),
         ]
         k.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+        # 第 3 个形参是 `DWORD_PTR Attribute`，**按值**传属性 ID。写成
+        # POINTER(c_size_t) + byref(...) 会把「临时变量的地址」当属性 ID 送进去，
+        # Windows 返回 ERROR_NOT_SUPPORTED(50) —— 表现为「本机 ConPTY 不可用」。
         k.UpdateProcThreadAttribute.argtypes = [
             ctypes.c_void_p,
             wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
             ctypes.c_void_p,
             ctypes.c_size_t,
             ctypes.c_void_p,
@@ -244,6 +247,8 @@ class WindowsConPtySession:
         self._hpc = None
         self._h_process = None
         self._h_thread = None
+        self._h_in_read = None
+        self._h_out_write = None
         self._h_in_write = None
         self._h_out_read = None
         self._attr_list = None
@@ -271,13 +276,15 @@ class WindowsConPtySession:
         hres = k.CreatePseudoConsole(
             size, in_read, out_write, 0, ctypes.byref(hpc)
         )
-        # 控制台已复制走它的两端，我们手上的这两个可以关掉。
-        k.CloseHandle(in_read)
-        k.CloseHandle(out_write)
         if hres != 0 or not hpc.value or hpc.value == _INVALID_HANDLE:
-            self._close_handles(in_write, out_read)
+            for handle in (in_read, out_write, in_write, out_read):
+                k.CloseHandle(handle)
             raise TerminalUnsupported(f"CreatePseudoConsole 失败（HRESULT 0x{hres & 0xFFFFFFFF:08x}）")
         self._hpc = hpc
+        # 四个句柄先都留着；交给 CreatePseudoConsole 的那两端（in_read / out_write）
+        # 要等 CreateProcess 之后才释放（见下方注释）。
+        self._h_in_read = in_read
+        self._h_out_write = out_write
         self._h_in_write = in_write
         self._h_out_read = out_read
 
@@ -307,12 +314,18 @@ class WindowsConPtySession:
         )
         k.DeleteProcThreadAttributeList(attr)
         self._attr_list = None
+        # 官方文档要求：CreatePseudoConsole 拿到的那两端（输入读端 / 输出写端）必须在
+        # **CreateProcess 之后**才释放。提前释放会断掉通道（写仍「成功」但没人读走、
+        # 也永远收不到输出）；一直不释放则本进程握着输出管道写端，读端永远等不到 EOF。
+        # 见「Creating a Pseudoconsole Session」的 Handle 生命周期说明。
+        k.CloseHandle(self._h_in_read)
+        k.CloseHandle(self._h_out_write)
+        self._h_in_read = self._h_out_write = None
         if not ok:
             err = ctypes.get_last_error()
             k.ClosePseudoConsole(hpc)
             self._hpc = None
-            self._close_handles(self._h_in_write, self._h_out_read)
-            self._h_in_write = self._h_out_read = None
+            self._close_handles()
             raise TerminalUnsupported(f"CreateProcess 失败（错误码 {err}）")
 
         self._h_process = pi.hProcess
@@ -332,24 +345,25 @@ class WindowsConPtySession:
         if size.value == 0:
             k.ClosePseudoConsole(hpc)
             self._hpc = None
-            self._close_handles(self._h_in_write, self._h_out_read)
-            self._h_in_write = self._h_out_read = None
+            self._close_handles()
             raise TerminalUnsupported("InitializeProcThreadAttributeList 取尺寸失败")
         buf = ctypes.create_string_buffer(size.value)
         if not k.InitializeProcThreadAttributeList(buf, 1, 0, ctypes.byref(size)):
             raise TerminalUnsupported("InitializeProcThreadAttributeList 失败")
         hpc_ref = ctypes.c_void_p(hpc.value)
+        ctypes.set_last_error(0)
         if not k.UpdateProcThreadAttribute(
             buf,
             0,
-            ctypes.byref(ctypes.c_size_t(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE)),
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
             ctypes.cast(ctypes.byref(hpc_ref), ctypes.c_void_p),
             ctypes.sizeof(wintypes.HANDLE),
             None,
             None,
         ):
+            err = ctypes.get_last_error()
             k.DeleteProcThreadAttributeList(buf)
-            raise TerminalUnsupported("UpdateProcThreadAttribute 失败")
+            raise TerminalUnsupported(f"UpdateProcThreadAttribute 失败（错误码 {err}）")
         return buf
 
     def _read_loop(self) -> None:
@@ -366,23 +380,24 @@ class WindowsConPtySession:
                 return
             self._queue.put(bytes(buf.raw[: read.value]))
 
-    def _close_handles(self, *extra) -> None:
+    def _close_handles(self) -> None:
         k = _load_kernel32()
         if k is None:
             return
-        handles = [
+        for handle in (
+            self._h_in_read,
+            self._h_out_write,
             self._h_in_write,
             self._h_out_read,
             self._h_process,
             self._h_thread,
-            *extra,
-        ]
-        for handle in handles:
+        ):
             if handle:
                 try:
                     k.CloseHandle(handle)
                 except Exception:  # noqa: BLE001
                     pass
+        self._h_in_read = self._h_out_write = None
         self._h_in_write = self._h_out_read = None
         self._h_process = self._h_thread = None
 

@@ -806,7 +806,7 @@ function termReset() {
 }
 
 async function termOpen() {
-  if (term.open || term.closed) return;
+  if (term.open) return;
   if (!term.enabled) { toast('交互式终端已被配置关闭（VIBE_TERM=0）', 'error'); return; }
   try {
     termResize();  // 用当前容器尺寸开一个大小合适的终端
@@ -814,6 +814,9 @@ async function termOpen() {
     term.id = res.termId;
     term.mode = res.mode;
     term.open = true;
+    // `closed` 只表示「当前这个会话已终止」，不是「终端入口作废」：新会话起来后必须
+    // 清掉，否则第一次关闭就把入口闩死，之后点「开启终端」直接 return、什么都看不到。
+    term.closed = false;
     termReset();
     const mode = $('term-mode');
     mode.hidden = false;

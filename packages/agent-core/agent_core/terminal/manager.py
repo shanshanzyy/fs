@@ -12,6 +12,11 @@
 - Windows：试 `pty_windows`（`ctypes` ConPTY），**任一 API 不可用即降级为管道模式**
   （`subprocess` + stdin/stdout 管道，无 TTY 语义、交互能力受限，但功能不崩）。
 
+「起得来」不等于「送得出」：有的环境 ConPTY 每一步都返回成功、子进程也真在跑，却一个字节都读不出来
+（界面会是一片空白）。所以在有界宽限期（`PTY_PROBE_SECONDS`）内收不到任何输出即判定「哑终端」，
+丢弃它并降级为管道模式 —— 本模块的立场是**绝不半启动**。管道后端在 Windows 上带 `CREATE_NO_WINDOW`，
+避免父进程无控制台时给子控制台程序新开一个原生终端窗口。
+
 降级是**显式的**：`status()` 如实回 `mode` 与 `fallbackReason`，界面据此给一行说明。
 
 ## 生命周期
@@ -41,6 +46,8 @@ READ_TIMEOUT = 0.2
 # 单条事件里承载的终端输出上限（防一个狂刷输出的程序把总线撑爆）；超出的分片，
 # 读循环天然会切成多条。
 READ_CHUNK = 65536
+# 伪终端自检宽限期：起得来之后多久收不到任何输出就判定「哑终端」并降级（见 _create）。
+PTY_PROBE_SECONDS = 2.5
 
 
 class TerminalError(RuntimeError):
@@ -80,6 +87,13 @@ class _PipeSession:
             stderr=subprocess.STDOUT,
             bufsize=0,
             start_new_session=(os.name != "nt"),
+            # Windows 桌面壳起后端时带了 windowsHide（见 apps/desktop/src/backend.js），
+            # 所以本进程**自己没有控制台**；此时 spawn 一个控制台程序，Windows 会给它
+            # 新开一个原生终端窗口 —— 那正是「点开启终端，弹出来的是本机终端窗口」。
+            # 管道模式的内容照走 stdout 管道渲染进界面，这个窗口纯属噪音，必须关掉。
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            ),
         )
         self._reader = threading.Thread(
             target=self._read_loop, name="pipe-reader", daemon=True
@@ -293,7 +307,7 @@ class TerminalManager:
             if len(self._sessions) >= self._max:
                 raise TerminalError(f"终端数量已达上限（{self._max} 个）")
 
-        backend, mode = self._create(argv, cwd, env, cols, rows)
+        backend, mode, warm = self._create(argv, cwd, env, cols, rows)
         now = self._clock()
         with self._lock:
             self._seq += 1
@@ -312,6 +326,12 @@ class TerminalManager:
         )
         with self._lock:
             self._sessions[term_id] = session
+        if warm and on_data is not None:
+            # 自检期间已经读到的开头输出不能丢，否则界面会缺第一屏（提示符）。
+            try:
+                on_data(term_id, warm)
+            except Exception:  # noqa: BLE001 — 回调异常不能拖垮 open
+                pass
         reader = threading.Thread(
             target=self._pump,
             args=(session, on_data, on_exit),
@@ -324,19 +344,57 @@ class TerminalManager:
 
     def _create(
         self, argv: list[str], cwd: str, env: dict[str, str], cols: int, rows: int
-    ) -> tuple[Any, str]:
-        """先试伪终端，失败则降级管道，并记下降级原因。"""
+    ) -> tuple[Any, str, bytes]:
+        """先试伪终端，失败则降级管道，并记下降级原因。
+
+        返回 `(backend, mode, warm)`：`warm` 是自检期间已经读到的开头输出，
+        **调用方必须把它交给 on_data**，否则界面会丢掉第一屏（提示符）。
+        """
         try:
             backend = self._spawn(argv, cwd, env, cols=cols, rows=rows)
+        except Exception as exc:  # noqa: BLE001 — 任何起不来都降级，而不是把界面搞崩
+            return self._pipe(argv, cwd, env, cols, rows, f"{type(exc).__name__}: {exc}")
+        warm, usable = self._warmup(backend)
+        if usable:
             self.last_mode = str(getattr(backend, "mode", "pty"))
             self.fallback_reason = ""
-            return backend, self.last_mode
-        except Exception as exc:  # noqa: BLE001 — 任何起不来都降级，而不是把界面搞崩
-            reason = f"{type(exc).__name__}: {exc}"
+            return backend, self.last_mode, warm
+        # 「起得来」不等于「送得出」：有的环境下 ConPTY 每一步都返回成功、子进程也真在
+        # 跑（会写文件、退出码 0），却一个字节都读不出来 —— 界面会是一片空白。本模块的
+        # 立场是**绝不半启动**：宁可明确降级为管道模式，也不给一个哑终端。
+        reason = "ConPTY 起得来但读不到任何输出（会话无响应）"
+        try:
+            backend.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return self._pipe(argv, cwd, env, cols, rows, reason)
+
+    def _warmup(self, backend: Any, timeout: float = PTY_PROBE_SECONDS) -> tuple[bytes, bool]:
+        """宽限期内收到第一个字节 = 这个伪终端真能用。"""
+        buf = bytearray()
+        deadline = time.monotonic() + max(0.2, float(timeout))
+        while time.monotonic() < deadline:
+            chunk = backend.read(0.1)
+            if chunk:
+                buf.extend(chunk)
+                return bytes(buf), True
+            if getattr(backend, "eof", False) or not backend.alive:
+                break
+        return bytes(buf), False
+
+    def _pipe(
+        self,
+        argv: list[str],
+        cwd: str,
+        env: dict[str, str],
+        cols: int,
+        rows: int,
+        reason: str,
+    ) -> tuple[Any, str, bytes]:
         backend = _PipeSession(argv, cwd, env, cols=cols, rows=rows)
         self.last_mode = "pipe"
         self.fallback_reason = reason[:200]
-        return backend, "pipe"
+        return backend, "pipe", b""
 
     def _pump(
         self,
