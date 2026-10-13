@@ -590,6 +590,10 @@ pre, code, kbd { font-family: var(--mono); }
 }
 .bottom-panel.is-collapsed { height: 30px; }
 .bottom-panel.is-collapsed .bp-body { display: none !important; }
+.bottom-panel.is-collapsed .panel-resizer { display: none; }
+/* 上沿把手：拖动自由改面板高度（见 bindRowResizer） */
+.panel-resizer { flex: 0 0 4px; cursor: row-resize; background: transparent; }
+.panel-resizer:hover { background: var(--accent); }
 .bp-head { display: flex; align-items: center; gap: 2px; padding: 0 8px; flex: 0 0 30px; }
 .bp-tab { padding: 4px 10px; font-size: 11.5px; color: var(--fg-dim); border-bottom: 2px solid transparent; text-transform: uppercase; letter-spacing: .4px; }
 .bp-tab.is-active { color: var(--fg); border-bottom-color: var(--accent); }
@@ -614,10 +618,13 @@ pre, code, kbd { font-family: var(--mono); }
 }
 .term-chip.is-warn { color: var(--danger); border-color: var(--danger); }
 .term-interactive {
-  flex: 1; min-height: 0; overflow: hidden; outline: none;
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; outline: none;
   padding: 4px 8px; cursor: text; background: var(--bg);
 }
 .term-interactive:focus { box-shadow: inset 0 0 0 1px var(--accent); }
+/* 回滚区（滚出屏幕的历史行，只读）+ 当前屏：两者一起构成可滚动的输出流 */
+.term-hist, .term-scr { white-space: pre; }
+.term-hist { opacity: .96; }
 .term-row { white-space: pre; height: 1.55em; }
 .term-cursor { background: var(--fg); color: var(--bg); }
 

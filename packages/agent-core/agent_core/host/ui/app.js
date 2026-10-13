@@ -613,6 +613,13 @@ function termLine(panel, text, cls = '') {
 
 function toggleBottom(open) {
   const bp = $('bottom-panel');
+  // 用户拖出来的高度是 inline height，会压过 `.is-collapsed { height: 30px }`；
+  // 所以收起时先把它存起来、展开时再还回去。
+  if (!open) {
+    if (bp.style.height) { bp.dataset.height = bp.style.height; bp.style.height = ''; }
+  } else if (bp.dataset.height) {
+    bp.style.height = bp.dataset.height;
+  }
   const collapsed = bp.classList.toggle('is-collapsed', !open);
   $('btn-bottom-toggle').textContent = collapsed ? '▴' : '▾';
 }
@@ -628,12 +635,19 @@ function switchBottom(name) {
  * 渲染只实现最小 ANSI 子集：SGR 前景/背景色与加粗、\r、\n、\b、清屏/清行；
  * 不做完整 VT 仿真（见 P1-P2-FEATURES-PLAN §10「明确不做」）。
  * ─────────────────────────────────────────────────────── */
+/* 回滚缓冲上限（行）：屏幕顶部滚出去的行推进 history，不再直接丢弃，滚轮可回看。 */
+const TERM_SCROLLBACK = 1000;
+
 const term = {
   rows: 24, cols: 80,
   buf: [], curRow: 0, curCol: 0,
   open: false, closed: false, enabled: true, id: null, mode: 'pty',
   sgr: { fg: '', bg: '', bold: false }, sgrCss: '',
   state: 0, csi: '', decoder: null,
+  // 历史行（只读）+ 两个 DOM 宿主。历史只增量追加（见 termRender），不每个 chunk 重建。
+  history: [], histEl: null, scrEl: null, histRendered: 0,
+  // 管道模式的本地行（见 termPipeKey）：后端管道没有 TTY 线路规程，行编辑只能在前端做。
+  line: '', lineCur: 0, lineStart: null,
 };
 
 const TERM_SGR = {
@@ -644,40 +658,62 @@ const TERM_SGR = {
   12: '#7aa6da', 13: '#c397d8', 14: '#70c0b1', 15: '#fff',
 };
 
+/** 一行单元格 → DOM。cursorRow 为 -1 表示这行没有光标（历史行）。 */
+function termRow(cells, r, cursorRow) {
+  const row = el('div', 'term-row');
+  let run = null;
+  let runSt = null;
+  const flush = () => { if (run) { row.appendChild(run); run = null; } };
+  for (let c = 0; c < term.cols; c++) {
+    const cell = cells[c];
+    const ch = cell ? cell.t : ' ';
+    const st = cell ? cell.st : '';
+    if (r === cursorRow && c === term.curCol) {
+      flush();
+      row.appendChild(el('span', 'term-cursor', ch));
+      runSt = null;
+      continue;
+    }
+    if (!run || st !== runSt) {
+      flush();
+      run = el('span');
+      runSt = st;
+      if (st) run.setAttribute('style', st);
+    }
+    run.textContent += ch;
+  }
+  flush();
+  return row;
+}
+
 function termRender() {
   const host = $('term');
+  // 两个子容器：history（滚出去的行，只读）+ screen（当前屏，含光标）。
+  if (!term.histEl || !term.histEl.isConnected || !term.scrEl || !term.scrEl.isConnected) {
+    host.replaceChildren();
+    term.histEl = el('div', 'term-hist');
+    term.scrEl = el('div', 'term-scr');
+    host.append(term.histEl, term.scrEl);
+    term.histRendered = 0;
+  }
+  // 贴底时才跟随新输出；用户滚上去回看时不能抢他的滚动位置。
   const stick = host.scrollHeight - host.scrollTop - host.clientHeight < 60;
+  const prevTop = host.scrollTop;
+  // 历史行只读：只有「宿主重建过 / 前端裁剪过」才整块重来，其余增量追加 ——
+  // 否则每来一个 chunk 都要重建上千个 div。
+  if (term.histRendered !== term.histEl.childElementCount) {
+    term.histEl.replaceChildren();
+    term.histRendered = 0;
+  }
+  while (term.histRendered < term.history.length) {
+    term.histEl.appendChild(termRow(term.history[term.histRendered], -1, -1));
+    term.histRendered++;
+  }
   const cursorRow = term.open && !term.closed ? term.curRow : -1;
   const frag = document.createDocumentFragment();
-  for (let r = 0; r < term.rows; r++) {
-    const row = el('div', 'term-row');
-    const cells = term.buf[r] || [];
-    let run = null;
-    let runSt = null;
-    const flush = () => { if (run) { row.appendChild(run); run = null; } };
-    for (let c = 0; c < term.cols; c++) {
-      const cell = cells[c];
-      const ch = cell ? cell.t : ' ';
-      const st = cell ? cell.st : '';
-      if (r === cursorRow && c === term.curCol) {
-        flush();
-        row.appendChild(el('span', 'term-cursor', ch));
-        runSt = null;
-        continue;
-      }
-      if (!run || st !== runSt) {
-        flush();
-        run = el('span');
-        runSt = st;
-        if (st) run.setAttribute('style', st);
-      }
-      run.textContent += ch;
-    }
-    flush();
-    frag.appendChild(row);
-  }
-  host.replaceChildren(frag);
-  if (stick) host.scrollTop = host.scrollHeight;
+  for (let r = 0; r < term.rows; r++) frag.appendChild(termRow(term.buf[r] || [], r, cursorRow));
+  term.scrEl.replaceChildren(frag);
+  host.scrollTop = stick ? host.scrollHeight : prevTop;
 }
 
 function termSgrCss() {
@@ -707,7 +743,16 @@ function termNewline() {
   term.curRow++;
   term.curCol = 0;
   if (term.curRow >= term.rows) {
-    term.buf.shift();
+    // 屏幕顶部那一行不是丢掉，而是推进 history 供滚轮回看（上限 TERM_SCROLLBACK）。
+    const gone = term.buf.shift();
+    if (gone) {
+      term.history.push(gone);
+      const over = term.history.length - TERM_SCROLLBACK;
+      if (over > 0) {
+        term.history.splice(0, over);
+        term.histRendered = -1;  // 前端裁剪过：DOM 与数组不再一一对应，下一帧整块重建
+      }
+    }
     term.curRow = term.rows - 1;
   }
 }
@@ -803,6 +848,11 @@ function termReset() {
   term.sgr = { fg: '', bg: '', bold: false };
   term.sgrCss = '';
   term.decoder = new TextDecoder('utf-8');
+  // 回滚缓冲一并清掉（「清空」按钮与新会话都从这里走）。
+  term.history = [];
+  term.histRendered = 0;
+  if (term.histEl) term.histEl.replaceChildren();
+  termLineReset();
 }
 
 async function termOpen() {
@@ -884,8 +934,92 @@ function termResize() {
   }
 }
 
+/* ── 管道模式的本地行编辑 ──────────────────────────────────────────────
+ * 后端降级成管道后没有 TTY 线路规程：shell（实测 PowerShell）不做任何行编辑，还会把我们
+ * 写进去的每个字节原样回显。于是「退格」那一颗 0x7F 既删不掉字符、又被回显成一个控制字符
+ * 渲染成空白格，看着就像插了个空格；它还会被当成命令正文一起交给解析器。
+ * 所以管道模式的行编辑放在前端：本地维护当前行 + 本地回显，只把「整行 + 回车」交给后端。
+ * 后端 shell 仍会回显这一行 —— 回车前把光标对回行首，回显即写到同一批格子上，不产生重影。
+ * ─────────────────────────────────────────────────────────────────── */
+function termLineReset() {
+  term.line = '';
+  term.lineCur = 0;
+  term.lineStart = null;
+}
+
+function termLineDraw() {
+  const st = term.lineStart;
+  if (!st) return;
+  term.buf.length = st.row + 1;
+  const row = term.buf[st.row] || (term.buf[st.row] = []);
+  row.length = st.col;
+  term.curRow = st.row;
+  term.curCol = st.col;
+  for (const ch of term.line) termWrite(ch);
+  term.curCol = Math.min(term.cols - 1, st.col + term.lineCur);  // 光标停在逻辑插入点
+  termRender();
+}
+
+/** kind: 'BS' 删插入点前一个字符 | 'DEL' 删插入点处字符 | 其它为要插入的字符。 */
+function termLineEdit(kind) {
+  if (!term.lineStart) term.lineStart = { row: term.curRow, col: term.curCol };
+  if (kind === 'BS') {
+    if (term.lineCur === 0) return;
+    term.line = term.line.slice(0, term.lineCur - 1) + term.line.slice(term.lineCur);
+    term.lineCur--;
+  } else if (kind === 'DEL') {
+    if (term.lineCur >= term.line.length) return;
+    term.line = term.line.slice(0, term.lineCur) + term.line.slice(term.lineCur + 1);
+  } else {
+    term.line = term.line.slice(0, term.lineCur) + kind + term.line.slice(term.lineCur);
+    term.lineCur++;
+  }
+  termLineDraw();
+}
+
+/** 提交当前本地行：整行 + 回车交给后端；光标对回行首让 shell 的回显覆盖同位置。 */
+function termPipeCommit() {
+  const line = term.line;
+  const st = term.lineStart;
+  if (st) { term.curRow = st.row; term.curCol = st.col; }
+  termLineReset();
+  termRender();
+  termInput(line + '\r');
+}
+
+function termPipeKey(event) {
+  const k = event.key;
+  if (k === 'Enter') { termPipeCommit(); event.preventDefault(); return; }
+  if (k === 'Backspace') { termLineEdit('BS'); event.preventDefault(); return; }
+  if (k === 'Delete') { termLineEdit('DEL'); event.preventDefault(); return; }
+  if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'Home' || k === 'End') {
+    if (k === 'ArrowLeft') term.lineCur = Math.max(0, term.lineCur - 1);
+    else if (k === 'ArrowRight') term.lineCur = Math.min(term.line.length, term.lineCur + 1);
+    else if (k === 'Home') term.lineCur = 0;
+    else term.lineCur = term.line.length;
+    termLineDraw();
+    event.preventDefault();
+    return;
+  }
+  if (k === 'Tab') { termInput('\t'); event.preventDefault(); return; }
+  if (k === 'Escape') { termInput('\x1b'); event.preventDefault(); return; }
+  if (event.ctrlKey && k.length === 1) {
+    const code = k.toUpperCase().charCodeAt(0) - 64;
+    if (code >= 1 && code <= 26) {
+      if (code === 3) termLineReset();  // Ctrl-C：丢弃当前本地行（管道下后端不会清行）
+      termInput(String.fromCharCode(code));
+      event.preventDefault();
+    }
+    return;
+  }
+  if (k.length === 1 && !event.metaKey && !event.altKey) { termLineEdit(k); event.preventDefault(); return; }
+  const seq = { ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', PageUp: '\x1b[5~', PageDown: '\x1b[6~' }[k];
+  if (seq) { termInput(seq); event.preventDefault(); }
+}
+
 function termKeydown(event) {
   if (!term.open || term.closed) return;
+  if (term.mode !== 'pty') { termPipeKey(event); return; }
   const k = event.key;
   if (k === 'Enter') { termInput('\r'); event.preventDefault(); return; }
   if (k === 'Backspace') { termInput('\x7f'); event.preventDefault(); return; }
@@ -907,7 +1041,19 @@ function termKeydown(event) {
 function termPaste(event) {
   if (!term.open || term.closed) return;
   const text = (event.clipboardData || window.clipboardData)?.getData('text') || '';
-  if (text) { termInput(text); event.preventDefault(); }
+  if (!text) return;
+  if (term.mode !== 'pty') {
+    // 管道模式：粘进本地行；换行视作回车逐行提交，别把控制字符塞进 shell 的行里。
+    const parts = text.replace(/\r\n?/g, '\n').split('\n');
+    for (let i = 0; i < parts.length; i++) {
+      for (const ch of parts[i]) termLineEdit(ch);
+      if (i < parts.length - 1) termPipeCommit();
+    }
+    event.preventDefault();
+    return;
+  }
+  termInput(text);
+  event.preventDefault();
 }
 
 /* ═══════════════════════════════ 编辑器标签 ═══════════════════════════════ */
@@ -4393,6 +4539,31 @@ function bindResizer(handleId, resolve) {
   });
 }
 
+/* 行把手：拖动改高度。把手在面板上沿，所以往上拖是「变高」（dir = -1）。 */
+function bindRowResizer(handleId, resolve) {
+  const handle = $(handleId);
+  handle.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    const { id, min = 120, dir = -1 } = resolve();
+    const target = $(id);
+    if (target.classList.contains('is-collapsed')) toggleBottom(true);  // 收起态拖一下先展开
+    const startY = event.clientY;
+    const startH = target.getBoundingClientRect().height;
+    const move = (e) => {
+      const max = Math.max(min, window.innerHeight - 160);  // 给上面的编辑器留出余地
+      const h = Math.min(max, Math.max(min, startH + (e.clientY - startY) * dir));
+      target.style.height = `${h}px`;
+      target.dataset.height = `${h}px`;  // 收起再展开要还回这个高度（见 toggleBottom）
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  });
+}
+
 /* ------------------------------------------------------------------ 布局模式 */
 const MODE_KEY = 'vibe.layout-mode';
 
@@ -4681,6 +4852,8 @@ function bind() {
     // SOLO：把手夹在「对话 | 编辑器」之间，调的是中间编辑器列的宽度
     ? { id: 'editor-stack', min: 320, max: 1200, dir: 1 }
     : { id: 'chatpane', min: 280, max: 640, dir: -1 });
+  // 底部面板（终端 / 输出）上沿的把手：自由改高度
+  bindRowResizer('bottom-resizer', () => ({ id: 'bottom-panel', min: 120, dir: -1 }));
 
   // 回滚浮层
   $('btn-cp-close').addEventListener('click', closeCheckpoints);
