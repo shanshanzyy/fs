@@ -235,9 +235,9 @@ python -m agent_core -w <目录> --check
 
 ## M1 的边界（明确没做的事）
 
-- ❌ 没有安装器（`electron-builder` / `electron-forge`）—— 交付物是**一个可双击的目录**，
-  见下面「分发与冒烟」（D1 已交付打包冒烟，安装器/制品库不在本期）
-- ❌ 没有自动更新 —— 升级靠换掉整个目录；升级通道归 M2
+- ✅ 已有 Windows 安装包（`--installer`，electron-builder + NSIS），见下面「Windows 安装包」；
+  分发包仍是「一个可双击的目录」，见「分发与冒烟」
+- ❌ 没有代码签名与自动更新 —— 升级靠重装新版本安装包
 - ❌ 没有多窗口 / 多工作区同时打开
 - ❌ 没有托盘、没有系统通知
 
@@ -245,7 +245,7 @@ python -m agent_core -w <目录> --check
 
 ## 分发与冒烟（D1）
 
-打包分两步，都从 `packages/agent-core` 下执行：
+打包分三步，都从 `packages/agent-core` 下执行：
 
 ```bash
 # 1) 打内嵌后端（PyInstaller onefile）并组装分发目录
@@ -253,6 +253,9 @@ python scripts/build_desktop.py
 
 # 2) 打包冒烟：两条后端路径各跑一轮，含健康检查 / mock 对话 / 截图 / 残留进程断言
 python scripts/e2e_package.py
+
+# 3) Windows 安装包（NSIS）：给内部同事双击安装用
+python scripts/build_desktop.py --backend --installer
 ```
 
 产出 `dist/desktop/VibeAgent-<版本>-<平台>-<架构>/`，里面是：
@@ -274,6 +277,33 @@ resources/app/...                  # main.js / backend.js / preload.js / smoke.j
 打包版本号只有一处真源（`agent_core.__version__`），`build_desktop.py` 从那里取，
 组装出的目录名与壳的 `package.json` 版本三处必须一致 —— 这条由
 [test_packaging.py](../../packages/agent-core/tests/test_packaging.py) 的静态契约锁住。
+
+---
+
+## Windows 安装包（NSIS）
+
+`python scripts/build_desktop.py --backend --installer` 产出
+`dist/desktop/installer/VibeAgent-Setup-<版本>.exe` —— 同事双击即可安装，
+装完有开始菜单与桌面快捷方式，控制面板里能卸载。
+
+| 配置项 | 值 | 说明 |
+|---|---|---|
+| 安装器 | electron-builder + NSIS | 构建期依赖，见 [package.json](package.json) 的 `build` 段 |
+| 安装范围 | `perMachine: false` | 装到 `%LOCALAPPDATA%\Programs\VibeAgent`，**不需要管理员** |
+| 安装目录 | `allowToChangeInstallationDirectory: true` | 安装时可自选 |
+| 内嵌后端 | `extraResources: resources/backend → backend` | 与分发目录同构，仍是 `resources/backend/`，见 `embeddedCandidates` |
+
+几条要点：
+
+- **首次构建要联网**：electron-builder 会下载 NSIS 工具链（缓存在
+  `%LOCALAPPDATA%\electron-builder\Cache`），之后走缓存。`electronDist` 指向本机
+  已装的 `node_modules/electron/dist`，因此**不会重复下载 Electron**。
+- **用户数据不在安装目录**：配置在 `%APPDATA%\vibe-agent-desktop\config.json`，
+  内核数据在 `~/.vibe/`。装到 `Program Files` 也不会因只读而失败。
+- **不做的事**：没有代码签名（同事首次运行会看到 SmartScreen 提示，选「仍要运行」即可）、
+  没有自动更新（升级重装新版本安装包）。这两项留给后续按需引入。
+- 应用图标目前用 Electron 默认图标（仓库里没有 `.ico` 资源）；要换图标就放一张
+  256×256 的 `resources/icon.ico` 并在 `build.win.icon` 里指过去。
 
 以上都是**刻意不做**：M1 的目标是让单人能真正用起来，
 而不是先花两周配打包流水线。

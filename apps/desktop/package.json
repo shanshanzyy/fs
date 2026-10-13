@@ -1,17 +1,55 @@
 {
   "name": "vibe-agent-desktop",
+  "productName": "VibeAgent",
   "version": "0.1.0",
   "private": true,
   "description": "本地化 Vibe Coding Agent 的桌面客户端（薄壳：起后端 + 开窗口 + 管进程）",
+  "author": "shanshanzyy",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --enable-logging"
+    "dev": "electron . --enable-logging",
+    "pack:win": "electron-builder --win nsis --publish never"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
-    "electron": "^44.4.5"
+    "electron": "^44.4.5",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.vibeagent.desktop",
+    "productName": "VibeAgent",
+    "copyright": "Copyright © 2026 shanshanzyy",
+    "directories": {
+      "output": "../../dist/desktop/installer"
+    },
+    "files": [
+      "src/*.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/backend",
+        "to": "backend"
+      }
+    ],
+    "electronDist": "node_modules/electron/dist",
+    "npmRebuild": false,
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "artifactName": "VibeAgent-Setup-${version}.${ext}",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "VibeAgent"
+    }
   }
 }

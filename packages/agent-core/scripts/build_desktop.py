@@ -1,25 +1,27 @@
-"""桌面端打包（D1.1）：内嵌后端二进制 + 可双击的分发目录。
+"""桌面端打包：内嵌后端二进制 + 可双击的分发目录 + Windows 安装包。
 
-分两步，可分别执行：
+分三步，可分别执行：
 
 1. `--backend`：用 PyInstaller 把 `agent_core`（含 host 与 UI 静态资源）
    打成**单文件** exe，落到 `apps/desktop/resources/backend/`。
    产物是「机器上没装 Python 也能跑」的后端本体。
 2. `--dist`：组装可双击的分发目录 `dist/desktop/VibeAgent-<版本>-<平台>-<架构>/`：
    复制 Electron 运行时 → 改名成 VibeAgent.exe → 放入我们的 app 与内嵌后端。
+3. `--installer`：用 electron-builder 出 **NSIS 安装包**（Windows），落到
+   `dist/desktop/installer/`。这一步是给内部同事「双击安装」用的；它自带
+   electron-builder（构建期依赖）与 NSIS 工具链，首次构建会联网下载工具链。
 
-刻意**不引入 electron-builder**（D1.3：本期只要求「能拿到一个可双击的目录」）：
-需要的只是一次文件搬运，而 electron-builder 会额外拉一整套打包工具链与
-签名/发布配置，对一个单机分发目录属于过度工程。将来要出安装包再引入不迟。
+三条路径共用同一个内嵌后端产物，安装包不出第二份后端。
 
 版本号（D1.2）：一律取自 `agent_core.__version__`，写进
 `resources/backend/version.json` 与分发目录里的 package.json 与目录名。
 运行期界面显示的版本则来自后端 `/api/health`，保证「壳说的版本 = 内核的版本」。
 
 用法：
-    python scripts/build_desktop.py              # 两步都做
-    python scripts/build_desktop.py --backend    # 只打后端二进制
-    python scripts/build_desktop.py --dist       # 只组装分发目录（需已有二进制）
+    python scripts/build_desktop.py                        # 前两步（后端 + 分发目录）
+    python scripts/build_desktop.py --backend              # 只打后端二进制
+    python scripts/build_desktop.py --dist                 # 只组装分发目录（需已有二进制）
+    python scripts/build_desktop.py --backend --installer  # 直接出安装包
 """
 
 from __future__ import annotations
@@ -43,6 +45,8 @@ ELECTRON_DIST = DESKTOP / "node_modules" / "electron" / "dist"
 BACKEND_DIR = DESKTOP / "resources" / "backend"
 BUILD_DIR = ROOT / "build" / "pyinstaller"
 DIST_ROOT = ROOT / "dist" / "desktop"
+# electron-builder 的输出目录（见 apps/desktop/package.json 的 build.directories.output）
+INSTALLER_DIR = DIST_ROOT / "installer"
 
 ENTRY = AGENT_CORE / "scripts" / "pyinstaller_entry.py"
 APP_FILES = ("main.js", "backend.js", "smoke.js", "preload.js")
@@ -238,11 +242,56 @@ def assemble_dist(version: str, out_dir: Path | None = None) -> Path:
     return target
 
 
+# --------------------------------------------------------------------- 步骤三
+def electron_builder_cmd() -> Path:
+    """本地 electron-builder 的可执行入口（apps/desktop 的构建期依赖）。
+
+    直接走 `node_modules/.bin` 而不经 `npx`：Windows 上 `npm.ps1` 常被执行策略
+    拦下（`.ps1` 不能跑），`.bin` 里的 `.cmd` 没有这个问题。
+    """
+    name = "electron-builder.cmd" if os.name == "nt" else "electron-builder"
+    return DESKTOP / "node_modules" / ".bin" / name
+
+
+def build_installer(version: str) -> Path:
+    """用 electron-builder 出 NSIS 安装包。返回预期产物路径。"""
+    if not sys.platform.startswith("win"):
+        raise SystemExit("安装包目前只支持 Windows（NSIS）；请在 Windows 上执行 --installer")
+
+    binary = backend_binary_path()
+    if not binary.is_file():
+        raise SystemExit(f"缺少内嵌后端产物 {binary}，请先执行 --backend")
+
+    cmd = electron_builder_cmd()
+    if not cmd.is_file():
+        raise SystemExit(
+            f"找不到 {cmd}；请先在 {DESKTOP} 执行 npm install（electron-builder 是构建期依赖）"
+        )
+
+    sync_package_version(version)  # 安装包名里的版本号与内核版本同源
+    INSTALLER_DIR.mkdir(parents=True, exist_ok=True)
+    setup = INSTALLER_DIR / f"VibeAgent-Setup-{version}.exe"
+
+    print("[3/3] electron-builder 出 NSIS 安装包 …")
+    args = [str(cmd), "--win", "nsis", "--publish", "never"]
+    print("      " + " ".join(args))
+    result = subprocess.run(args, cwd=str(DESKTOP))
+    if result.returncode != 0:
+        raise SystemExit(f"electron-builder 失败（退出码 {result.returncode}）")
+
+    if not setup.is_file():  # 产物名带版本号，找不到就把目录里实际有什么报出来
+        found = sorted(p.name for p in INSTALLER_DIR.glob("*.[eE][xX][eE]"))
+        raise SystemExit(f"构建完成但没找到 {setup}；目录内实际产物：{found or '（空）'}")
+    print(f"      安装包 {setup}  ({setup.stat().st_size / 1_048_576:.1f} MB)")
+    return setup
+
+
 # --------------------------------------------------------------------- 入口
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="桌面端打包（D1）")
+    parser = argparse.ArgumentParser(description="桌面端打包")
     parser.add_argument("--backend", action="store_true", help="只打内嵌后端二进制")
     parser.add_argument("--dist", action="store_true", help="只组装分发目录")
+    parser.add_argument("--installer", action="store_true", help="只出 Windows 安装包（NSIS）")
     parser.add_argument("--out", help="分发目录输出路径（默认 dist/desktop/<自动命名>）")
     parser.add_argument("--python", default=sys.executable, help="用于 PyInstaller 的解释器")
     args = parser.parse_args(argv)
@@ -250,8 +299,10 @@ def main(argv: list[str] | None = None) -> int:
     version = core_version()
     print(f"核心版本 {version}")
 
-    do_backend = args.backend or not (args.backend or args.dist)
-    do_dist = args.dist or not (args.backend or args.dist)
+    # 不指定任何步骤时只做前两步；安装包要联网拉 NSIS 工具链，显式要才做。
+    bare = not (args.backend or args.dist or args.installer)
+    do_backend = args.backend or bare
+    do_dist = args.dist or bare
 
     if do_backend:
         build_backend(args.python)
@@ -259,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
         out = Path(args.out).resolve() if args.out else None
         target = assemble_dist(version, out)
         print(f"\n完成。双击运行：{target / ('VibeAgent.exe' if sys.platform.startswith('win') else 'VibeAgent')}")
+    if args.installer:
+        setup = build_installer(version)
+        print(f"\n完成。安装包：{setup}")
     return 0
 
 

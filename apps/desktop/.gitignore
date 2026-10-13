@@ -2,3 +2,6 @@ node_modules/
 dist/
 out/
 *.log
+
+# 打包产物：内嵌后端（PyInstaller onefile，20+ MB），由 build_desktop.py --backend 生成
+resources/backend/

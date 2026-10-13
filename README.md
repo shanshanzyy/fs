@@ -160,9 +160,13 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 cd packages/agent-core
 python scripts/e2e_package.py --build    # 先重新打包再冒烟
 # 产出 dist/desktop/VibeAgent-<版本>-<平台>-<架构>/
+
+# 出 Windows 安装包（给内部同事双击安装；需在 Windows 上执行，首次会联网拉 NSIS 工具链）
+python scripts/build_desktop.py --backend --installer
+# 产出 dist/desktop/installer/VibeAgent-Setup-<版本>.exe
 ```
 
-步骤与产物结构详见[桌面客户端文档](apps/desktop/README.md) §分发与冒烟。
+步骤与产物结构详见[桌面客户端文档](apps/desktop/README.md) §分发与冒烟、§Windows 安装包。
 
 ---
 
