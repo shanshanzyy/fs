@@ -401,6 +401,10 @@ class GovernanceClient:
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/healthz", _retry_auth=False).body
 
+    def auth_config(self) -> dict[str, Any]:
+        """探测服务端注册策略（是否开放自助注册）。只读、无需登录。"""
+        return self.request("GET", "/auth/config", _retry_auth=False).body
+
 
 def _safe_json(text: str) -> dict[str, Any]:
     try:

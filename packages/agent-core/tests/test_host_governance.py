@@ -106,6 +106,13 @@ class _FakeGovernanceClient:
             self.store.clear()
         return True
 
+    def auth_config(self) -> dict:
+        """策略探针替身：行为由 behavior["auth_config"] 控制（默认开放注册）。"""
+        error = self.behavior.get("error")
+        if error is not None:
+            raise error
+        return dict(self.behavior.get("auth_config", {"registrationOpen": True}))
+
 
 class _GovHostFixture(unittest.TestCase):
     """临时工作区 + 真实 host；`wire` 与 `GovernanceClient` 换成替身。"""
@@ -291,6 +298,60 @@ class GovernanceRegisterTests(_GovHostFixture):
         saved = self.store.load()
         self.assertEqual(saved.email, "new@example.com")
         self.assertEqual(saved.user_id, "u-2")
+
+    def test_register_without_token_passes_through(self) -> None:
+        """开放自助注册：邀请码留空也必须能注册（是否放行由服务端开关决定，
+        内核只负责如实透传 —— 在 host 层拦「无邀请码」会把开放注册挡死）。"""
+        status, data, _text = self._call(
+            "/api/governance/register",
+            {"enrollmentToken": "", "email": "open@example.com", "password": "pw"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["governance"]["status"], "governed")
+        saved = self.store.load()
+        self.assertEqual(saved.email, "open@example.com")
+
+
+class GovernanceConfigProbeTests(_GovHostFixture):
+    """`GET /api/governance/config`：登录门的策略探针。
+
+    探针的关键是**永不 409 / 永不写凭证**：执行中也得能探（它只读），
+    治理面不可达时回 ok=False 而不是抛错 —— 界面据此退化为「邀请码按需填写」。
+    """
+
+    def _get(self, path: str) -> tuple[int, dict]:
+        request = urllib.request.Request(self.base + path, method="GET")
+        request.add_header("X-Vibe-Token", self.token)
+        try:
+            with self._opener.open(request, timeout=15) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+    def test_probe_reports_open_registration(self) -> None:
+        status, data = self._get("/api/governance/config")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["registrationOpen"])
+
+    def test_probe_reports_closed_registration(self) -> None:
+        _FakeGovernanceClient.behavior = {"auth_config": {"registrationOpen": False}}
+        status, data = self._get("/api/governance/config")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["registrationOpen"])
+
+    def test_probe_survives_unreachable_server(self) -> None:
+        _FakeGovernanceClient.behavior = {"error": GovernanceError("不可达", status=0)}
+        status, data = self._get("/api/governance/config")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["ok"])
+
+    def test_probe_allowed_while_running(self) -> None:
+        self.host.session._state = P.STATE_RUNNING
+        status, data = self._get("/api/governance/config")
+        self.assertEqual(status, 200)
+        self.assertIn("ok", data)
 
 
 class GovernanceLogoutTests(_GovHostFixture):

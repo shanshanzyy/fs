@@ -157,6 +157,10 @@ class ServerConfig:
     access_ttl: int = 1800          # 访问令牌 30 分钟（ADR：15–30 分钟）
     refresh_ttl: int = 30 * 86400   # 刷新令牌 30 天
     enrollment_ttl: int = 7 * 86400 # 一次性注册令牌 7 天
+    # 开放自助注册：开启后允许**不带邀请码**注册（落到默认团队、developer 角色）。
+    # 默认关闭 —— 「任何人都能给自己开号」是必须显式承担的风险，
+    # 内网自助起步时把它打开，暴露到更大范围前记得关掉并改用邀请码/SSO。
+    open_registration: bool = False
 
     # --- 密钥托管 ---
     secrets_provider: str = "env"   # env | file | vault
@@ -240,6 +244,7 @@ class ServerConfig:
             access_ttl=_int("ACCESS_TTL", cls.access_ttl),
             refresh_ttl=_int("REFRESH_TTL", cls.refresh_ttl),
             enrollment_ttl=_int("ENROLLMENT_TTL", cls.enrollment_ttl),
+            open_registration=_bool("OPEN_REGISTRATION", cls.open_registration),
             secrets_provider=_str("SECRETS_PROVIDER", cls.secrets_provider).lower(),
             secrets_file=(
                 Path(_str("SECRETS_FILE", str(base / "secrets.json"))).expanduser()

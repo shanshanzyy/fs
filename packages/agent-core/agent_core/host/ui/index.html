@@ -691,6 +691,52 @@
   </div>
 </div>
 
+<!-- 启动登录门（强制登录）：未接入治理面时全屏遮住工作区 —— 「一进软件先登录，
+     每个人用自己的账号密码」。登录成功后热接入并隐藏（会话/检查点/审计链原样保留）。
+     令牌只在后端与用户级凭证文件，界面只显示掩码视图。地址可保存进桌面壳 config.json。 -->
+<div class="gate" id="login-gate" hidden>
+  <div class="gate-card">
+    <div class="gate-brand"><span class="gate-mark">⚡</span> Vibe Coding</div>
+    <div class="gate-sub">登录后开始工作 · 每个人使用自己的账号</div>
+
+    <div class="gate-tabs" role="tablist">
+      <button type="button" class="gate-tab is-active" id="gate-tab-login">登录</button>
+      <button type="button" class="gate-tab" id="gate-tab-register">注册</button>
+    </div>
+
+    <label class="gate-label" for="gate-server">服务器地址</label>
+    <div class="gate-server-row">
+      <input class="ws-input" id="gate-server" type="text" spellcheck="false"
+             autocomplete="off" placeholder="https://vibe.内网域名">
+      <button type="button" class="ws-pick" id="btn-gate-save-server" hidden>记住</button>
+    </div>
+    <div class="gate-note" id="gate-server-note"></div>
+
+    <div id="gate-login-form">
+      <label class="gate-label" for="gate-email">邮箱</label>
+      <input class="ws-input" id="gate-email" type="text" spellcheck="false" autocomplete="username">
+      <label class="gate-label" for="gate-password">密码</label>
+      <input class="ws-input" id="gate-password" type="password" autocomplete="current-password">
+      <button type="button" class="btn btn-primary gate-submit" id="btn-gate-login">登录</button>
+    </div>
+
+    <div id="gate-register-form" hidden>
+      <label class="gate-label" for="gate-name">显示名（可选）</label>
+      <input class="ws-input" id="gate-name" type="text" spellcheck="false" autocomplete="off">
+      <label class="gate-label" for="gate-token">邀请码（开放注册时可留空）</label>
+      <input class="ws-input" id="gate-token" type="text" spellcheck="false" autocomplete="off">
+      <label class="gate-label" for="gate-reg-email">邮箱</label>
+      <input class="ws-input" id="gate-reg-email" type="text" spellcheck="false" autocomplete="username">
+      <label class="gate-label" for="gate-reg-password">密码</label>
+      <input class="ws-input" id="gate-reg-password" type="password" autocomplete="new-password">
+      <button type="button" class="btn btn-primary gate-submit" id="btn-gate-register">注册并登录</button>
+    </div>
+
+    <div class="gate-error" id="gate-error" hidden></div>
+    <div class="gate-msg" id="gate-msg"></div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <script type="module" src="/app.js"></script>

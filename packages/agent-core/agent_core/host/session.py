@@ -595,6 +595,22 @@ class Session:
         self.agent.audit.record("governance.logout", ok=True, user_id=user_id)
         return self._governance_response()
 
+    def governance_config(self, *, server_url: str = "") -> dict[str, Any]:
+        """`GET /api/governance/config`：探测治理面注册策略（登录门用）。
+
+        只读、零副作用：不写凭证、不热接入、执行中也不 409。治理面不可达时
+        回 `ok=False` 而不是抛错 —— 界面据此退化为「邀请码按需填写」。
+        """
+        try:
+            target = self._resolve_governance_server(server_url)
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc)}
+        try:
+            body = GovernanceClient(target, store=CredentialStore()).auth_config()
+        except GovernanceError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {"ok": True, "registrationOpen": bool(body.get("registrationOpen"))}
+
     def _governance_guard(self) -> None:
         """登录 / 登出的前置闸门：执行中 409。
 

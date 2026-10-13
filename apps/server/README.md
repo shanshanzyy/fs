@@ -85,6 +85,7 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 | `ACCESS_TTL` | 1800 | 访问令牌有效期（秒），即 30 分钟 |
 | `REFRESH_TTL` | 30 天 | 刷新令牌有效期（秒） |
 | `ENROLLMENT_TTL` | 7 天 | 注册令牌默认有效期（秒） |
+| `OPEN_REGISTRATION` | `0` | 置 `1` 允许**不带邀请码**注册（落到默认团队、developer）。默认关闭 —— 内网自助起步时打开，暴露到更大范围前记得关掉并改用邀请码/SSO |
 | `POLICY_REQUIRED` | `1` | 是否要求下发策略（关掉也只是回**保守默认**，不是全放开） |
 | `POLICY_MAX_STALENESS` | 12h | 策略过期阈值；客户端超时未更新则进受限模式 |
 | `DEFAULT_DAILY_CLOUD_TOKENS` | 200000 | 默认每日云端 token 配额（0 = 不限） |

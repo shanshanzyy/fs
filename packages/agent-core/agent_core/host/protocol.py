@@ -80,8 +80,9 @@
 | `POST /api/mcp/servers/remove` | 删除一个 MCP server（L 管理面）：`{name}` → 最新 status；不存在 400；写后自动 reload 并记 `mcp.server_removed` |
 | `POST /api/mcp/test` | 测一个 MCP server 的连接（L 管理面）：`{name}` → `{ok, name, count, tools[]}` 或 `{ok:false, error}`；首次调用惰性启动该 server |
 | `POST /api/governance/login` | 登录治理面（M3+）：`{email, password, serverUrl?, deviceName?}` → `{ok, governance, session}`；`serverUrl` 缺省回退配置里的治理面地址，为空则以 400 拒绝；调 `GovernanceClient.login()` 把令牌落 `~/.vibe/credentials.json`（0o600）后**热接入**当前会话（不重建对话 / 检查点 / 审计链）；执行中 409，治理面拒登按其状态码（4xx），不可达 502。响应只回 `governance.describe()`（**不含令牌**） |
-| `POST /api/governance/register` | 邀请码注册并登录（M3+）：`{enrollmentToken, email, password, displayName?, serverUrl?, deviceName?}` → `{ok, governance, session}`；走 `GovernanceClient.register()`，成功后同 login 热接入 |
+| `POST /api/governance/register` | 注册并登录（M3+）：`{enrollmentToken, email, password, displayName?, serverUrl?, deviceName?}` → `{ok, governance, session}`；走 `GovernanceClient.register()`，成功后同 login 热接入；服务端开 `OPEN_REGISTRATION` 时 `enrollmentToken` 可留空（自助注册落默认团队 developer） |
 | `POST /api/governance/logout` | 退出登录（M3+）：`{allDevices?}` → `{ok, governance, session}`；调 `GovernanceClient.logout()` 后**无论网络是否可达都清本地凭证**（`CredentialStore.clear()` 兜底），再热接入回本地直连客户端；执行中 409 |
+| `GET  /api/governance/config` | 治理面策略探针（登录门）：`?serverUrl=` → `{ok, registrationOpen}` 或 `{ok:false, reason}`；只读零副作用，执行中也可探；界面据此决定「邀请码」必填与否 |
 | `POST /api/plan/toggle` | 人工标注计划中某一步（P2-12）：`{id, status}` → `{ok, id, status, steps[], revision}` |
 | `GET  /api/context/stats` | 上下文用量（P2-17）：`{budgetTokens, usedTokens, segments{}, estimator, trimmedLastRun, cache}`；只读无副作用 |
 | `GET  /api/index/status` | 增量索引健康度（P1-9）：`{watching, interval, files, chunks, edges, lastUpdate, pending}`；**只读**，`index_watch` 关时如实回 0（不因此建索引） |

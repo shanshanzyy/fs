@@ -189,6 +189,8 @@ function applySession(info) {
     for (const text of info.notices) { addNotice(text); termLine('output', text, 'is-dim'); }
   }
   applyGovernanceChip(info.governance);
+  // 启动登录门（强制登录）：未接入治理面时遮住工作区，登录后才放行
+  renderLoginGate(info.governance);
   $('sb-session').textContent = info.sessionId ? `会话 ${info.sessionId}` : '';
   $('sb-session').title = `会话 ${info.sessionId || ''}`;
   $('sb-audit').textContent = info.auditPath || '';
@@ -431,6 +433,8 @@ async function governanceLogout() {
   try {
     const res = await api.post('/api/governance/logout', {});
     applyGovernanceResult(res, 'gov-msg', '已退出治理面，当前会话回到本地直连');
+    // 退出后重新落回登录门（applySession 内已调 renderLoginGate，这里只需聚焦）
+    setTimeout(() => { const n = $('gate-email'); if (n && !$('login-gate').hidden) n.focus(); }, 50);
   } catch (err) {
     govShowError(err);
   } finally {
@@ -452,6 +456,154 @@ async function saveGovernanceServer() {
     govShowError(new Error(`保存地址失败：${err.message}`));
   } finally {
     btn.disabled = false;
+  }
+}
+
+/* ═══════════════════════════════ 启动登录门（强制登录） ═══════════════════════════════
+ * 「一进软件先登录，每个人自己的账号密码」：未接入治理面（status 不是 governed）时
+ * 全屏遮住工作区，只给「登录 / 注册」两个动作。登录成功后热接入并隐藏 —— 会话、
+ * 检查点、审计链原样保留（见 Session._install_governance）。这是**界面层**的强制；
+ * 令牌仍只在后端与用户级凭证文件，界面只拿 describe() 的掩码视图。
+ * 服务器地址可「记住」进桌面壳 config.json，下次启动即由 VIBE_SERVER_URL 注入。 */
+
+function gateRequired(governance) {
+  return !governance || governance.status !== 'governed';
+}
+
+function renderLoginGate(governance) {
+  const gate = $('login-gate');
+  if (!gate) return;
+  const need = gateRequired(governance);
+  gate.hidden = !need;
+  if (!need) return;
+  const gov = governance || governanceView();
+  if (gov && gov.serverUrl && !$('gate-server').value) $('gate-server').value = gov.serverUrl;
+  const bridge = shellConfigBridge();
+  $('btn-gate-save-server').hidden = !bridge;
+  // 后端这次启动没带地址时，回填上一次保存进 config.json 的地址
+  if (bridge && !$('gate-server').value) {
+    bridge
+      .readDesktopConfig()
+      .then((cfg) => {
+        if (cfg && cfg.serverUrl && !$('gate-server').value) {
+          $('gate-server').value = cfg.serverUrl;
+          probeGateRegistration();
+        }
+      })
+      .catch(() => {});
+  }
+  probeGateRegistration();
+}
+
+function gateTab(which) {
+  const login = which !== 'register';
+  $('gate-tab-login').classList.toggle('is-active', login);
+  $('gate-tab-register').classList.toggle('is-active', !login);
+  $('gate-login-form').hidden = !login;
+  $('gate-register-form').hidden = login;
+  gateErr('');
+  $('gate-msg').textContent = '';
+}
+
+function gateErr(text) {
+  const node = $('gate-error');
+  node.hidden = !text;
+  node.textContent = text || '';
+}
+
+/** 探针：服务器是否开放自助注册 —— 决定「邀请码」是否必填。 */
+async function probeGateRegistration() {
+  const server = $('gate-server').value.trim();
+  const note = $('gate-server-note');
+  if (!server) { note.textContent = ''; return; }
+  try {
+    const res = await api.get('/api/governance/config', { serverUrl: server });
+    if (res && res.ok) {
+      note.textContent = res.registrationOpen
+        ? '该服务器已开放自助注册，可直接注册（邀请码可留空）。'
+        : '该服务器需邀请码注册 —— 请向管理员索取。';
+    } else {
+      note.textContent = `未连上服务器：${(res && res.reason) || '未知原因'}`;
+    }
+  } catch (err) {
+    note.textContent = `未连上服务器：${err.message}`;
+  }
+}
+
+/** 登录成功后把地址记进桌面壳 config.json，下次启动即自动带 server_url。 */
+async function persistGateServer() {
+  const bridge = shellConfigBridge();
+  const server = $('gate-server').value.trim();
+  if (!bridge || !server) return;
+  try {
+    await bridge.saveDesktopConfig({ serverUrl: server });
+  } catch (_) { /* 记不住地址不影响本次登录 */ }
+}
+
+async function gateLogin() {
+  const email = $('gate-email').value.trim();
+  const password = $('gate-password').value;
+  if (!email || !password) { gateErr('请填写邮箱与密码。'); return; }
+  const btn = $('btn-gate-login');
+  btn.disabled = true;
+  gateErr('');
+  $('gate-msg').textContent = '登录中…';
+  try {
+    const res = await api.post('/api/governance/login', {
+      email,
+      password,
+      serverUrl: $('gate-server').value.trim(),
+    });
+    $('gate-password').value = '';
+    await persistGateServer();
+    if (res && res.session) applySession(res.session);
+    toast('已登录，欢迎回来', 'ok');
+  } catch (err) {
+    gateErr(err.message);
+    $('gate-msg').textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function gateRegister() {
+  const email = $('gate-reg-email').value.trim();
+  const password = $('gate-reg-password').value;
+  if (!email || !password) { gateErr('请填写邮箱与密码。'); return; }
+  const btn = $('btn-gate-register');
+  btn.disabled = true;
+  gateErr('');
+  $('gate-msg').textContent = '注册中…';
+  try {
+    const res = await api.post('/api/governance/register', {
+      enrollmentToken: $('gate-token').value.trim(),
+      email,
+      password,
+      displayName: $('gate-name').value.trim(),
+      serverUrl: $('gate-server').value.trim(),
+    });
+    $('gate-reg-password').value = '';
+    $('gate-token').value = '';
+    await persistGateServer();
+    if (res && res.session) applySession(res.session);
+    toast('注册成功，已登录', 'ok');
+  } catch (err) {
+    gateErr(err.message);
+    $('gate-msg').textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function saveGateServer() {
+  const bridge = shellConfigBridge();
+  if (!bridge) return;
+  try {
+    const res = await bridge.saveDesktopConfig({ serverUrl: $('gate-server').value.trim() });
+    if (res && res.ok === false) throw new Error(res.error || '写入配置失败');
+    toast('服务器地址已保存，下次启动自动带上', 'ok');
+  } catch (err) {
+    gateErr(`保存地址失败：${err.message}`);
   }
 }
 
@@ -4924,6 +5076,22 @@ function bind() {
   $('btn-gov-register').addEventListener('click', governanceRegister);
   $('btn-gov-logout').addEventListener('click', governanceLogout);
   $('btn-gov-save-server').addEventListener('click', saveGovernanceServer);
+
+  // 启动登录门（强制登录）：tab 切换 / 登录 / 注册 / 记住地址 / 地址失焦探测
+  $('gate-tab-login').addEventListener('click', () => gateTab('login'));
+  $('gate-tab-register').addEventListener('click', () => gateTab('register'));
+  $('btn-gate-login').addEventListener('click', gateLogin);
+  $('btn-gate-register').addEventListener('click', gateRegister);
+  $('btn-gate-save-server').addEventListener('click', saveGateServer);
+  $('gate-server').addEventListener('change', probeGateRegistration);
+  // 门内回车：按当前 tab 提交（与设置浮层同一套交互）
+  $('login-gate').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && event.target.tagName !== 'BUTTON') {
+      event.preventDefault();
+      if ($('gate-register-form').hidden) gateLogin();
+      else gateRegister();
+    }
+  });
   $('gov-modal').addEventListener('click', (event) => {
     if (event.target === $('gov-modal')) closeGovModal();
   });

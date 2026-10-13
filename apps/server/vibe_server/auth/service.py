@@ -130,22 +130,30 @@ class AuthService:
         """用一次性注册令牌开通账号并直接登录。
 
         注册令牌是内网分发的准入凭据（由管理员签发、可限次、可指定团队与角色）。
+
+        当 `config.open_registration` 为真且**未带令牌**时走「开放自助注册」：
+        落到默认团队、developer 角色。这是显式开关（默认关闭），
+        让内网/自托管能把「打开即注册」做成产品形态，而不必先发邀请码。
         """
         now = self.clock.now()
         raw = (enrollment_token or "").strip()
-        if not raw:
+        row: dict | None = None
+        if raw:
+            row = self.store.find_enrollment_by_hash(
+                tokens.hash_token(raw, pepper=self._pepper)
+            )
+            if row is None:
+                self.store.record_auth_event("enrollment.invalid", remote=client_ip, now=now)
+                raise Unauthenticated("注册令牌无效")
+            if row.get("revoked_at"):
+                raise Unauthenticated("注册令牌已被吊销")
+            if int(row.get("expires_at") or 0) < now:
+                raise Unauthenticated("注册令牌已过期")
+            if int(row.get("uses") or 0) >= int(row.get("max_uses") or 1):
+                raise Unauthenticated("注册令牌已用尽")
+        elif not self.config.open_registration:
+            # 没开自助注册又没带令牌 —— 明确拒绝，而不是静默给一个无权限账号
             raise BadRequest("缺少注册令牌")
-
-        row = self.store.find_enrollment_by_hash(tokens.hash_token(raw, pepper=self._pepper))
-        if row is None:
-            self.store.record_auth_event("enrollment.invalid", remote=client_ip, now=now)
-            raise Unauthenticated("注册令牌无效")
-        if row.get("revoked_at"):
-            raise Unauthenticated("注册令牌已被吊销")
-        if int(row.get("expires_at") or 0) < now:
-            raise Unauthenticated("注册令牌已过期")
-        if int(row.get("uses") or 0) >= int(row.get("max_uses") or 1):
-            raise Unauthenticated("注册令牌已用尽")
 
         normalized = email.lower().strip()
         if not normalized or "@" not in normalized:
@@ -155,8 +163,8 @@ class AuthService:
         passwords.check_strength(password, email=normalized)
 
         # 先占额度再建用户：反过来的话，令牌用尽与建号成功之间有个窗口，
-        # 并发请求会重复建号。占用失败就直接拒。
-        if not self.store.consume_enrollment(str(row["id"]), now):
+        # 并发请求会重复建号。占用失败就直接拒。（开放注册无额度可占。）
+        if row is not None and not self.store.consume_enrollment(str(row["id"]), now):
             raise Unauthenticated("注册令牌已用尽")
 
         user_id = new_id("usr")
@@ -168,8 +176,8 @@ class AuthService:
             now=now,
         )
 
-        team_id = row.get("team_id")
-        role = str(row.get("role") or rbac.ROLE_DEVELOPER)
+        team_id = row.get("team_id") if row is not None else None
+        role = str(row.get("role") or rbac.ROLE_DEVELOPER) if row is not None else rbac.ROLE_DEVELOPER
         effective_team = self._ensure_baseline_membership(
             user_id=user_id,
             role=role,
@@ -180,7 +188,8 @@ class AuthService:
         self.store.record_auth_event(
             "user.register",
             user_id=user_id,
-            detail=f"role={role} team={effective_team}",
+            detail=f"role={role} team={effective_team}"
+            + ("" if row is not None else " open"),
             remote=client_ip,
             now=now,
         )

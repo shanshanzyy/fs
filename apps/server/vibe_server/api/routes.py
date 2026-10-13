@@ -122,6 +122,18 @@ def register_auth(router: Router) -> None:
         )
         return Response.json(result, status=HTTPStatus.CREATED)
 
+    @router.get(API + "/auth/config", auth=AUTH_PUBLIC)
+    def auth_config(request: Request) -> Response:
+        """公开的注册策略探针。
+
+        客户端登录门据此决定「邀请码」是必填还是可留空 —— 硬编码一份策略在
+        客户端必然与服务端漂移，然后表现为「一批注册全被拒」。
+        这里**只回一个布尔**，不泄漏任何配置细节。
+        """
+        return Response.json(
+            {"registrationOpen": bool(getattr(request.app.config, "open_registration", False))}
+        )
+
     @router.post(API + "/auth/register", auth=AUTH_PUBLIC)
     def register(request: Request) -> Response:
         body = _obj(request)

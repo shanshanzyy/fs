@@ -660,6 +660,14 @@ class VibeHandler(BaseHTTPRequestHandler):
             self._send_json(session.context_stats())
             return
 
+        # ---- 治理面策略探针（登录门）：是否开放自助注册 -------------------
+        # 只读、零副作用，执行中也照样可用（见 Session.governance_config）。
+        if path == "/api/governance/config" and method == "GET":
+            self._send_json(
+                session.governance_config(server_url=(query.get("serverUrl") or [""])[0])
+            )
+            return
+
         # ---- Git 集成（P0-C）：只读的仓库视图 ---------------------------
         # 三个端点都走 gitinfo（固定 argv + shell=False），非 git 仓库时返回
         # available=false 而不是报错 —— 界面据此显示「不是 git 仓库」。
