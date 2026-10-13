@@ -19,6 +19,9 @@ venv/
 .tmp-*/
 *.log
 
+# 本地实战工具（如便携版 Caddy）：二进制不入库
+.tools/
+
 # Node / Electron（桌面壳只有 electron 一个依赖，但体积近 400MB）
 node_modules/
 out/

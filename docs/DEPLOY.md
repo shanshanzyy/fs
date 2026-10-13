@@ -147,6 +147,25 @@ vibe.corp.example {
 Caddy 会自动：获取证书、终结 TLS、并**自动带上** `X-Forwarded-For` 与
 `X-Forwarded-Proto: https` —— 与上面两个开关正好配套。
 
+> **纯内网警告**：上面的 `vibe.corp.example` 依赖 Caddy 自动 ACME 签发，要求域名
+> **公网可解析**且 **80/443 可达** —— 内网环境通常两条都不满足，会自动签发失败。
+> 内网改用 Caddy 自带的**本地 CA**（`tls internal`）：
+>
+> ```caddyfile
+> localhost:8443 {          # 换成你的内网域名 / 端口（如 vibe.corp.local:443）
+>     tls internal          # 本地 CA 签发，不依赖公网
+>     reverse_proxy 127.0.0.1:8787
+> }
+> ```
+>
+> 首次 `caddy run` 会**自动把本地根证书装进 Windows 信任库**（日志出现
+> `certificate installed properly in windows trusts`），因此本机客户端（含 Python
+> `ssl.create_default_context`）直接就能信任，无需再配 `SSL_CERT_FILE`。
+> 换机器或换 Caddy 数据目录后需重新信任：`caddy trust`。
+>
+> 实测备注：curl（Schannel 后端）对本地 CA 会报 `CRYPT_E_NO_REVOCATION_CHECK`
+> （无法检查吊销），加 `--ssl-no-revoke` 即可 —— 这是**吊销检查**问题，不是证书不受信。
+
 #### 样例 B：Nginx（已有 Nginx/证书体系时）
 
 ```nginx
