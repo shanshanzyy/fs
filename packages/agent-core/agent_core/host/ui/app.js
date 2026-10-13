@@ -820,7 +820,11 @@ function addToolCall(ev) {
   head.addEventListener('click', () => card.classList.toggle('is-open'));
 
   stream.appendChild(card);
-  S.calls.set(ev.callId, { card, body, out, status, name: ev.tool });
+  S.calls.set(ev.callId, {
+    card, body, out, status, name: ev.tool, streaming: null,
+    // 底部「输出」面板实时滚动的行缓冲：跨块的半行先攒着，凑满一行才推。
+    termBuf: '', termErr: false, termStreamed: false,
+  });
   scrollToEnd();
 
   // 命令类工具同步进底部终端
@@ -828,6 +832,54 @@ function addToolCall(ev) {
     const cmd = ev.arguments && (ev.arguments.command || summarizeArgs(ev.arguments));
     if (cmd) termLine('output', `$ ${cmd}`, 'is-cmd');
   }
+}
+
+/* ---- 命令流式回显（run_command 边跑边看）----------------------------------
+ * run.tool_output 事件把子进程 stdout/stderr 的增量片段实时推到这里。
+ * 它只是「打字机」：命令结束时 completeToolCall 用 run.tool_result 的完整
+ * content **覆盖式收口**，并把这块临时区域移除 —— 模型侧与刷新后的视图都不受影响。 */
+function applyToolOutput(ev) {
+  const entry = S.calls.get(ev.callId);
+  if (!entry) return; // 历史重放或刷新后卡片可能不在，静默跳过
+  if (!entry.streaming) {
+    const live = el('pre', 'tool-live', '');
+    entry.body.insertBefore(live, entry.out);
+    entry.card.classList.add('is-open'); // 命令有输出时自动展开，用户能立刻看到
+    entry.streaming = live;
+  }
+  if (ev.stream === 'stderr') {
+    // stderr 单独着色：一行一段，避免与 stdout 交错时染色错乱
+    const span = el('span', 'live-err', ev.text || '');
+    entry.streaming.appendChild(span);
+  } else {
+    entry.streaming.appendChild(document.createTextNode(ev.text || ''));
+  }
+  // 跟随滚动：只在用户没往上翻时自动滚到底
+  const box = entry.streaming;
+  if (box.scrollHeight - box.scrollTop - box.clientHeight < 40) {
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // 底部「输出」面板同步实时滚动：按行推进，跨块的半行先攒进 entry.termBuf。
+  // 与卡片内的实时区是两条独立渲染路径，但都只影响「看」，不影响模型侧。
+  const text = ev.text || '';
+  if (text) {
+    entry.termStreamed = true;
+    // 流切换（stdout↔stderr）时先把上一个流的半行冲掉，避免两个流的残句拼进同一行。
+    if (entry.termErr !== (ev.stream === 'stderr') && entry.termBuf) {
+      termLine('output', entry.termBuf, entry.termErr ? 'is-err' : '');
+      entry.termBuf = '';
+    }
+    entry.termErr = ev.stream === 'stderr';
+    entry.termBuf += text;
+    let nl;
+    while ((nl = entry.termBuf.indexOf('\n')) >= 0) {
+      const line = entry.termBuf.slice(0, nl);
+      entry.termBuf = entry.termBuf.slice(nl + 1);
+      termLine('output', line, entry.termErr ? 'is-err' : '');
+    }
+  }
+  scrollToEnd();
 }
 
 function completeToolCall(ev) {
@@ -838,6 +890,12 @@ function completeToolCall(ev) {
       termLine('output', ev.content, ev.ok ? '' : 'is-err');
     }
     return;
+  }
+
+  // 命令流式回显收口：以 run.tool_result 的完整 content 覆盖，移除临时实时区
+  if (entry.streaming) {
+    entry.streaming.remove();
+    entry.streaming = null;
   }
 
   entry.status.textContent = ev.ok ? '完成' : '失败';
@@ -856,7 +914,21 @@ function completeToolCall(ev) {
   }
   if (ev.meta?.path) markChangedFile(ev.meta.path, ev.meta.created);
   if (COMMAND_TOOLS.test(entry.name)) {
-    termLine('output', ev.content || '（无输出）', ev.ok ? '' : 'is-err');
+    if (entry.termStreamed) {
+      // 流式已实时滚过：冲掉残留半行，再补一行退出状态收口（不重复写完整输出）。
+      if (entry.termBuf) {
+        termLine('output', entry.termBuf, entry.termErr ? 'is-err' : '');
+        entry.termBuf = '';
+      }
+      const code = ev.meta && ev.meta.exit_code;
+      termLine(
+        'output',
+        `（结束，退出码 ${code == null ? '?' : code}）`,
+        ev.ok ? 'is-ok' : 'is-err'
+      );
+    } else {
+      termLine('output', ev.content || '（无输出）', ev.ok ? '' : 'is-err');
+    }
   }
   scrollToEnd();
 }
@@ -3302,6 +3374,8 @@ const HANDLERS = {
   },
 
   'run.tool_result': (ev) => completeToolCall(ev),
+
+  'run.tool_output': (ev) => applyToolOutput(ev),
 
   'run.subagent': (ev) => applySubAgent(ev),
 

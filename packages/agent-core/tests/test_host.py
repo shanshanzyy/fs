@@ -382,6 +382,36 @@ class SessionTests(unittest.TestCase):
             time.sleep(0.02)
         raise AssertionError("没有等到审批请求")
 
+    # ---- 命令流式输出（run_command 边跑边回显）-----------------------------
+    def test_run_command_streams_tool_output_event(self) -> None:
+        """后端把子进程输出转成 run.tool_output 事件（UI 流式回显的数据源）。"""
+        (self.ws / "emit.py").write_text(
+            "print('hello-stream')\n", encoding="utf-8", newline=""
+        )
+        session = self._session(
+            [[("run_command", {"command": "python emit.py"})], "跑完了。"]
+        )
+        sub = session.bus.subscribe()  # 有界面连着：审批会合点才会真正抛给用户
+        session.submit("跑一下")
+        pending = self._wait_approval(session)
+        self.assertEqual(pending["tool"], "run_command")
+        session.resolve_approval(pending["approvalId"], "approve")
+        self._wait_idle(session)
+
+        types: list[str] = []
+        stdout_text = ""
+        while True:
+            event = sub.get(timeout=0.05)
+            if event is None:
+                break
+            types.append(event["type"])
+            if event["type"] == "run.tool_output" and event.get("stream") == "stdout":
+                stdout_text += event["text"]
+        sub.close()
+
+        self.assertIn("run.tool_output", types)
+        self.assertIn("hello-stream", stdout_text)
+
     # ---- 审批 -------------------------------------------------------------
     def test_approve_applies_edit(self) -> None:
         session = self._session(

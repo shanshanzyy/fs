@@ -146,6 +146,11 @@ class ToolContext:
     # 由 `Agent._execute_call` 在真正执行前绑到当前 `ToolCall` 上（见 C4）。
     # None = 子 Agent 未启用（VIBE_SUBAGENT=0 或直接调 registry 的场景）。
     subagent_sink: Callable[[str], ToolResult] | None = None
+    # 命令流式输出：`run_command` 子进程边跑边把 stdout/stderr 的增量交给这个回调，
+    # 由 `Agent._execute_call` 绑到当前 `ToolCall` 上（与 plan_sink/subagent_sink 同范式）。
+    # 参数为 (stream: "stdout"|"stderr", chunk: str)。**它只影响界面呈现，不改变
+    # 工具返回给模型的 ToolResult** —— 为 None 时走纯累积路径，结果与改造前逐字节一致。
+    stream_sink: Callable[[str, str], None] | None = None
 
     def mark_read(self, rel: str) -> None:
         self.read_files.add(rel)

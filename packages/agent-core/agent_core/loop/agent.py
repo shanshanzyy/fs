@@ -166,6 +166,15 @@ class AgentHooks:
     def on_assistant_text(self, text: str) -> None: ...
     def on_tool_call(self, call: ToolCall, risk: Risk, reason: str) -> None: ...
     def on_tool_result(self, call: ToolCall, result: ToolResult) -> None: ...
+    def on_tool_output(self, call: ToolCall, stream: str, chunk: str) -> None:
+        """命令流式输出：`run_command` 子进程 stdout/stderr 的增量片段。
+
+        `stream` 是 "stdout" | "stderr"。定位与 `on_assistant_delta` 相同 ——
+        增量只用于「边跑边看」，**最终结果仍以 `on_tool_result` 为准**：
+        两个回调都消费时，界面上应以 `on_tool_result` 的完整内容收口。
+        默认空实现，CLI 不关心；不订阅时子进程仍走纯累积路径，结果不变。
+        """
+        ...
     def on_notice(self, text: str) -> None: ...
     def on_plan(self, steps: list[dict[str, Any]], revision: int) -> None:
         """计划更新（P2-12）：`update_plan` 给出的**完整**步骤表。
@@ -1130,11 +1139,16 @@ class Agent:
         #（callId 要用来关联父侧卡片），执行完复原。工具批在循环里是**串行**执行的，
         # 所以「临时赋值 → 执行 → 复原」是安全的。
         previous_sink = self.ctx.subagent_sink
+        previous_stream = self.ctx.stream_sink
         self.ctx.subagent_sink = lambda task: self._delegate(call, task)
+        self.ctx.stream_sink = lambda stream, chunk: self.hooks.on_tool_output(
+            call, stream, chunk
+        )
         try:
             result = self.registry.execute(self.ctx, call.name, call.arguments)
         finally:
             self.ctx.subagent_sink = previous_sink
+            self.ctx.stream_sink = previous_stream
         elapsed = time.perf_counter() - started
 
         # 沙箱拦截与工具内部异常要**单独成条**。

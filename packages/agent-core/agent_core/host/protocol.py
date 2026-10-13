@@ -29,6 +29,7 @@
 | `run.assistant_delta` | 模型纯文本回复的增量（流式输出，A1） | `runId` `text`（片段，按序拼接即全文；工具围栏后的内容不会出现） |
 | `run.tool_call` | 工具调用前（含风险分级） | `runId` `callId` `tool` `arguments` `risk` `reason` |
 | `run.tool_result` | 工具执行后 | `runId` `callId` `tool` `ok` `content` `diff` `meta` |
+| `run.tool_output` | `run_command` 子进程有输出（流式回显） | `runId` `callId` `tool` `stream`（`stdout`/`stderr`）`text`（片段，按序拼接即该流全文）`clipped`；**纯呈现**，不落盘、不进会话库，最终结果仍以 `run.tool_result` 为准 |
 | `run.approval` | 需要人工审批 | `runId` `approvalId` `tool` `risk` `reason` `preview{}` |
 | `run.approval_resolved` | 审批已处理 | `approvalId` `decision` |
 | `run.notice` | 提醒/警告 | `runId` `text` |
@@ -301,6 +302,9 @@ RUN_ITERATION = "run.iteration"
 RUN_ASSISTANT_DELTA = "run.assistant_delta"
 RUN_TOOL_CALL = "run.tool_call"
 RUN_TOOL_RESULT = "run.tool_result"
+# 命令流式输出：`run_command` 子进程边跑边回显的增量片段。与 delta 同定位 ——
+# 只用于「边跑边看」，**不落盘、不进会话库**；最终结果仍以 run.tool_result 为准。
+RUN_TOOL_OUTPUT = "run.tool_output"
 RUN_APPROVAL = "run.approval"
 RUN_APPROVAL_RESOLVED = "run.approval_resolved"
 RUN_NOTICE = "run.notice"

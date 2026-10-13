@@ -91,6 +91,69 @@ class LoopHarness(unittest.TestCase):
         return agent, client, approvals
 
 
+class CommandStreamTest(LoopHarness):
+    """run_command 流式回显（后端）：增量只喂界面，模型侧结果必须逐字节不变。
+
+    对应改造：tools/shell.py 由 subprocess.run 改为 Popen + 双读取线程，
+    边跑边经 `ctx.stream_sink` 上抛；`Agent._execute_call` 把它绑到当前 call。
+    这里钉住核心不变式 —— **有没有订阅流式，喂给模型的 ToolResult 完全一致**。
+    """
+
+    def _emit_script(self) -> str:
+        (self.ws / "emit.py").write_text(
+            "import sys\n"
+            "print('out-1')\n"
+            "print('err-1', file=sys.stderr)\n"
+            "print('out-2')\n"
+            "sys.exit(2)\n",
+            encoding="utf-8",
+            newline="",
+        )
+        return "python emit.py"
+
+    def test_streaming_does_not_change_model_visible_result(self) -> None:
+        command = self._emit_script()
+        agent, _, _ = self._make_agent([])
+        ctx = agent.ctx
+
+        ctx.stream_sink = None
+        silent = agent.registry.execute(ctx, "run_command", {"command": command})
+
+        chunks: list[tuple[str, str]] = []
+        ctx.stream_sink = lambda stream, chunk: chunks.append((stream, chunk))
+        streamed = agent.registry.execute(ctx, "run_command", {"command": command})
+        ctx.stream_sink = None
+
+        # 核心不变式：无论有没有流式订阅，模型看到的结果逐字段一致
+        self.assertEqual(silent.content, streamed.content)
+        self.assertEqual(silent.meta, streamed.meta)
+        self.assertEqual(silent.ok, streamed.ok)
+        # 流式确实吐了片段，且按序拼回即该流全文
+        self.assertTrue(chunks, "订阅了 stream_sink 却一个片段都没收到")
+        out_text = "".join(c for s, c in chunks if s == "stdout")
+        err_text = "".join(c for s, c in chunks if s == "stderr")
+        self.assertEqual(out_text, "out-1\nout-2\n")
+        self.assertEqual(err_text, "err-1\n")
+
+    def test_sink_exception_never_breaks_the_command(self) -> None:
+        """sink 只是呈现 —— 它抛异常也绝不能影响命令执行与模型侧结果。"""
+        command = self._emit_script()
+        agent, _, _ = self._make_agent([])
+        ctx = agent.ctx
+
+        ctx.stream_sink = None
+        baseline = agent.registry.execute(ctx, "run_command", {"command": command})
+
+        def boom(stream: str, chunk: str) -> None:
+            raise RuntimeError("界面回调炸了")
+
+        ctx.stream_sink = boom
+        result = agent.registry.execute(ctx, "run_command", {"command": command})
+        ctx.stream_sink = None
+
+        self.assertEqual(baseline.content, result.content)
+
+
 class HappyPathTest(LoopHarness):
     def test_read_then_edit_closes_the_loop(self) -> None:
         path = self.ws / "calc.py"

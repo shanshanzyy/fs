@@ -703,6 +703,24 @@ pre, code, kbd { font-family: var(--mono); }
 }
 .tool-output.is-error { color: var(--danger); }
 
+/* 命令流式回显（run_command 边跑边看）：命令执行期间的临时实时输出区，
+ * 命令结束时被 run.tool_result 的完整内容替换并移除。样式与 .tool-output 一致，
+ * 加一个呼吸光标提示「还在跑」。 */
+.tool-live {
+  margin: 6px 0 0; padding: 7px 9px; border-radius: 5px;
+  background: #101216; border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11.5px; max-height: 260px; overflow: auto;
+  white-space: pre-wrap; word-break: break-all;
+  color: #c6cfdd;
+}
+.tool-live .live-err { color: var(--warn); }
+.tool-live::after {
+  content: '▌';
+  color: var(--accent);
+  animation: live-blink 1s steps(2) infinite;
+}
+@keyframes live-blink { 50% { opacity: 0; } }
+
 /* 子 Agent 内嵌卡片（M3）：嵌在 task 工具卡片的正文里，随父卡片一起展开/收起 */
 .subagent {
   margin: 6px 0 0; padding: 6px 8px; border-radius: 5px;
@@ -1105,3 +1123,31 @@ body[data-mode="solo"]:not(.has-open-tab) .bottom-panel {
   flex: 1 1 auto; height: auto; border-top: 0;
 }
 body[data-mode="solo"]:not(.has-open-tab) .bottom-panel.is-collapsed { flex: 0 0 30px; height: 30px; }
+
+/* ═══════════════ 启动登录门（强制登录） ═══════════════
+   未接入治理面时全屏遮住工作区。z-index 150：压过审批浮层(100)，但低于
+   Toast(200) —— 登录失败的提示必须能被看见。 */
+.gate {
+  position: fixed; inset: 0; z-index: 150;
+  display: grid; place-items: center; padding: 24px;
+  background: radial-gradient(1200px 600px at 50% -10%, #1d2b46 0%, #14161a 55%, #0f1013 100%);
+}
+.gate-card {
+  width: min(400px, 94vw); display: flex; flex-direction: column; gap: 4px;
+  background: var(--panel); border: 1px solid #33415e; border-radius: 14px;
+  padding: 26px 24px; box-shadow: 0 24px 70px rgba(0,0,0,.6);
+}
+.gate-brand { font-size: 22px; font-weight: 700; letter-spacing: .5px; }
+.gate-mark { color: var(--accent); }
+.gate-sub { color: var(--fg-dim); font-size: 12.5px; margin-bottom: 10px; }
+.gate-tabs { display: flex; gap: 6px; background: var(--panel-2); padding: 4px; border-radius: 10px; }
+.gate-tab { flex: 1; padding: 7px 0; border-radius: 7px; font-size: 13px; color: var(--fg-dim); }
+.gate-tab.is-active { background: var(--raise); color: var(--fg); font-weight: 600; }
+.gate-label { font-size: 12px; color: var(--fg-dim); margin-top: 8px; }
+.gate-server-row { display: flex; gap: 8px; }
+.gate-server-row .ws-input { flex: 1; min-width: 0; }
+.gate-note { font-size: 11px; color: var(--fg-faint); min-height: 14px; }
+.gate-submit { margin-top: 16px; padding: 9px 0; width: 100%; border-radius: 8px; font-size: 13.5px; }
+.gate-error { color: var(--danger); font-size: 12px; word-break: break-all; margin-top: 6px; }
+.gate-msg { font-size: 11.5px; color: var(--fg-dim); min-height: 14px; }
+

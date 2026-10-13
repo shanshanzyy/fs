@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 
 from ..errors import SandboxViolation, ToolError
 from ..sandbox import Risk
@@ -40,6 +41,30 @@ def scrub_env() -> dict[str, str]:
     return clean
 
 
+def _pump(stream, sink, name: str, buffer: list[str]) -> None:
+    """逐块读取子进程输出：累积进 buffer（喂模型），同时实时交给 sink（喂界面）。
+
+    **累积与实时是两条独立路径**：sink 抛异常也绝不能影响 buffer —— 模型侧结果
+    必须与「没有流式」时逐字节一致。sink 为 None 时等价于原来的整段读取。
+    """
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            buffer.append(chunk)
+            if sink is not None:
+                try:
+                    sink(name, chunk)
+                except Exception:  # noqa: BLE001 — 流式只是呈现，绝不拖垮命令
+                    pass
+    finally:
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _run_command(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.config.allow_shell:
         raise SandboxViolation("当前会话已关闭命令执行权限（allow_shell=false）")
@@ -50,27 +75,22 @@ def _run_command(ctx: ToolContext, args: dict) -> ToolResult:
     timeout = int(args.get("timeout") or ctx.config.command_timeout)
     timeout = max(1, min(timeout, 600))
 
+    sink = ctx.stream_sink
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+
     try:
-        proc = subprocess.run(  # noqa: S603 — argv 数组 + shell=False，无注入面
+        proc = subprocess.Popen(  # noqa: S603 — argv 数组 + shell=False，无注入面
             analysis.argv,
             cwd=str(ctx.config.workspace),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             env=scrub_env(),
             stdin=subprocess.DEVNULL,
-            check=False,
         )
-    except subprocess.TimeoutExpired:
-        ctx.audit.record(
-            "tool.run_command", command=command, status="timeout", timeout=timeout
-        )
-        raise ToolError(
-            f"命令执行超过 {timeout} 秒被终止：{command}\n"
-            "  建议：把长任务拆小，或对该次调用显式提高 timeout（上限 600 秒）。"
-        ) from None
     except FileNotFoundError:
         raise ToolError(
             f"找不到可执行文件 {analysis.executable!r}，请确认它已安装并在 PATH 中。"
@@ -78,36 +98,66 @@ def _run_command(ctx: ToolContext, args: dict) -> ToolResult:
     except OSError as exc:
         raise ToolError(f"命令启动失败: {exc}") from None
 
-    stdout = (proc.stdout or "")[:_MAX_CAPTURE]
-    stderr = (proc.stderr or "")[:_MAX_CAPTURE]
+    # 两条读取线程并行排空 stdout/stderr，避免管道写满导致子进程阻塞；
+    # 每读到一块就累积 + （若有订阅）实时上抛。累积结果与 subprocess.run 的
+    # `capture_output` 等价（同样的 text/encoding/errors 与通用换行翻译）。
+    t_out = threading.Thread(
+        target=_pump, args=(proc.stdout, sink, "stdout", out_chunks), daemon=True
+    )
+    t_err = threading.Thread(
+        target=_pump, args=(proc.stderr, sink, "stderr", err_chunks), daemon=True
+    )
+    t_out.start()
+    t_err.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        ctx.audit.record(
+            "tool.run_command", command=command, status="timeout", timeout=timeout
+        )
+        raise ToolError(
+            f"命令执行超过 {timeout} 秒被终止：{command}\n"
+            "  建议：把长任务拆小，或对该次调用显式提高 timeout（上限 600 秒）。"
+        ) from None
+    t_out.join()
+    t_err.join()
+
+    stdout_full = "".join(out_chunks)
+    stderr_full = "".join(err_chunks)
+    stdout = stdout_full[:_MAX_CAPTURE]
+    stderr = stderr_full[:_MAX_CAPTURE]
 
     ctx.audit.record(
         "tool.run_command",
         command=command,
         executable=analysis.executable,
         risk=analysis.risk.value,
-        exit_code=proc.returncode,
-        stdout_bytes=len(proc.stdout or ""),
-        stderr_bytes=len(proc.stderr or ""),
+        exit_code=returncode,
+        stdout_bytes=len(stdout_full),
+        stderr_bytes=len(stderr_full),
     )
 
-    parts = [f"[run_command] {command}", f"退出码: {proc.returncode}"]
+    parts = [f"[run_command] {command}", f"退出码: {returncode}"]
     if stdout.strip():
         parts.append(wrap_untrusted("stdout", stdout.rstrip()))
     if stderr.strip():
         parts.append(wrap_untrusted("stderr", stderr.rstrip()))
     if not stdout.strip() and not stderr.strip():
         parts.append("（命令没有产生任何输出）")
-    if proc.returncode != 0:
+    if returncode != 0:
         parts.append(
-            f"（命令以非零退出码 {proc.returncode} 结束。请先读懂报错再改代码，"
+            f"（命令以非零退出码 {returncode} 结束。请先读懂报错再改代码，"
             "不要盲目重试同一条命令。）"
         )
 
     return ToolResult(
-        ok=proc.returncode == 0,
+        ok=returncode == 0,
         content="\n".join(parts),
-        meta={"exit_code": proc.returncode, "executable": analysis.executable},
+        meta={"exit_code": returncode, "executable": analysis.executable},
     )
 
 

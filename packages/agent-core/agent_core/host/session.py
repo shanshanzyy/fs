@@ -2402,6 +2402,26 @@ class _SessionHooks(AgentHooks):
             )
         )
 
+    def on_tool_output(self, call: Any, stream: str, chunk: str) -> None:
+        """命令流式输出：把 `run_command` 子进程的增量片段转发给界面。
+
+        与 on_assistant_delta 同定位 —— **纯呈现**：不落盘、不进会话库，
+        刷新页面靠快照补齐；最终结果仍以 on_tool_result 为准（覆盖式收口）。
+        文本经 `_clip` 限幅，防止单块异常巨大。
+        """
+        body, clipped = _clip(chunk)
+        self._bus.publish(
+            P.event(
+                P.RUN_TOOL_OUTPUT,
+                runId=self._run_id,
+                callId=call.id,
+                tool=call.name,
+                stream=stream,
+                text=body,
+                clipped=clipped,
+            )
+        )
+
     def on_subagent(self, event: dict[str, Any]) -> None:
         """子 Agent 进度（M3）：把一次 `task` 委派的生命周期帧转发给界面。
 
