@@ -26,6 +26,9 @@
   </div>
   <div class="tb-right">
     <span class="chip chip-clickable" id="chip-model" role="button" tabindex="0" title="点击配置模型">—</span>
+    <!-- 治理面入口（M3+）：始终可见 —— 未配 VIBE_SERVER_URL 时 chip-gov 是隐藏的，
+         但登录弹窗必须有一个总在的入口，否则同事机器上第一次没法填地址登录。 -->
+    <button class="tbtn" id="btn-gov" title="治理面：登录 / 邀请码注册 / 退出（多人共用入口）">治理面</button>
     <span class="chip chip-gov" id="chip-gov" hidden title="治理面状态">治理面</span>
     <span class="chip chip-state" id="chip-state" data-state="idle">空闲</span>
     <!-- 命令面板入口（P2-13）：让鼠标用户也能发现 Ctrl/Cmd+Shift+P -->
@@ -616,6 +619,63 @@
       <div class="modal-actions">
         <button class="btn btn-ghost" id="btn-mcp-cancel">关闭</button>
         <button class="btn btn-primary" id="btn-mcp-save">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 治理面登录（M3+）：把「填地址 → 密码登录 / 邀请码注册 → 热接入」做成闭环，
+     桌面端不必再「先用 CLI 登录、再重启」。登录是「用户本人动作」（ADR-011）：
+     不弹审批浮层，但任务执行中会被拒（409）。令牌由后端写进用户级凭证文件，
+     界面只显示掩码视图，绝不持有明文。地址可保存进桌面壳 config.json（重启后生效）。 -->
+<div class="modal-backdrop" id="gov-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="gov-title">
+    <div class="modal-head">
+      <span class="risk-badge" data-r="SAFE">GOV</span>
+      <h2 id="gov-title">治理面登录</h2>
+      <span class="modal-tool" id="gov-status">—</span>
+    </div>
+    <div class="modal-reason" id="gov-hint">
+      登录后模型请求经治理网关、审计事件上报服务端（客户端不再持有云端密钥）。
+      这是「用户本人动作」，不弹审批浮层；任务执行中不可登录 / 退出。
+    </div>
+    <div class="ws-body">
+      <label class="ws-label" for="gov-server">治理面地址</label>
+      <div class="ws-path-row">
+        <span class="set-note">保存后<b>重启应用</b>生效；本次登录直接用这里填的地址</span>
+        <button type="button" class="ws-pick" id="btn-gov-save-server" hidden>保存地址</button>
+      </div>
+      <input class="ws-input" id="gov-server" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://vibe.内网域名">
+
+      <div class="sb-caption">密码登录</div>
+      <label class="ws-label" for="gov-email">邮箱</label>
+      <input class="ws-input" id="gov-email" type="text" spellcheck="false" autocomplete="username">
+      <label class="ws-label" for="gov-password">密码</label>
+      <input class="ws-input" id="gov-password" type="password" autocomplete="current-password">
+      <div class="set-row">
+        <button type="button" class="ws-pick" id="btn-gov-login">登录</button>
+        <button type="button" class="ws-pick" id="btn-gov-logout" hidden>退出登录</button>
+        <span class="set-msg" id="gov-msg"></span>
+      </div>
+
+      <div class="sb-caption">邀请码注册（首次加入团队）</div>
+      <label class="ws-label" for="gov-token">邀请码</label>
+      <input class="ws-input" id="gov-token" type="text" spellcheck="false" autocomplete="off"
+             placeholder="由管理员发放">
+      <label class="ws-label" for="gov-name">显示名（可选）</label>
+      <input class="ws-input" id="gov-name" type="text" spellcheck="false" autocomplete="off">
+      <div class="set-row">
+        <button type="button" class="ws-pick" id="btn-gov-register">用邀请码注册</button>
+        <span class="set-msg" id="gov-reg-msg"></span>
+      </div>
+
+      <div class="ws-error" id="gov-error" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-gov-close">关闭</button>
       </div>
     </div>
   </div>

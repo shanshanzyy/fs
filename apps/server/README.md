@@ -53,11 +53,18 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 |---|---|
 | `serve`（默认） | 起服务 |
 | `bootstrap --email --password [--name] [--enrollment-uses N]` | 建首个组织所有者 + 签发注册令牌（`--enrollment-uses 0` 跳过签发） |
+| `invite --email --password [--role] [--uses] [--count] [--ttl-hours] [--team-id] [--note]` | 管理员签发注册令牌（邀请码），把同事拉进组织 |
 | `doctor [--probe URL]` | 环境自检 |
 
 `bootstrap` 只在库为空时可用 —— 它是个一次性入口，不走 HTTP 认证，
-所以不能留成「任何人都能给自己开个 owner」。组织建好后要走：
-注册令牌（`POST /api/v1/enrollments` 签发）或 SSO。
+所以不能留成「任何人都能给自己开个 owner」。组织建好后**拉人靠 `invite`**：
+它用管理员本人账号口令鉴权（CLI 无设备，故直接装配 actor、不走 `authenticate`），
+再以 `enrollment:write` 权限签发注册令牌。同事侧拿令牌走
+`vibe-agent governance register --enrollment-token <token>`（桌面端标题栏
+「治理面」→ 填地址 → 选「邀请码注册」同效）。
+
+> 集中治理面的**部署手册（Windows 内网单机 + Caddy/Nginx 反代 TLS + 服务化 + 备份恢复 + 排障）**
+> 见 [`docs/DEPLOY.md`](../../docs/DEPLOY.md)。
 
 ---
 
@@ -481,7 +488,7 @@ python -m unittest discover -s tests -t .
 | `test_quota_derive.py` | 29 | 预算→每日额度**推导数学**（单价换算 / 窗口 / 成员分摊 / 向下取整 / 0 与负值）、**解析链显式恒优先**（含 `0=不限`）、推导额度被 `reserve` 真拦住、`status()` 来源标注、`GET/POST /api/v1/quota/budget` 的权限与作用域（越权 403） |
 | `test_redaction.py` | 32 | 键黑/白名单、值形状拒码、摘要、整条拒收 |
 | `test_policy.py` | 43 | 只收紧、**交换律（6 个排列同一 etag）**、`sensitiveForceLocal` 拒收、客户端映射、过期降级 |
-| `test_cli_bootstrap.py` | 5 | CLI 首跑链路，且**用签出的令牌真的注册一个开发者** |
+| `test_cli_bootstrap.py` | 11 | CLI 首跑链路：`bootstrap` 且**用签出的令牌真的注册一个开发者**；`invite` 的权限（口令错误 / 账号不存在均返回 1）、批量签发互异、`--role`/`--uses` 语义、缺凭据返回 2 |
 | `test_oidc.py` | 7 | 假 IdP 上走完 begin → callback → `/auth/me`；PKCE 与 client_secret 真被核验；state 重放 / nonce 不符 / 邮箱未验证 / IdP 自称 owner 全被拒 |
 | `test_gateway_stream.py` | 16 | 流式透传 SSE（HTTP 层不再被 `stream=true` 拦下）、流式下的配额结算、`X-Vibe-Route-*` 与非流式一致、降级与失败路径 |
 | `test_metrics_usage.py` | 21 | `/metrics` 的 Prometheus 文本渲染与 HTTP 暴露、`usage_summary()` 口径、端点声明 |

@@ -33,9 +33,10 @@ contextBridge.exposeInMainWorld('vibeShell', Object.freeze({
   // （base64）。浏览器里没有这个方法，界面据此把「截图自检」降级为「需桌面端」。
   capturePage: (url, width, height) =>
     ipcRenderer.invoke('vibe:capture-page', { url, width, height }),
-  // 解释器设置（模型设置面板）：读/写 config.json 的解释器字段 + 重启应用。
-  // 只接受/只回传 {pythonPath, backendBin} —— 主进程侧再白名单一次，密钥不经此桥。
-  // 浏览器里没有这三座桥，界面据此隐藏「解释器」整段。
+  // 桌面壳配置（模型设置面板的解释器段 + 治理面登录弹窗的地址段）：读/写
+  // config.json 的解释器与治理面地址字段 + 重启应用。只接受/只回传
+  // {pythonPath, backendBin, serverUrl, gatewayUrl} —— 主进程侧再白名单一次，
+  // 任何密钥都不经此桥。浏览器里没有这三座桥，界面据此隐藏对应控制。
   readDesktopConfig: () => ipcRenderer.invoke('vibe:read-config'),
   saveDesktopConfig: (patch) => ipcRenderer.invoke('vibe:save-config', patch),
   relaunch: () => ipcRenderer.invoke('vibe:relaunch'),

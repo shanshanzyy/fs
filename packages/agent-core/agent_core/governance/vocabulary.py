@@ -824,6 +824,36 @@ _RULES: dict[str, Rule] = {
         note="每轮任务注入记忆段的条数与总字符数。**注入的正文不上传**——"
         "它会被拼进系统提示，本质与用户消息同级的自由文本",
     ),
+    "governance.login": Rule(
+        upload="governance.login",
+        fields={
+            "ok": ("ok", "bool"),
+            "status": ("status", "str"),
+            "user_id": ("user_id", "str"),
+            "device_id": ("device_id", "str"),
+        },
+        note="用户在桌面端登录治理面的动作。只记结果、装配状态与不透明标识 —— "
+        "邮箱、口令、治理面地址一律只留本机（ADR-006）",
+    ),
+    "governance.register": Rule(
+        upload="governance.register",
+        fields={
+            "ok": ("ok", "bool"),
+            "status": ("status", "str"),
+            "user_id": ("user_id", "str"),
+            "device_id": ("device_id", "str"),
+        },
+        note="用户用邀请码注册并登录的动作。字段口径同 governance.login，"
+        "邀请码/邮箱/口令均不上传",
+    ),
+    "governance.logout": Rule(
+        upload="governance.logout",
+        fields={
+            "ok": ("ok", "bool"),
+            "user_id": ("user_id", "str"),
+        },
+        note="用户退出治理面登录的动作。只记结果与不透明用户标识",
+    ),
 }
 
 

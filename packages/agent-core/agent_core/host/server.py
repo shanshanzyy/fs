@@ -39,6 +39,7 @@ from ..context import (
     iter_workspace_symbols,
 )
 from ..errors import ConfigError, LLMError, SandboxViolation
+from ..governance.client import GovernanceError
 from ..llm.openai_compat import OpenAICompatClient, probe_endpoint
 from ..tools import ToolRegistry
 from ..tools.symbols import KIND_TYPE
@@ -1040,6 +1041,49 @@ class VibeHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             try:
                 result = session.mcp_test_server(str(body.get("name") or ""))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json(result)
+            return
+
+        # ---- 治理面登录（M3+）：从界面完成登录 / 邀请码注册 / 登出 ----------
+        # 「用户本人动作」（ADR-011 同范式）：不走审批浮层，但执行中 409
+        # （登录会换掉模型客户端与策略闸门，见 Session._governance_guard）。
+        # 令牌写进用户级凭证文件，响应只回掩码视图，绝不回明文令牌。
+        if path in (
+            "/api/governance/login",
+            "/api/governance/register",
+            "/api/governance/logout",
+        ):
+            body = self._read_json()
+            try:
+                if path.endswith("/login"):
+                    result = session.governance_login(
+                        str(body.get("email") or ""),
+                        str(body.get("password") or ""),
+                        server_url=str(body.get("serverUrl") or ""),
+                        device_name=str(body.get("deviceName") or ""),
+                    )
+                elif path.endswith("/register"):
+                    result = session.governance_register(
+                        str(body.get("enrollmentToken") or ""),
+                        str(body.get("email") or ""),
+                        str(body.get("password") or ""),
+                        display_name=str(body.get("displayName") or ""),
+                        server_url=str(body.get("serverUrl") or ""),
+                        device_name=str(body.get("deviceName") or ""),
+                    )
+                else:
+                    result = session.governance_logout(
+                        all_devices=bool(body.get("allDevices"))
+                    )
+            except BusyError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except GovernanceError as exc:
+                # 4xx（凭证错 / 邀请码无效）如实透传，其余按「治理面不可达」转 502。
+                status = exc.status if 400 <= exc.status < 500 else HTTPStatus.BAD_GATEWAY
+                self._send_json({"error": str(exc)}, status=status)
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             else:

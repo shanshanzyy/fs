@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import unittest
 
 from vibe_server.__main__ import main
@@ -66,6 +67,12 @@ class CliBootstrapTests(TempDirTestCase):
                 if candidate.strip():
                     return candidate.strip()
         self.fail(f"没从输出里找到注册令牌：\n{output}")
+
+    def extract_invite_tokens(self, output: str) -> list[str]:
+        """`invite` 输出里每枚令牌一行 `<缩进>[n] <令牌>`。"""
+        found = re.findall(r"^\s*\[\d+\]\s+(\S+)\s*$", output, flags=re.MULTILINE)
+        self.assertTrue(found, f"没从 invite 输出里找到令牌：\n{output}")
+        return found
 
 
 def _close(app) -> None:
@@ -145,6 +152,103 @@ class BootstrapFlowTests(CliBootstrapTests):
         code, output = self.bootstrap()
         self.assertEqual(code, 1, "组织已存在时 bootstrap 仍然成功了")
         self.assertIn("已初始化", output)
+
+
+class InviteFlowTests(CliBootstrapTests):
+    """`invite` —— 组织建好之后把同事拉进来的常态化入口。
+
+    与 bootstrap 的区别决定了它必须单独测：bootstrap 只在库为空时可用，
+    所以「拉第二个人进来」这条路径它压根覆盖不到；而现实里天天走的正是这条。
+    """
+
+    def invite(self, *argv: str) -> tuple[int, str]:
+        return self.run_cli("invite", "--email", self.email, "--password", self.password, *argv)
+
+    def test_invite_issues_a_usable_enrollment_token(self) -> None:
+        """核心：invite 必须签出一枚**能用**的令牌，而不只是打印一行字。"""
+        self.assertEqual(self.bootstrap()[0], 0)
+        code, output = self.invite()
+        self.assertEqual(code, 0, f"invite 没成功：{output}")
+        self.assertIn("已签发 1 枚注册令牌", output)
+
+        token = self.extract_invite_tokens(output)[0]
+        app = self.make_shared_app()
+        session = app.auth_service.register_with_enrollment(
+            enrollment_token=token,
+            email="alice@corp.example",
+            password="Al1ce!Passw0rd",
+            device_name="alice-laptop",
+            platform="test",
+            fingerprint="fp-alice",
+        )
+        self.assertTrue(session["accessToken"])
+        self.assertIn("developer", session["user"]["roles"])
+
+    def test_invite_rejects_wrong_password(self) -> None:
+        """直接读写本地库的命令，口令错就绝不能签发 —— 否则等于本地文件读权限即提权。"""
+        self.assertEqual(self.bootstrap()[0], 0)
+        code, output = self.run_cli(
+            "invite", "--email", self.email, "--password", "Wr0ng!Passw0rd"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("认证失败", output)
+        self.assertNotIn("已签发", output)
+
+    def test_invite_rejects_unknown_admin(self) -> None:
+        self.assertEqual(self.bootstrap()[0], 0)
+        code, output = self.run_cli(
+            "invite", "--email", "nobody@corp.example", "--password", "Str0ng!Passw0rd"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("认证失败", output)
+        self.assertNotIn("已签发", output)
+
+    def test_invite_count_issues_distinct_tokens(self) -> None:
+        """批量签发：一次给几个同事各一枚，且互不相同、各自可用。"""
+        self.assertEqual(self.bootstrap()[0], 0)
+        code, output = self.invite("--count", "3")
+        self.assertEqual(code, 0, output)
+        tokens = self.extract_invite_tokens(output)
+        self.assertEqual(len(tokens), 3)
+        self.assertEqual(len(set(tokens)), 3, "批量签发的令牌出现了重复")
+
+        app = self.make_shared_app()
+        for index, token in enumerate(tokens):
+            session = app.auth_service.register_with_enrollment(
+                enrollment_token=token,
+                email=f"dev{index}@corp.example",
+                password="An0ther!Str0ngPwd",
+                device_name=f"dev{index}",
+                platform="test",
+                fingerprint=f"fp{index}",
+            )
+            self.assertTrue(session["accessToken"])
+
+    def test_invite_honors_role_and_uses(self) -> None:
+        self.assertEqual(self.bootstrap()[0], 0)
+        code, output = self.invite("--role", "viewer", "--uses", "3")
+        self.assertEqual(code, 0, output)
+        self.assertIn("角色 viewer", output)
+        self.assertIn("可用 3 次", output)
+        token = self.extract_invite_tokens(output)[0]
+
+        app = self.make_shared_app()
+        session = app.auth_service.register_with_enrollment(
+            enrollment_token=token,
+            email="viewer@corp.example",
+            password="V1ewer!Passw0rd",
+            device_name="viewer",
+            platform="test",
+            fingerprint="fp-viewer",
+        )
+        self.assertIn("viewer", session["user"]["roles"])
+
+    def test_invite_requires_admin_credentials(self) -> None:
+        """没给口令时必须在动库之前就拒绝（退出码 2 = 用法错误）。"""
+        self.assertEqual(self.bootstrap()[0], 0)
+        code, output = self.run_cli("invite", "--email", self.email, "--password", "")
+        self.assertEqual(code, 2)
+        self.assertIn("需要 --email 与 --password", output)
 
 
 class DoctorTests(CliBootstrapTests):

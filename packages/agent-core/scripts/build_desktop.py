@@ -15,6 +15,7 @@
 
 版本号（D1.2）：一律取自 `agent_core.__version__`，写进
 `resources/backend/version.json` 与分发目录里的 package.json 与目录名。
+安装包同样带着这份 `resources/backend/version.json`（含内置后端与构建时间）。
 运行期界面显示的版本则来自后端 `/api/health`，保证「壳说的版本 = 内核的版本」。
 
 用法：
@@ -76,6 +77,32 @@ def dist_dir_name(version: str, platform_name: str = sys.platform, machine: str 
 
 def backend_binary_path() -> Path:
     return BACKEND_DIR / embedded_binary_name()
+
+
+def write_backend_manifest(dest_dir: Path, version: str) -> Path:
+    """在 dest_dir 写内嵌后端的清单 version.json，返回清单路径。
+
+    分发目录与安装包都要有它：前者给 `scripts/e2e_package.py` 校验，
+    后者给「装完之后能一眼看出装的是哪版内核」。
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = dest_dir / "version.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "core": version,
+                "binary": embedded_binary_name(),
+                "platform": sys.platform,
+                "arch": platform.machine(),
+                "builtAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest
 
 
 # --------------------------------------------------------------------- 步骤一
@@ -222,21 +249,7 @@ def assemble_dist(version: str, out_dir: Path | None = None) -> Path:
     backend_out = target / "resources" / "backend"
     backend_out.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, backend_out / embedded_binary_name())
-    (backend_out / "version.json").write_text(
-        json.dumps(
-            {
-                "core": version,
-                "binary": embedded_binary_name(),
-                "platform": sys.platform,
-                "arch": platform.machine(),
-                "builtAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    write_backend_manifest(backend_out, version)
     sync_package_version(version)
     print(f"      完成：{target / app_exe}")
     return target
@@ -269,6 +282,8 @@ def build_installer(version: str) -> Path:
         )
 
     sync_package_version(version)  # 安装包名里的版本号与内核版本同源
+    # 安装包靠 extraResources 整份搬 resources/backend，版本清单必须在这里落盘
+    write_backend_manifest(BACKEND_DIR, version)
     INSTALLER_DIR.mkdir(parents=True, exist_ok=True)
     setup = INSTALLER_DIR / f"VibeAgent-Setup-{version}.exe"
 

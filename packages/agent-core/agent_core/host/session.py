@@ -83,6 +83,8 @@ from ..terminal.manager import (
 from ..testing import collect as collect_tests, run as run_tests
 from ..tools import ToolRegistry, ToolResult, ToolPreview, build_default_registry
 from ..tools.plan import PLAN_STATUSES
+from ..governance.client import GovernanceClient, GovernanceError
+from ..governance.credentials import CredentialStore
 from ..governance.runtime import wire
 from . import protocol as P
 from . import visual
@@ -513,6 +515,133 @@ class Session:
             "governance": self.governance.describe() if self.governance is not None else None,
             "lastAnswer": self._answer,
             "pendingApproval": self.pending_approval,
+        }
+
+    # ------------------------------------------------------------------ 治理面登录（M3+）
+    def governance_login(
+        self, email: str, password: str, *, server_url: str = "", device_name: str = ""
+    ) -> dict[str, Any]:
+        """`POST /api/governance/login`：在本机登录治理面（用户本人动作）。
+
+        桌面端过去只能「先用 CLI 登录、再重启」；这里把「填地址 → 登录 → 热接入」
+        做成闭环，**不必重启**。令牌由 `GovernanceClient` 写进用户级
+        `~/.vibe/credentials.json`（0o600 原子写），响应只回掩码视图，绝不回明文。
+        """
+        self._governance_guard()
+        target = self._resolve_governance_server(server_url)
+        credentials = GovernanceClient(target, store=CredentialStore()).login(
+            email=email, password=password, device_name=device_name
+        )
+        runtime = self._install_governance(target)
+        self.agent.audit.record(
+            "governance.login",
+            ok=True,
+            status=runtime.status,
+            user_id=str(getattr(credentials, "user_id", "") or ""),
+            device_id=str(getattr(credentials, "device_id", "") or ""),
+        )
+        return self._governance_response()
+
+    def governance_register(
+        self,
+        enrollment_token: str,
+        email: str,
+        password: str,
+        *,
+        display_name: str = "",
+        server_url: str = "",
+        device_name: str = "",
+    ) -> dict[str, Any]:
+        """`POST /api/governance/register`：用邀请码兑换账号并登录（用户本人动作）。"""
+        self._governance_guard()
+        target = self._resolve_governance_server(server_url)
+        credentials = GovernanceClient(target, store=CredentialStore()).register(
+            enrollment_token=enrollment_token,
+            email=email,
+            password=password,
+            display_name=display_name,
+            device_name=device_name,
+        )
+        runtime = self._install_governance(target)
+        self.agent.audit.record(
+            "governance.register",
+            ok=True,
+            status=runtime.status,
+            user_id=str(getattr(credentials, "user_id", "") or ""),
+            device_id=str(getattr(credentials, "device_id", "") or ""),
+        )
+        return self._governance_response()
+
+    def governance_logout(self, *, all_devices: bool = False) -> dict[str, Any]:
+        """`POST /api/governance/logout`：退出登录并清除本机凭证（用户本人动作）。
+
+        网络失败**不阻止**本地清除凭证 —— 否则一个不可达的治理面会让用户永远
+        退不出去。清除后按配置重新装配，当前会话立即回落到本地直连。
+        """
+        self._governance_guard()
+        target = str(self.agent.config.server_url or "").strip().rstrip("/")
+        user_id = ""
+        if self.governance is not None and self.governance.governance is not None:
+            existing = self.governance.governance.credentials
+            user_id = str(getattr(existing, "user_id", "") or "")
+        store = CredentialStore()
+        if target:
+            try:
+                GovernanceClient(target, store=store).logout(all_devices=all_devices)
+            except GovernanceError:
+                pass  # logout() 内部已吞网络错误；这里再兜一层
+        store.clear()  # 兜底：即使没走到 client.logout，也确保本地一定退出
+        self._install_governance(target)
+        self.agent.audit.record("governance.logout", ok=True, user_id=user_id)
+        return self._governance_response()
+
+    def _governance_guard(self) -> None:
+        """登录 / 登出的前置闸门：执行中 409。
+
+        它们会换掉模型客户端与策略闸门，与「执行中不可改模型设置」同一纪律
+        （见 apply_settings）—— 不给运行中的任务换一套客户端引用。
+        """
+        if self.state != P.STATE_IDLE:
+            raise BusyError("任务执行中，无法登录/登出治理面，请先中断或等任务结束")
+
+    def _resolve_governance_server(self, server_url: str) -> str:
+        """定治理面地址：入参 > 当前配置；都没有 / 非法则 ValueError（→ 400）。"""
+        target = str(server_url or "").strip().rstrip("/")
+        if not target:
+            target = str(self.agent.config.server_url or "").strip().rstrip("/")
+        if not target:
+            raise ValueError("请先填写治理面地址（例如 https://vibe.内网域名）")
+        if not target.startswith(("http://", "https://")):
+            raise ValueError("治理面地址必须以 http:// 或 https:// 开头")
+        return target
+
+    def _install_governance(self, server_url: str) -> Any:
+        """按最新凭证重新装配并**热接入**当前会话，返回新的 GovernanceRuntime。
+
+        与启动时的 `wire()` 走同一个入口：写入 server_url 后重新装配策略、网关
+        客户端与审计上传器，再把结果换进当前 Agent（见 `Agent.install_governance`）。
+        当前对话、检查点与审计链都原样保留。`wire()` 永不抛异常 —— 降级信息在
+        runtime 的 notices / degradedReason 里，由界面按治理面视图展示。
+        """
+        base = self.agent.config
+        if str(base.server_url or "") != server_url:
+            base = replace(base, server_url=server_url)
+        runtime = wire(base)
+        self.governance = runtime
+        self.config = runtime.config
+        self.agent.install_governance(
+            config=runtime.config, client=runtime.client, constraints=runtime.constraints
+        )
+        self._client = self.agent.client
+        return runtime
+
+    def _governance_response(self) -> dict[str, Any]:
+        """登录 / 登出后的统一回包：广播新快照 + 只回掩码视图。"""
+        self.bus.publish(P.event(P.SESSION_READY, **self.describe()))
+        return {
+            "ok": True,
+            "governance": self.governance.describe() if self.governance is not None else None,
+            "session": self.describe(),
         }
 
     def stats(self) -> dict[str, Any]:

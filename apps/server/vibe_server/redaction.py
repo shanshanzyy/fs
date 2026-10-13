@@ -394,6 +394,22 @@ _SCHEMA: dict[str, dict[str, str]] = {
     "memory.add": {"scope": "str", "chars": "int", "digest": "digest"},
     # 每轮任务注入记忆段。只收注入条数与总字符数，**不记正文**。
     "memory.inject": {"count": "int", "chars": "int"},
+    # 治理面登录 / 注册 / 登出（M3+）：用户在桌面端接入治理面的动作。
+    # 只收结果、装配状态与不透明标识（userId/deviceId）；邮箱、口令、邀请码、
+    # 治理面地址一律只留本机（ADR-006）。
+    "governance.login": {
+        "ok": "bool",
+        "status": "str",
+        "user_id": "str",
+        "device_id": "str",
+    },
+    "governance.register": {
+        "ok": "bool",
+        "status": "str",
+        "user_id": "str",
+        "device_id": "str",
+    },
+    "governance.logout": {"ok": "bool", "user_id": "str"},
     # --- 审批闸门 ---
     "approval.request": {"tool": "str", "risk": "str", "reason": "str"},
     "approval.decision": {

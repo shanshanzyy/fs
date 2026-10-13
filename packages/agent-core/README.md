@@ -209,6 +209,29 @@ python -m agent_core -w /path/to/repo --check
 `{server, tool, ok, argc, args_digest, ms}`（**参数正文只留本机**）。server 起不来只影响自身
 （`/api/mcp/status` 报 `available:false + 原因`），会话完全不受影响。
 
+### 治理面登录（M3+）的端点
+
+桌面端过去只能「先用 CLI 登录、再重启」。这三个端点把「填地址 → 登录 / 邀请码注册 →
+**热接入**」做成闭环：登录后令牌写进用户级凭证文件（`~/.vibe/credentials.json`，0o600 原子写），
+当前会话的模型客户端与策略闸门**立即**换成治理面那一套 —— **不重建会话**，对话 / 检查点 /
+审计链都保留（`Agent.install_governance`）。
+
+| 端点 | 请求 | 返回 |
+|---|---|---|
+| `POST /api/governance/login` | `{email, password, serverUrl?, deviceName?}` | `{ok, governance, session}`；`serverUrl` 缺省回退配置（都为空则 400） |
+| `POST /api/governance/register` | `{enrollmentToken, email, password, displayName?, serverUrl?, deviceName?}` | 同 login；走 `GovernanceClient.register()` |
+| `POST /api/governance/logout` | `{allDevices?}` | `{ok, governance, session}`；**网络失败也清本地凭证**，会话回落本地直连 |
+
+四条边界：**令牌绝不外泄** —— 响应只回 `governance.describe()`（掩码视图，不含任何令牌）；
+**执行中 409**（登录会换掉模型客户端与策略闸门，与「执行中不可改模型设置」同一纪律）；
+**是「用户本人动作」**（ADR-011：不走审批浮层，但记 `governance.login` / `governance.register` /
+`governance.logout` 审计）；**退得出去** —— 治理面不可达时仍清本地凭证，不让用户被永久困在登录态。
+
+桌面端入口：标题栏「治理面」按钮（始终可见，未配 `VIBE_SERVER_URL` 时也可用）打开登录弹窗，
+支持密码登录 / 邀请码注册 / 退出；「去登录」徽标（治理面已配置但未登录 / 降级时出现）同样打开该弹窗。
+弹窗里的地址可经桌面壳配置桥写进 `config.json`（`serverUrl`），下次启动作为 `VIBE_SERVER_URL`
+注入后端；**本次登录直接用弹窗里填的地址，无需重启**。
+
 ### 交互式终端（P1-7）的环境变量与端点
 
 | 环境变量 | `Config` 字段 | 默认 | 作用 | 缺失 / 关闭时的行为 |
@@ -606,7 +629,7 @@ cd packages/agent-core
 python -m unittest discover -s tests -t .
 ```
 
-673 个用例（671 通过 / 2 跳过：ConPTY 与符号链接各一，均为本机环境相关）；下表挑出价值最高的几组：
+782 个用例（780 通过 / 2 跳过：ConPTY 与符号链接各一，均为本机环境相关）；下表挑出价值最高的几组：
 
 | 文件 | 覆盖内容 |
 |---|---|
@@ -619,6 +642,7 @@ python -m unittest discover -s tests -t .
 | `test_store.py` | 会话落盘与恢复、消息成组校验、标题只写一次、`GET /api/sessions` 系列 |
 | `test_checkpoint.py` | 写前快照 + manifest、链式 restore / redo、keep 淘汰、与 Agent 及 API 的接线 |
 | `test_governance_wiring.py` | **治理面接线**：未配 `VIBE_SERVER_URL` 时行为一行不变、策略收紧、配额视图、桌面壳契约、**`describe()` 只在配置了治理面时暴露 `serverUrl`（Q：界面据此给「去登录」入口）** |
+| `test_host_governance.py` | **治理面登录闭环（M3+）**：`POST /api/governance/login\|register\|logout` 的 host 端点 —— 登录成功**热接入**当前会话（Agent 客户端与 `ctx.paths/commands`、`_policy_approval` 同步换新，不重建会话）、凭证落盘、**响应逐字不含令牌**、执行中 409、无地址 / 非法协议 400、凭证错误透传 4xx、不可达 502、**登出在治理面不可达时仍清本地凭证** |
 | `test_refs.py`（P0-A） | 上下文引用：形状校验、越权逐条降级为 notice、缺省与不传逐字节一致 |
 | `test_semantic.py`（P0-B） | 语义检索：无 embedding 时回退词法、索引缓存签名、依赖图 |
 | `test_gitinfo.py`（P0-C） | Git 只读视图：非仓库返回 `available=false`、固定 argv 不拼 shell |

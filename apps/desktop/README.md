@@ -57,7 +57,7 @@ npm start -- E:/path/to/your/project
 | `pythonPath` | 留空则依次尝试 `python.exe` / `python` / `py`（非 Windows：`python3` / `python`） |
 | `workspace` | 上次使用的工作区，菜单「文件 → 切换工作区」会自动写回 |
 | `model` / `baseUrl` / `apiKey` | 透传给 agent-core，留空用 agent-core 的默认值 |
-| `serverUrl` | 治理面地址。留空 = 纯本地（M0/M1 行为）；填了需先用 CLI 登录过 |
+| `serverUrl` | 治理面地址。留空 = 纯本地（M0/M1 行为）；填了即可在应用内登录（见「治理面登录」） |
 | `gatewayUrl` | 网关基址，留空由 `serverUrl` 派生；只在网关单独部署时才需要填 |
 
 环境变量 `VIBE_PYTHON` 可覆盖解释器路径，优先级高于配置文件。
@@ -76,9 +76,28 @@ npm start -- E:/path/to/your/project
 标题栏出现「治理面未登录 / 治理面降级」徽标，并把原因写进顶部提示条。
 没填 `serverUrl` 时整个徽标不出现 —— 纯本地用户不该看到治理相关的噪音。
 
-徽标在「已配置治理面但未登录 / 降级」时**追加一个「去登录」入口**，点击由系统浏览器
-打开 `<serverUrl>/login`。登录页与认证逻辑**全在服务端**（`GET /login`），壳里不实现任何
-认证 —— 这仍是「壳只做三件事」的边界（见上方「安全边界」）。
+徽标在「已配置治理面但未登录 / 降级」时**追加一个「去登录」入口**，点击直接打开应用内的
+**治理面登录弹窗**（见下方「治理面登录」），不再强制跳浏览器。
+
+---
+
+## 治理面登录
+
+标题栏的**「治理面」按钮**（始终可见）打开登录弹窗 —— 把「填地址 → 密码登录 / 邀请码注册 →
+**热接入**」做成桌面端闭环，不必再「先用 CLI 登录、再重启」。
+
+| 区域 | 说明 |
+|---|---|
+| 治理面地址 | 本次登录随请求下发（后端据此即时热接入，**无需重启**）；「保存地址」把它写进 `config.json`，下次启动作为 `VIBE_SERVER_URL` 注入后端（仅桌面壳可用） |
+| 密码登录 | `POST /api/governance/login`（`{email, password, serverUrl?}`） |
+| 邀请码注册 | `POST /api/governance/register`（`{enrollmentToken, email, password, displayName?}`）—— 首次加入团队 |
+| 退出登录 | `POST /api/governance/logout`；**治理面不可达时仍清本地凭证**，会话回落本地直连 |
+
+登录成功后令牌写进用户级 `~/.vibe/credentials.json`（0o600），当前会话**热接入**：
+模型客户端与策略闸门立即换新，**当前对话 / 检查点 / 审计链都保留**（不重建会话）。
+界面只显示掩码视图，**从不持有令牌明文**。三条纪律：登录是「用户本人动作」
+（不走审批浮层，但记审计）；**任务执行中不可登录 / 退出**（409）；**退得出去**
+（治理面不可达也清本地凭证）。
 
 ---
 
@@ -132,7 +151,9 @@ npm start -- E:/path/to/your/project
 - **密钥不回明文**：`GET /api/settings` 只回末 4 位掩码；API Key 输入框留空即「保持原值」。
 - **解释器要重启**：`pythonPath` / `backendBin` 决定壳怎么起子进程，后端自己不知道，
   只能写 `config.json` 后用 `vibe:relaunch` 重启应用（这就是那一段为什么有个单独的重启按钮）。
-  这座桥只接受/只回传 `{pythonPath, backendBin}` 两个字段，密钥不经它 —— 见 [`src/preload.js`](src/preload.js)。
+  这座桥只接受/只回传 `{pythonPath, backendBin, serverUrl, gatewayUrl}` 四个字段，
+  任何密钥都不经它 —— 见 [`src/preload.js`](src/preload.js)。（`serverUrl` 供「治理面登录」
+  弹窗保存地址，见上方「治理面登录」。）
 
 ---
 
@@ -263,6 +284,7 @@ python scripts/build_desktop.py --backend --installer
 ```
 VibeAgent.exe                      # Electron 壳（主进程 + 零构建前端）
 resources/backend/vibe-agent-core.exe   # 内嵌后端（PyInstaller onefile）
+resources/backend/version.json     # 后端清单：core 版本 / 平台 / 架构 / 构建时间
 resources/app/...                  # main.js / backend.js / preload.js / smoke.js
 ```
 
@@ -277,6 +299,8 @@ resources/app/...                  # main.js / backend.js / preload.js / smoke.j
 打包版本号只有一处真源（`agent_core.__version__`），`build_desktop.py` 从那里取，
 组装出的目录名与壳的 `package.json` 版本三处必须一致 —— 这条由
 [test_packaging.py](../../packages/agent-core/tests/test_packaging.py) 的静态契约锁住。
+后端清单一律由 `write_backend_manifest()` 生成，分发目录与安装包都带，
+所以两条链路的 `version.json` 格式永远同源。
 
 ---
 
@@ -291,7 +315,7 @@ resources/app/...                  # main.js / backend.js / preload.js / smoke.j
 | 安装器 | electron-builder + NSIS | 构建期依赖，见 [package.json](package.json) 的 `build` 段 |
 | 安装范围 | `perMachine: false` | 装到 `%LOCALAPPDATA%\Programs\VibeAgent`，**不需要管理员** |
 | 安装目录 | `allowToChangeInstallationDirectory: true` | 安装时可自选 |
-| 内嵌后端 | `extraResources: resources/backend → backend` | 与分发目录同构，仍是 `resources/backend/`，见 `embeddedCandidates` |
+| 内嵌后端 | `extraResources: resources/backend → backend` | 与分发目录同构，仍是 `resources/backend/`，见 `embeddedCandidates`；含 `version.json` |
 
 几条要点：
 

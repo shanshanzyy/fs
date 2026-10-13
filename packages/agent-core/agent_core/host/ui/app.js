@@ -245,19 +245,24 @@ function applyGovernanceChip(governance) {
   const exhausted = quotaExhausted(governance);
   chip.dataset.quota = exhausted ? 'exhausted' : '';
   chip.textContent = (GOV_LABELS[status] || '治理面') + (exhausted ? ' · 配额用尽' : '');
-  // 「去登录」入口（Q 阶段）：已接入治理面但未登录/降级时，界面给一个通往
-  // 服务端登录页的入口。**薄壳纪律**：这里只负责打开 `<serverUrl>/login`，
-  // 登录逻辑仍在服务端（/login + /api/v1/auth/login），界面不实现任何认证。
-  // 外链交给系统浏览器（Electron 壳的 setWindowOpenHandler 负责），不在应用内打开。
+  // 「去登录」入口：已接入治理面但未登录/降级时，界面给一个登录入口。
+  // M3+ 起改为在应用内打开登录弹窗（登录 / 邀请码注册 / 退出闭环），
+  // 不再强制跳到浏览器。`loginPageUrl` 仍保留 —— 弹窗里用它显示可外开的地址，
+  // 且浏览器直开 host 时弹窗同样可用（走本机 /api/governance/* 端点）。
   const loginUrl = loginPageUrl(governance);
-  if (loginUrl && (status === 'unauthenticated' || status === 'degraded')) {
+  if (status === 'unauthenticated' || status === 'degraded') {
     const link = document.createElement('a');
     link.className = 'chip-link';
-    link.href = loginUrl;
-    link.target = '_blank';
+    link.href = loginUrl || '#';
     link.rel = 'noopener noreferrer';
     link.textContent = '去登录';
-    link.title = `在浏览器打开治理面登录页：${loginUrl}`;
+    link.title = loginUrl
+      ? `登录治理面（应用内弹窗；服务端登录页 ${loginUrl}）`
+      : '登录治理面';
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      openGovModal();
+    });
     chip.append(' ', link);
   }
   const lines = [
@@ -275,6 +280,179 @@ function loginPageUrl(governance) {
   const base = governance && governance.serverUrl;
   if (!base) return '';
   return String(base).replace(/\/+$/, '') + '/login';
+}
+
+/* ═══════════════════════════════ 治理面登录弹窗（M3+） ═══════════════════════════════
+ * 把「填地址 → 密码登录 / 邀请码注册 → 热接入」做成桌面端闭环：不必再「先用 CLI
+ * 登录、再重启」。登录是「用户本人动作」（ADR-011）—— 不走审批浮层，但执行中后端
+ * 返回 409（这里如实显示）。**令牌全程只在后端与用户级凭证文件里**，界面只读回
+ * `describe()` 的掩码视图，绝不持有明文。
+ *
+ * 地址双重用途：本次登录把它随请求下发（serverUrl），后端据此即时热接入、无需重启；
+ * 「保存地址」则经桌面壳配置桥写进 config.json，下次启动作为 VIBE_SERVER_URL 生效。 */
+
+function govMsg(text, kind = '', id = 'gov-msg') {
+  const node = $(id);
+  node.className = 'set-msg' + (kind ? ` is-${kind}` : '');
+  node.textContent = text || '';
+}
+
+function governanceView() {
+  return (S.session && S.session.governance) || null;
+}
+
+function openGovModal() {
+  $('gov-modal').hidden = false;
+  $('gov-error').hidden = true;
+  govMsg('');
+  govMsg('', '', 'gov-reg-msg');
+  $('gov-password').value = '';
+  $('gov-token').value = '';
+  // 「保存地址」只在桌面壳里可用（浏览器没有写 config.json 的桥）
+  const bridge = shellConfigBridge();
+  $('btn-gov-save-server').hidden = !bridge;
+  const gov = governanceView();
+  if (gov && gov.serverUrl) $('gov-server').value = gov.serverUrl;
+  // 后端这次启动没带治理面地址时，回填上一次保存进 config.json 的地址。
+  if (bridge && !(gov && gov.serverUrl)) {
+    bridge
+      .readDesktopConfig()
+      .then((cfg) => {
+        if (cfg && cfg.serverUrl && !$('gov-server').value) {
+          $('gov-server').value = cfg.serverUrl;
+        }
+      })
+      .catch(() => {});
+  }
+  renderGovStatus(gov);
+  $('gov-email').focus();
+}
+
+function closeGovModal() {
+  $('gov-modal').hidden = true;
+}
+
+function renderGovStatus(gov) {
+  const status = gov && gov.status;
+  $('gov-status').textContent = status ? GOV_LABELS[status] || status : '未接入治理面';
+  // 已登录 / 已降级都允许退出；纯未登录没有可退的东西
+  $('btn-gov-logout').hidden = !(status === 'governed' || status === 'degraded');
+  const lines = [];
+  if (gov && gov.degradedReason) lines.push(gov.degradedReason);
+  if (gov && gov.credentials) {
+    const c = gov.credentials;
+    lines.push(
+      `当前用户：${c.email || c.userId || '—'}` +
+        (c.deviceId ? ` · 设备 ${c.deviceId}` : '')
+    );
+  }
+  const quota = gov ? quotaLine(gov) : '';
+  if (quota) lines.push(quota);
+  if (lines.length) $('gov-hint').textContent = lines.join('\n');
+}
+
+function govShowError(err) {
+  $('gov-error').hidden = false;
+  $('gov-error').textContent = err && err.message ? err.message : String(err);
+}
+
+/** 登录 / 注册 / 登出后的统一收尾：应用新快照 + 回显状态。 */
+function applyGovernanceResult(res, msgId, okText) {
+  if (res && res.session) applySession(res.session);
+  govMsg(okText, 'ok', msgId);
+  renderGovStatus(res && res.governance ? res.governance : governanceView());
+  toast(okText, 'ok');
+}
+
+async function governanceLogin() {
+  const email = $('gov-email').value.trim();
+  const password = $('gov-password').value;
+  if (!email || !password) {
+    $('gov-error').hidden = false;
+    $('gov-error').textContent = '请填写邮箱与密码。';
+    return;
+  }
+  const btn = $('btn-gov-login');
+  btn.disabled = true;
+  $('gov-error').hidden = true;
+  govMsg('登录中…');
+  try {
+    const res = await api.post('/api/governance/login', {
+      email,
+      password,
+      serverUrl: $('gov-server').value.trim(),
+    });
+    $('gov-password').value = '';
+    applyGovernanceResult(res, 'gov-msg', '已登录治理面，当前会话已热接入');
+  } catch (err) {
+    govShowError(err);
+    govMsg('');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function governanceRegister() {
+  const token = $('gov-token').value.trim();
+  const email = $('gov-email').value.trim();
+  const password = $('gov-password').value;
+  if (!token || !email || !password) {
+    $('gov-error').hidden = false;
+    $('gov-error').textContent = '邀请码、邮箱、密码都必须填写。';
+    return;
+  }
+  const btn = $('btn-gov-register');
+  btn.disabled = true;
+  $('gov-error').hidden = true;
+  govMsg('注册中…', '', 'gov-reg-msg');
+  try {
+    const res = await api.post('/api/governance/register', {
+      enrollmentToken: token,
+      email,
+      password,
+      displayName: $('gov-name').value.trim(),
+      serverUrl: $('gov-server').value.trim(),
+    });
+    $('gov-token').value = '';
+    $('gov-password').value = '';
+    applyGovernanceResult(res, 'gov-reg-msg', '注册成功并已登录治理面');
+  } catch (err) {
+    govShowError(err);
+    govMsg('', '', 'gov-reg-msg');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function governanceLogout() {
+  const btn = $('btn-gov-logout');
+  btn.disabled = true;
+  $('gov-error').hidden = true;
+  try {
+    const res = await api.post('/api/governance/logout', {});
+    applyGovernanceResult(res, 'gov-msg', '已退出治理面，当前会话回到本地直连');
+  } catch (err) {
+    govShowError(err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 把治理面地址写进桌面壳 config.json；重启应用后作为 VIBE_SERVER_URL 传给后端。 */
+async function saveGovernanceServer() {
+  const bridge = shellConfigBridge();
+  if (!bridge) return;
+  const btn = $('btn-gov-save-server');
+  btn.disabled = true;
+  try {
+    const res = await bridge.saveDesktopConfig({ serverUrl: $('gov-server').value.trim() });
+    if (res && res.ok === false) throw new Error(res.error || '写入配置失败');
+    toast('治理面地址已保存，重启应用后生效', 'ok');
+  } catch (err) {
+    govShowError(new Error(`保存地址失败：${err.message}`));
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function setState(state) {
@@ -4354,6 +4532,7 @@ const KEYMAP = [
   { chord: 'Esc', id: 'ui.close-workspace', label: '关闭工作区弹窗', palette: false, when: () => !$('ws-modal').hidden, run: closeWorkspaceModal },
   { chord: 'Esc', id: 'ui.close-settings', label: '关闭模型设置', palette: false, when: () => !$('settings-modal').hidden, run: closeSettingsModal },
   { chord: 'Esc', id: 'ui.close-mcp', label: '关闭 MCP 浮层', palette: false, when: () => !$('mcp-modal').hidden, run: closeMcpModal },
+  { chord: 'Esc', id: 'ui.close-gov', label: '关闭治理面登录', palette: false, when: () => !$('gov-modal').hidden, run: closeGovModal },
   { chord: 'Esc', id: 'ui.close-checkpoints', label: '关闭回滚浮层', palette: false, when: () => !$('cp-modal').hidden && !S.awaiting, run: closeCheckpoints },
   { chord: 'Esc', id: 'approval.deny', label: '拒绝审批（默认动作）', palette: false, when: () => !!S.awaiting, run: () => decide('deny') },
   { chord: 'Ctrl+Enter', id: 'approval.approve', label: '批准审批', palette: false, when: () => !!S.awaiting, run: () => decide('approve') },
@@ -4364,6 +4543,7 @@ const KEYMAP = [
 /* 命令面板里的「非快捷键动作」：与 KEYMAP 一起进列表，但没有键位。 */
 const PALETTE_ACTIONS = [
   { id: 'settings.model', label: '模型设置…', group: '模型', run: openSettingsModal },
+  { id: 'governance.account', label: '治理面：登录 / 注册 / 退出…', group: '模型', run: openGovModal },
   { id: 'workspace.open', label: '切换工作区…', group: '工作区', run: openWorkspaceModal },
   { id: 'git.commit-message', label: '生成提交信息', group: 'Git', run: generateCommitMessage },
   { id: 'session.rollback', label: '回滚到检查点…', group: '会话', run: () => openCheckpoints() },
@@ -4734,6 +4914,24 @@ function bind() {
     if (event.key === 'Enter' && event.target.tagName !== 'BUTTON') {
       event.preventDefault();
       saveSettings();
+    }
+  });
+
+  // 治理面登录（M3+）：标题栏入口（始终可见）+ 弹窗内按钮
+  $('btn-gov').addEventListener('click', openGovModal);
+  $('btn-gov-close').addEventListener('click', closeGovModal);
+  $('btn-gov-login').addEventListener('click', governanceLogin);
+  $('btn-gov-register').addEventListener('click', governanceRegister);
+  $('btn-gov-logout').addEventListener('click', governanceLogout);
+  $('btn-gov-save-server').addEventListener('click', saveGovernanceServer);
+  $('gov-modal').addEventListener('click', (event) => {
+    if (event.target === $('gov-modal')) closeGovModal();
+  });
+  // 浮层内回车 = 密码登录（注册段有各自的按钮，不抢回车）
+  $('gov-modal').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && event.target.tagName !== 'BUTTON') {
+      event.preventDefault();
+      governanceLogin();
     }
   });
 

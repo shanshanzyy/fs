@@ -140,13 +140,95 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             print(f"  {enrollment['enrollmentToken']}")
             print(f"  可用次数 {enrollment['maxUses']}，过期于 {enrollment['expiresAt']}")
             print()
-            print("开发者在本机执行：")
+            print("开发者在本机执行（把 <服务地址> / <同事邮箱> 换成实际值）：")
             print(
-                "  python -m agent_core.governance enroll "
-                f"--server <服务地址> --token {enrollment['enrollmentToken']}"
+                "  vibe-agent governance register "
+                f"--server <服务地址> --email <同事邮箱> "
+                f"--enrollment-token {enrollment['enrollmentToken']}"
             )
+            print("或在桌面端标题栏「治理面」→ 填地址 → 选「邀请码注册」。")
+            print("后续再拉人：python -m vibe_server invite --email <管理员> --password <...>")
         finally:
             store.close()
+    return 0
+
+
+# --------------------------------------------------------------------------- invite
+def cmd_invite(args: argparse.Namespace) -> int:
+    """签发注册令牌（邀请码）—— 组织建好之后把同事拉进来的常态化入口。
+
+    `bootstrap` 只在库为空时可用（一次性）；组织一旦建好，新账号只能靠
+    SSO 或注册令牌。SSO 要运维先接 IdP，所以「明天再拉一个同事进来」的
+    实际路径就是这条：管理员用自己的账号签到限次令牌，把令牌 + 服务地址
+    交给同事，同事在桌面端「邀请码注册」或 CLI `governance register` 自助开通。
+
+    **为什么必须校验管理员口令**：本命令直接读写本地库。不校验的话，
+    任何能碰到服务端数据目录的人都能量一枚令牌（注册令牌还带角色），
+    等于把提权做成了本地文件读权限。`bootstrap` 不校验是因为它只能在
+    库为空时跑一次（此时还没有任何账号可冒充）；invite 是常态动作，
+    必须先证明「你就是那个管理员」。
+    """
+    config = _load_config(args)
+    email = (args.email or "").lower().strip()
+    if not email or not args.password:
+        print("需要 --email 与 --password（管理员本人账号）", file=sys.stderr)
+        return 2
+
+    from . import rbac
+    from .auth import passwords
+    from .auth.service import AuthService
+    from .clock import Clock
+    from .store import open_store
+
+    store = open_store(config.store_target())
+    try:
+        user = store.find_user_by_email(email)
+        # 用户不存在时也算一次哈希，抹平「账号是否存在」的时间差（同 login 的纪律）
+        stored = str(user["password_hash"]) if user else passwords.hash_password("dummy-invite-timing")
+        if user is None or not passwords.verify_password(args.password, stored):
+            print("认证失败：邮箱或口令不正确", file=sys.stderr)
+            return 1
+        if str(user.get("status") or "active") != "active":
+            print(f"账号状态为 {user.get('status')}，无法签发注册令牌", file=sys.stderr)
+            return 1
+
+        auth = AuthService(store=store, config=config, clock=Clock())
+        # 与 bootstrap 同范式：**刻意不走 authenticate()** —— 它要核对令牌里的设备，
+        # 而 CLI 不是设备。直接按库里的成员关系装配主体即可。
+        actor = rbac.build_actor(
+            user_id=str(user["id"]),
+            email=str(user["email"]),
+            display_name=str(user.get("display_name") or ""),
+            memberships=store.list_memberships(str(user["id"])),
+        )
+        count = max(1, min(int(args.count or 1), 50))
+        ttl = int(args.ttl_hours or 0) * 3600
+        issued = [
+            auth.create_enrollment(
+                actor=actor,
+                team_id=str(args.team_id or ""),
+                role=str(args.role or rbac.ROLE_DEVELOPER),
+                max_uses=int(args.uses or 1),
+                ttl=ttl,
+                note=str(args.note or ""),
+            )
+            for _ in range(count)
+        ]
+    finally:
+        store.close()
+
+    print(f"已签发 {len(issued)} 枚注册令牌（只显示这一次，请立刻分发给同事）：")
+    for index, item in enumerate(issued, 1):
+        print()
+        print(f"  [{index}] {item['enrollmentToken']}")
+        print(f"      角色 {item['role']}，可用 {item['maxUses']} 次，过期于 {item['expiresAt']}")
+    print()
+    print("同事在本机执行（把 <服务地址> / <同事邮箱> 换成实际值）：")
+    print(
+        "  vibe-agent governance register "
+        "--server <服务地址> --email <同事邮箱> --enrollment-token <上面的令牌>"
+    )
+    print("或在桌面端标题栏「治理面」→ 填地址 → 选「邀请码注册」。")
     return 0
 
 
@@ -298,6 +380,17 @@ def build_parser() -> argparse.ArgumentParser:
     boot.add_argument("--name", default="")
     boot.add_argument("--enrollment-uses", type=int, default=1, help="自动签发注册令牌的可用次数（0 表示跳过签发）")
     boot.set_defaults(func=cmd_bootstrap, no_enrollment=False)
+
+    invite = sub.add_parser("invite", help="签发注册令牌（邀请码），把同事拉进组织")
+    invite.add_argument("--email", required=True, help="管理员本人账号（用于鉴权）")
+    invite.add_argument("--password", required=True, help="管理员本人口令")
+    invite.add_argument("--role", default="developer", help="新账号角色，默认 developer")
+    invite.add_argument("--uses", type=int, default=1, help="每枚令牌可用次数（1–100）")
+    invite.add_argument("--count", type=int, default=1, help="一次签发几枚（1–50）")
+    invite.add_argument("--ttl-hours", type=int, default=0, help="令牌有效期（小时），0 = 用服务端默认")
+    invite.add_argument("--team-id", default="", help="限定令牌开通的账号所属团队（留空 = 默认团队）")
+    invite.add_argument("--note", default="", help="备注，只进服务端审计（截断展示）")
+    invite.set_defaults(func=cmd_invite)
 
     doctor = sub.add_parser("doctor", help="环境自检")
     doctor.add_argument("--probe", help="额外探测一个已运行实例的地址，如其 http://127.0.0.1:8787")

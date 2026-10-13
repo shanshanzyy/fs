@@ -81,23 +81,26 @@ ipcMain.handle('vibe:capture-page', async (_event, payload) => {
   }
 });
 
-/* ------------------------------------------------- 解释器设置（模型设置面板）
+/* ------------------------------------------------- 桌面壳配置（解释器 / 治理面地址）
  * 模型 / 接入地址 / API Key 走 host 的 POST /api/settings（后端热替换 LLM 客户端），
- * 但「用哪个 Python、用哪个后端二进制」是**壳专有**的：它们决定壳怎么起子进程，
- * 后端自己并不知道，只能由壳写进 config.json 并重启。于是这里开两条窄桥：
+ * 但「用哪个 Python、用哪个后端二进制」与「治理面地址」是**壳专有**的：前者决定壳
+ * 怎么起子进程，后者在启动时作为 VIBE_SERVER_URL 注入后端 —— 后端自己都不知道用户
+ * 想连哪个治理面。于是这里开两条窄桥：
  *
- *   vibe:save-config —— 只接受 {pythonPath, backendBin}（其余键一律丢弃，
- *                       界面无法通过它改 model / apiKey / serverUrl 等敏感项）；
- *   vibe:read-config —— 只回传 {pythonPath, backendBin}，绝不回传密钥。
+ *   vibe:save-config —— 只接受 {pythonPath, backendBin, serverUrl, gatewayUrl}
+ *                       （其余键一律丢弃，界面无法通过它改 model / apiKey 等敏感项）；
+ *   vibe:read-config —— 只回传这几个非敏感字段，**绝不回传任何密钥**。
  *
- * 纪律与 pick-folder / capture-page 一致：不暴露 fs、child_process、裸 ipcRenderer，
- * 参数是白名单字段而非任意对象。
+ * 治理面地址不是秘密（就是运维填的地址），但**只经此桥写盘**：界面没有 fs，改不动
+ * 别的键。约定与 pick-folder / capture-page 一致：参数是白名单字段而非任意对象。
  */
 ipcMain.handle('vibe:save-config', async (_event, patch) => {
   const source = patch && typeof patch === 'object' ? patch : {};
   const safe = {};
   if (typeof source.pythonPath === 'string') safe.pythonPath = source.pythonPath.trim();
   if (typeof source.backendBin === 'string') safe.backendBin = source.backendBin.trim();
+  if (typeof source.serverUrl === 'string') safe.serverUrl = source.serverUrl.trim();
+  if (typeof source.gatewayUrl === 'string') safe.gatewayUrl = source.gatewayUrl.trim();
   try {
     writeConfig(safe);
     return { ok: true };
@@ -108,7 +111,11 @@ ipcMain.handle('vibe:save-config', async (_event, patch) => {
 
 ipcMain.handle('vibe:read-config', async () => {
   const config = readConfig();
-  return { pythonPath: config.pythonPath || '', backendBin: config.backendBin || '' };
+  return {
+    pythonPath: config.pythonPath || '',
+    backendBin: config.backendBin || '',
+    serverUrl: config.serverUrl || '',
+  };
 });
 
 /* 解释器变更必须重启才生效（后端进程要按新路径重起）。先把子进程收干净，
@@ -137,8 +144,9 @@ const DEFAULT_CONFIG = {
   baseUrl: '',
   apiKey: '',
   // 治理面（M3）。留空 = 纯本地，M0/M1 行为一行不变。
-  // 填了它就必须先用 CLI 登录过（vibe-agent governance login），
-  // 否则后端会以「已配置但未登录」的降级状态启动，界面顶部会给出提示。
+  // 填了它但没登录时，后端会以「已配置但未登录」的降级状态启动；
+  // 界面顶部的「治理面」入口可在应用内直接登录 / 邀请码注册（登录后热接入，
+  // 不必重启）；这里保存的地址会在下次启动时作为 VIBE_SERVER_URL 注入后端。
   serverUrl: '',
   // 网关基址。留空 = 由 serverUrl 派生，只在网关单独部署时才需要填。
   gatewayUrl: '',

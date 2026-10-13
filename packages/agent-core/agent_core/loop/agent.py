@@ -213,6 +213,47 @@ class RunStats:
     files_touched: list[str] = field(default_factory=list)
 
 
+def _default_client(config: Config) -> OpenAICompatClient:
+    """按配置建一个本地直连客户端。
+
+    抽成一个函数是为了让「构造」与「热接入」两条路径共用同一份口径：
+    prompt caching（P2-17）的前缀键取 session_id（同一会话的系统提示与早期
+    历史逐字节不变，上游才有可能命中前缀缓存）；多模态探测（N / P1-10）
+    默认 off —— 不探测、不剥图，请求体与改造前逐字节一致。
+    """
+    return OpenAICompatClient(
+        base_url=config.base_url,
+        model=config.model,
+        api_key=config.api_key,
+        timeout=config.request_timeout,
+        prompt_cache=config.prompt_cache,
+        cache_key=config.session_id,
+        vision_mode=config.vision_mode,
+    )
+
+
+def _policy_state(
+    config: Config, constraints: "RuntimeConstraints | None"
+) -> tuple[set[str], PathGuard, CommandGuard]:
+    """把治理策略约束摊进运行时闸门：审批提升清单 + 路径/命令拒绝清单。
+
+    返回 `(policy_approval, paths, commands)`。`constraints=None` = 无策略，
+    行为与 M0/M1 一致（各闸门拿到空拒绝清单）。
+    """
+    approval = set(constraints.require_approval) if constraints else set()
+    paths = PathGuard(
+        config.workspace,
+        allow_sensitive=config.allow_sensitive_read,
+        denied_patterns=constraints.denied_paths if constraints else (),
+    )
+    commands = CommandGuard(
+        config.workspace,
+        allow_network=config.allow_network_commands,
+        policy_denied=frozenset(constraints.denied_commands) if constraints else frozenset(),
+    )
+    return approval, paths, commands
+
+
 class Agent:
     def __init__(
         self,
@@ -265,32 +306,10 @@ class Agent:
             self.memory = MemoryStore(db_path, max_items=config.memory_max_items)
         else:
             self.memory = None
-        self.client = client or OpenAICompatClient(
-            base_url=config.base_url,
-            model=config.model,
-            api_key=config.api_key,
-            timeout=config.request_timeout,
-            # prompt caching（P2-17）：前缀键取 session_id —— 同一会话的
-            # 系统提示与早期历史逐字节不变，上游才有可能命中前缀缓存。
-            prompt_cache=config.prompt_cache,
-            cache_key=config.session_id,
-            # 多模态能力探测（N / P1-10）：默认 off —— 不探测、不剥图，
-            # 请求体与改造前逐字节一致。
-            vision_mode=config.vision_mode,
-        )
+        self.client = client or _default_client(config)
         # 治理策略约束（M3）：拒绝清单进 PathGuard / CommandGuard，
         # require_approval 提升审批门槛。不传 = 无策略，行为与 M0/M1 一致。
-        self._policy_approval: set[str] = set(constraints.require_approval) if constraints else set()
-        self.paths = PathGuard(
-            config.workspace,
-            allow_sensitive=config.allow_sensitive_read,
-            denied_patterns=constraints.denied_paths if constraints else (),
-        )
-        self.commands = CommandGuard(
-            config.workspace,
-            allow_network=config.allow_network_commands,
-            policy_denied=frozenset(constraints.denied_commands) if constraints else frozenset(),
-        )
+        self._policy_approval, self.paths, self.commands = _policy_state(config, constraints)
         # 检查点（B1）：编辑落盘前收旧内容，回滚兜底「已发生」的错误。
         # 目录在 .vibe/checkpoints，模型写不进来（PathGuard 拒绝 .vibe 全部写入）。
         self.checkpoints = CheckpointManager(
@@ -360,6 +379,31 @@ class Agent:
         # on_message（落盘过一次了），否则库里会出现双份。
         if initial_messages:
             self.messages.extend(copy.deepcopy(initial_messages))
+
+    def install_governance(
+        self,
+        *,
+        config: Config,
+        client: LLMClient | None = None,
+        constraints: "RuntimeConstraints | None" = None,
+    ) -> None:
+        """热接入治理面（登录 / 登出后调用），**不重建会话**。
+
+        登录或登出只改变「模型客户端 + 策略约束」这两件事，当前对话
+        （`self.messages`）、检查点与审计链都原样保留。因此这里只替换那几个
+        引用，与 `__init__` 的口径逐字段对齐（客户端缺省回退本地、拒绝清单
+        重建进 PathGuard / CommandGuard、require_approval 覆盖审批门槛）。
+
+        `client=None` 表示「用本地直连」—— 登出后 `wire()` 正是回这个值，
+        此时按收紧后的配置重建一个本地客户端，而不是留着一个指向网关的旧引用。
+        """
+        self.config = config
+        self.ctx.config = config
+        self.client = client or _default_client(config)
+        self._policy_approval, self.paths, self.commands = _policy_state(config, constraints)
+        # 工具在每次调用时读 `self.ctx`，因此替换 ctx 上的引用即可让新约束生效。
+        self.ctx.paths = self.paths
+        self.ctx.commands = self.commands
 
     # ------------------------------------------------------------------ 对外
     @property

@@ -1137,6 +1137,28 @@ def _sample_locals() -> dict[str, dict]:
             "count": 3,
             "chars": 280,
         },
+        # 治理面登录（M3+）：形状与 host/session.py 的 governance_login /
+        # governance_register / governance_logout 调用点一致。
+        # 只记结果、装配状态与不透明标识；邮箱/口令/地址不上传。
+        "governance.login": {
+            "event": "governance.login",
+            "ok": True,
+            "status": "governed",
+            "user_id": "u-1",
+            "device_id": "d-1",
+        },
+        "governance.register": {
+            "event": "governance.register",
+            "ok": True,
+            "status": "governed",
+            "user_id": "u-1",
+            "device_id": "d-1",
+        },
+        "governance.logout": {
+            "event": "governance.logout",
+            "ok": True,
+            "user_id": "u-1",
+        },
     }
 
 
