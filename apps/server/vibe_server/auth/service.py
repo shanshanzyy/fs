@@ -767,12 +767,16 @@ class AuthService:
         actor.scope_user(target, rbac.PERM_DEVICE_READ)
         return [
             {
-                "id": str(d["id"]),
+                # 键名与 /auth/login、/auth/register 返回的 deviceId 对齐 ——
+                # 客户端（governance devices）读的就是这个名字，用 `id` 会渲染成空白。
+                "deviceId": str(d["id"]),
                 "name": str(d.get("name") or ""),
                 "platform": str(d.get("platform") or ""),
                 "createdAt": int(d.get("created_at") or 0),
                 "lastSeenAt": int(d.get("last_seen_at") or 0),
                 "revoked": bool(d.get("revoked_at")),
+                # 标记「发起本次请求的设备」，供客户端显示「（本机）」。
+                "current": bool(actor.device_id) and str(d["id"]) == actor.device_id,
             }
             for d in self.store.list_devices(target)
         ]

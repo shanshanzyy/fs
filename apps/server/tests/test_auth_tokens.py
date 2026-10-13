@@ -17,10 +17,17 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 
-from tests.support import TempDirTestCase, actor_of, bootstrap_and_login
+from tests.support import (
+    TempDirTestCase,
+    actor_of,
+    bootstrap_and_login,
+    http_get,
+    serve_app,
+)
 
 from vibe_server import rbac
 from vibe_server.errors import Forbidden, Unauthenticated
@@ -224,6 +231,30 @@ class LoginHygieneTests(TempDirTestCase):
             email="Owner@Corp.Example", password="Str0ng!Passw0rd"
         )
         self.assertTrue(session["accessToken"])
+
+
+class DeviceListTests(TempDirTestCase):
+    def test_list_devices_exposes_device_id_and_current_marker(self) -> None:
+        """`GET /api/v1/devices` 必须回 deviceId（与登录响应同名）和 current。
+
+        曾经的缺陷：服务端返回键是 `id`，而客户端 `governance devices`
+        读的是 `deviceId`，于是设备列表渲染成一片空白；且服务端从不返回
+        `current`，「（本机）」标记永远不出现。这条用例把两件事一起钉住。
+        """
+        app = self.make_app()
+        session = bootstrap_and_login(app)
+        base = serve_app(self, app)
+
+        status, body, _ = http_get(base, "/api/v1/devices", token=session["accessToken"])
+        self.assertEqual(status, 200)
+        devices = json.loads(body)["devices"]
+        self.assertEqual(len(devices), 1)
+        device = devices[0]
+
+        self.assertTrue(device.get("deviceId"), "deviceId 为空 —— 客户端会渲染成空白")
+        self.assertEqual(device["deviceId"], session["deviceId"])
+        self.assertIs(device["current"], True, "发起请求的设备未被标成 current")
+        self.assertNotIn("id", device, "旧的 `id` 键会让两套命名长期并存")
 
 
 if __name__ == "__main__":
