@@ -60,6 +60,9 @@ DEFAULT_POLICY: dict[str, Any] = {
     "allowShell": True,
     "allowWrite": True,
     "autoApproveReview": False,
+    # 联网检索（M7）：默认关 —— 会外发的能力，默认策略必须最保守。
+    # 客户端键 web_enabled；工具恒 REVIEW，此开关只决定「注册不注册」。
+    "allowWeb": False,
     "maxIterations": 40,
     "maxContextChars": 400_000,
     "toolOutputLimit": 40_000,
@@ -68,6 +71,9 @@ DEFAULT_POLICY: dict[str, Any] = {
     "deniedCommands": [],
     "requireApproval": [],
     "allowedModels": [],
+    # web_fetch 的 host 黑名单（M7）：并集合并，客户端键 web_deny_hosts。
+    # deny 恒优先于客户端本地的白名单，是治理面「一刀切」的抓手。
+    "webDeniedHosts": [],
     # 功能灰度（M4）。形状：flag 名 -> {enabled, rolloutPercent, allowlist, denylist}。
     # 与能力开关一样「只收紧」：任一层说关就是关，上层没定义的 flag 不许下层凭空开。
     "features": {},
@@ -79,11 +85,11 @@ DEFAULT_POLICY: dict[str, Any] = {
 }
 
 # 能力开关：AND 合并
-_BOOL_AND_FIELDS = ("allowCloud", "allowShell", "allowWrite", "autoApproveReview")
+_BOOL_AND_FIELDS = ("allowCloud", "allowShell", "allowWrite", "autoApproveReview", "allowWeb")
 # 数值上限：MIN 合并
 _INT_MIN_FIELDS = ("maxIterations", "maxContextChars", "toolOutputLimit", "commandTimeout")
 # 拒绝清单：并集合并
-_LIST_UNION_FIELDS = ("deniedPaths", "deniedCommands", "requireApproval")
+_LIST_UNION_FIELDS = ("deniedPaths", "deniedCommands", "requireApproval", "webDeniedHosts")
 # 白名单：交集合并（空列表 = 不限制）
 _LIST_INTERSECT_FIELDS = ("allowedModels",)
 
@@ -493,6 +499,7 @@ _CLIENT_KEY_MAP: dict[str, str] = {
     "allowShell": "allow_shell",
     "allowWrite": "allow_write",
     "autoApproveReview": "auto_approve_review",
+    "allowWeb": "web_enabled",
     "maxIterations": "max_iterations",
     "maxContextChars": "max_context_chars",
     "toolOutputLimit": "tool_output_limit",
@@ -501,6 +508,7 @@ _CLIENT_KEY_MAP: dict[str, str] = {
     "deniedCommands": "denied_commands",
     "requireApproval": "require_approval",
     "allowedModels": "allowed_models",
+    "webDeniedHosts": "web_deny_hosts",
 }
 
 
@@ -533,6 +541,8 @@ def apply_to_client_config(
             {
                 "allowCloud": False,
                 "autoApproveReview": False,
+                # 联网检索是外发能力，过期受限模式里恒关（同 allowCloud 处理）
+                "allowWeb": False,
                 "commandTimeout": min(int(policy["commandTimeout"]), 60),
             }
         )
@@ -542,7 +552,7 @@ def apply_to_client_config(
         )
 
     # --- 能力开关：只允许 True→False ---
-    for policy_key in ("allowCloud", "allowShell", "allowWrite", "autoApproveReview"):
+    for policy_key in ("allowCloud", "allowShell", "allowWrite", "autoApproveReview", "allowWeb"):
         key = _client_key(policy_key)
         current = effective.get(key)
         if current is None:
@@ -574,6 +584,20 @@ def apply_to_client_config(
     # --- 拒绝/强制审批清单：并集（客户端原有的不能被顶掉）---
     for policy_key in _LIST_UNION_FIELDS:
         key = _client_key(policy_key)
+        if key == "web_deny_hosts":
+            # 客户端把 host 名单存成**逗号分隔字符串**，不是列表：
+            # 走通用并集会把它按字符拆开。单独按 glob 项并集，写回字符串。
+            current = str(effective.get(key) or "")
+            existing = [h.strip() for h in current.split(",") if h.strip()]
+            incoming = [str(h).strip() for h in policy[policy_key] if str(h).strip()]
+            seen = {h.lower() for h in existing}
+            merged = existing + [h for h in incoming if h.lower() not in seen]
+            if len(merged) != len(existing):
+                effective[key] = ",".join(merged)
+                notes.append(
+                    f"{key} 新增 {len(merged) - len(existing)} 条来自策略的拒绝 host"
+                )
+            continue
         existing = list(effective.get(key) or [])
         combined = existing + list(policy[policy_key])
         seen: set[str] = set()

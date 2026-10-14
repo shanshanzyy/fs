@@ -23,26 +23,64 @@ from pathlib import Path
 from typing import Any, Mapping
 
 # 允许持久化的字段（白名单）。解释器路径属桌面壳专有，不进这里。
-_SETTINGS_KEYS: tuple[str, ...] = ("model", "base_url", "api_key")
+# 联网检索的字符串键（M7）与模型三件套同一「空串=不改」规则。
+_SETTINGS_KEYS: tuple[str, ...] = (
+    "model",
+    "base_url",
+    "api_key",
+    "web_search_provider",
+    "web_search_url",
+    "web_allow_hosts",
+    "web_deny_hosts",
+)
 
 # 类型化设置（D3+）：补全参数，与字符串三件套共享同一个 settings.json。
 # 它们不能套用「空串=不改」的规则 —— 0 / False 都是合法值，必须按「显式存在」判断。
-_BOOL_KEYS: tuple[str, ...] = ("fim_enabled", "mcp_enabled")
+_BOOL_KEYS: tuple[str, ...] = (
+    "fim_enabled",
+    "mcp_enabled",
+    "web_enabled",
+    "web_fetch_allow_private",
+)
 _INT_KEYS: tuple[str, ...] = (
     "completion_max_tokens",
     "completion_prefix_chars",
     "completion_suffix_chars",
+    "web_timeout",
+    "web_max_bytes",
+    "web_search_max_results",
 )
 _TYPED_KEYS: tuple[str, ...] = _BOOL_KEYS + _INT_KEYS
-# 补全参数专用键集（不含 MCP 开关）—— completion overrides 只处理这一组，
-# 免得把 mcp_enabled 也塞进「补全」的覆盖项里。
-_COMPLETION_TYPED_KEYS: tuple[str, ...] = ("fim_enabled", *_INT_KEYS)
+# 补全参数专用键集（不含 MCP / web）—— completion overrides 只处理这一组，
+# 免得把别的开关也塞进「补全」的覆盖项里。
+_COMPLETION_TYPED_KEYS: tuple[str, ...] = ("fim_enabled", "completion_max_tokens", "completion_prefix_chars", "completion_suffix_chars")
+# 联网检索键集（M7）—— effective_web_overrides 只处理这一组。
+_WEB_STR_KEYS: tuple[str, ...] = (
+    "web_search_provider",
+    "web_search_url",
+    "web_allow_hosts",
+    "web_deny_hosts",
+)
+_WEB_TYPED_KEYS: tuple[str, ...] = (
+    "web_enabled",
+    "web_fetch_allow_private",
+    "web_timeout",
+    "web_max_bytes",
+    "web_search_max_results",
+)
+# provider 枚举（与 config._env_choice 同一集合）：settings.json 里的非法值
+# 不进 overrides —— 坏文件不该把非法枚举塞进运行时 Config。
+_WEB_PROVIDERS: frozenset[str] = frozenset({"gateway", "searxng"})
 
 # 字段 -> 对应的环境变量名（环境变量恒为最高优先级）。
 _ENV_FOR_FIELD: dict[str, str] = {
     "model": "VIBE_MODEL",
     "base_url": "VIBE_BASE_URL",
     "api_key": "VIBE_API_KEY",
+    "web_search_provider": "VIBE_WEB_SEARCH",
+    "web_search_url": "VIBE_WEB_SEARCH_URL",
+    "web_allow_hosts": "VIBE_WEB_ALLOW_HOSTS",
+    "web_deny_hosts": "VIBE_WEB_DENY_HOSTS",
 }
 _ENV_FOR_TYPED: dict[str, str] = {
     "fim_enabled": "VIBE_FIM",
@@ -50,6 +88,11 @@ _ENV_FOR_TYPED: dict[str, str] = {
     "completion_max_tokens": "VIBE_COMPLETION_MAX_TOKENS",
     "completion_prefix_chars": "VIBE_COMPLETION_PREFIX_CHARS",
     "completion_suffix_chars": "VIBE_COMPLETION_SUFFIX_CHARS",
+    "web_enabled": "VIBE_WEB",
+    "web_fetch_allow_private": "VIBE_WEB_ALLOW_PRIVATE",
+    "web_timeout": "VIBE_WEB_TIMEOUT",
+    "web_max_bytes": "VIBE_WEB_MAX_BYTES",
+    "web_search_max_results": "VIBE_WEB_MAX_RESULTS",
 }
 
 
@@ -183,7 +226,7 @@ def effective_mcp_overrides(
 ) -> dict[str, Any]:
     """算出 MCP 开关（``mcp_enabled``）的覆盖项。
 
-    纪律同模型/补全：环境变量（``VIBE_MCP``）已设 → **不传** override，把最高
+    纪律同模型/补全：环境变量已设 → **不传** override，把最高
     优先级留给 ``Config.load`` 自己；否则用 settings.json 里的合法 boolean。
     """
     if str(env.get(_ENV_FOR_TYPED["mcp_enabled"]) or "").strip():
@@ -191,3 +234,33 @@ def effective_mcp_overrides(
     if isinstance(settings.get("mcp_enabled"), bool):
         return {"mcp_enabled": settings["mcp_enabled"]}
     return {}
+
+
+def effective_web_overrides(
+    env: Mapping[str, str],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """算出联网检索九字段（M7）的覆盖项。
+
+    纪律同模型/补全/MCP：环境变量已设 → **不传** override，把最高优先级
+    留给 ``Config.load`` 自己（它有 ``_env_choice`` 的枚举校验）；否则用
+    settings.json 里的合法值。provider 是枚举，settings.json 里的非法值
+    **不进 overrides**（回退内核默认 ``gateway``）—— 坏文件不拦启动、
+    也不把非法枚举塞进运行时。
+    """
+    result: dict[str, Any] = {}
+    for field in _WEB_STR_KEYS:
+        if str(env.get(_ENV_FOR_FIELD[field]) or "").strip():
+            continue
+        value = str(settings.get(field) or "").strip()
+        if not value:
+            continue
+        if field == "web_search_provider" and value not in _WEB_PROVIDERS:
+            continue
+        result[field] = value
+    for field in _WEB_TYPED_KEYS:
+        if str(env.get(_ENV_FOR_TYPED[field]) or "").strip():
+            continue
+        if field in settings:
+            result[field] = settings[field]
+    return result

@@ -105,17 +105,33 @@
     <section class="sb-body" data-body="git" hidden>
       <div class="sb-caption">仓库状态</div>
       <div class="git-head" id="git-head"><div class="empty">加载中…</div></div>
-      <div class="git-actions">
-        <button class="btn btn-small" id="btn-commit-msg" title="让模型根据当前改动起草一条提交信息；只生成文本，不会替你提交">生成提交信息</button>
+      <!-- 工具栏：非仓库时整体隐藏（关闭态不出现任何不可用的交互件） -->
+      <div class="git-toolbar" id="git-toolbar">
+        <select class="git-branch-select" id="git-branch-select" title="切换分支"></select>
+        <button class="btn btn-small" id="btn-git-newbranch" title="新建并切换到分支">新建分支</button>
+        <button class="btn btn-small" id="btn-git-pull" title="快进拉取（git pull --ff-only；非快进直接报错，绝不自动合并）">拉取</button>
+        <button class="btn btn-small" id="btn-git-push" title="推送当前分支到已设上游（不带 --force）">推送</button>
         <button class="btn btn-small" id="btn-git-refresh" title="刷新仓库状态">刷新</button>
       </div>
-      <!-- 生成结果默认收起：不生成时不占位置 -->
-      <div id="git-msg" hidden>
-        <div class="sb-caption">提交信息 <button class="icon-btn" id="btn-copy-msg" title="复制到剪贴板">⧉</button></div>
-        <pre class="git-msg-text" id="git-msg-text"></pre>
+      <div class="sb-caption">暂存区 <span class="badge" id="badge-git-staged">0</span>
+        <button class="icon-btn" id="btn-git-unstage-all" title="全部取消暂存" hidden>全部取消</button>
       </div>
-      <div class="sb-caption">改动 <span class="badge" id="badge-git">0</span></div>
-      <div id="git-list"><div class="empty">加载中…</div></div>
+      <div id="git-staged"><div class="empty">加载中…</div></div>
+      <div class="sb-caption">工作区 <span class="badge" id="badge-git">0</span>
+        <button class="icon-btn" id="btn-git-stage-all" title="全部暂存" hidden>全部暂存</button>
+      </div>
+      <div id="git-unstaged"><div class="empty">加载中…</div></div>
+      <!-- 提交条：AI 只起草文本（结果可编辑），提交由用户点 -->
+      <div class="git-commitbar" id="git-commitbar">
+        <div class="sb-caption">提交信息
+          <button class="icon-btn" id="btn-commit-msg" title="让模型根据当前改动起草一条提交信息；只生成文本，不会替你提交">AI 生成</button>
+          <button class="icon-btn" id="btn-copy-msg" title="复制到剪贴板">⧉</button>
+        </div>
+        <textarea class="git-msg-text" id="git-msg-text" rows="3" placeholder="描述这次改动…（可点「AI 生成」起草后自行编辑）"></textarea>
+        <div class="git-commitrow">
+          <button class="btn btn-small" id="btn-git-commit" title="提交已暂存的改动（尊重你的 git 钩子）">提交</button>
+        </div>
+      </div>
     </section>
 
     <section class="sb-body" data-body="tools" hidden>
@@ -537,6 +553,40 @@
       <label class="ws-label" for="set-completion-suffix">光标后上下文窗口（字符，0 = 不截断）</label>
       <input class="ws-input" id="set-completion-suffix" type="number" min="0" max="100000"
              step="500" placeholder="2000">
+
+      <div class="sb-caption">联网检索（web_search / web_fetch）</div>
+      <label class="ws-label ws-check" for="set-web-enabled">
+        <input type="checkbox" id="set-web-enabled">
+        启用联网检索 —— 两个工具恒需人工审批：查询词与 URL 外发前必经确认，取回内容按不可信文本包裹
+      </label>
+      <label class="ws-label" for="set-web-provider">搜索提供方</label>
+      <select class="ws-input" id="set-web-provider">
+        <option value="gateway">gateway（治理面中转，客户端零密钥零公网出口）</option>
+        <option value="searxng">searxng（自部署 SearXNG JSON 端点）</option>
+      </select>
+      <label class="ws-label" for="set-web-url">SearXNG JSON 端点（provider=searxng 时生效）</label>
+      <input class="ws-input" id="set-web-url" type="text" spellcheck="false" autocomplete="off"
+             placeholder="例如 http://127.0.0.1:8888/search">
+      <div class="set-note" id="set-web-endpoint">搜索端点：—</div>
+      <label class="ws-label ws-check" for="set-web-private">
+        <input type="checkbox" id="set-web-private">
+        web_fetch 允许私网 / 环回地址（内网文档服务器场景，默认仅公网）
+      </label>
+      <label class="ws-label" for="set-web-allow">fetch 白名单（逗号分隔 glob，留空 = 不限）</label>
+      <input class="ws-input" id="set-web-allow" type="text" spellcheck="false" autocomplete="off"
+             placeholder="例如 *.python.org,docs.example.com">
+      <label class="ws-label" for="set-web-deny">fetch 黑名单（逗号分隔 glob，恒优先于白名单）</label>
+      <input class="ws-input" id="set-web-deny" type="text" spellcheck="false" autocomplete="off"
+             placeholder="例如 *.evil.example,metadata.tencentyun.com">
+      <label class="ws-label" for="set-web-timeout">单次请求超时（秒）</label>
+      <input class="ws-input" id="set-web-timeout" type="number" min="1" max="120"
+             step="1" placeholder="20">
+      <label class="ws-label" for="set-web-bytes">单次 fetch 字节上限（超限整体拒绝）</label>
+      <input class="ws-input" id="set-web-bytes" type="number" min="1024" max="50000000"
+             step="1024" placeholder="2000000">
+      <label class="ws-label" for="set-web-results">搜索返回条数上限</label>
+      <input class="ws-input" id="set-web-results" type="number" min="1" max="20"
+             step="1" placeholder="8">
 
       <label class="ws-label" for="set-workspace">工作区（留空保持不变）</label>
       <div class="ws-path-row">

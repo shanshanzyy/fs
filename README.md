@@ -14,12 +14,13 @@
 | **M0** | CLI 打通本地闭环 | ✅ **已完成** |
 | **M1** | 桌面客户端（对话 + Diff 审查 + 审批） | ✅ **已完成** |
 | **M1.5** | 效果与体验补全（流式输出 / 会话持久化 / 检查点回滚 / VIBE.md / 验证闭环） | ✅ **已完成**（C4 删除前摘要、D1 打包分发冒烟均已补；另补 W1 工作区切换入口） → [docs/M1.5-PLAN.md](docs/M1.5-PLAN.md) |
-| **M2** | 服务端治理面（SSO / RBAC / 网关 / 审计 / 策略） | ✅ **已完成（含收尾 E1–E4）**（治理面 383 个用例；治理面已接进 CLI 与桌面端） → [apps/server/README.md](apps/server/README.md) · [docs/M2-PLAN.md](docs/M2-PLAN.md) |
+| **M2** | 服务端治理面（SSO / RBAC / 网关 / 审计 / 策略） | ✅ **已完成（含收尾 E1–E4）**（治理面 420 个用例；治理面已接进 CLI 与桌面端） → [apps/server/README.md](apps/server/README.md) · [docs/M2-PLAN.md](docs/M2-PLAN.md) |
 | **M3** | 多 Agent 编排（主从只读子 Agent） | ✅ **已完成**（父 Agent 经 `task` 工具派生**只读**子 Agent 做探索/检索，结论压缩回传；子 Agent 只读、无递归、共用审计链） → [docs/M3-PLAN.md](docs/M3-PLAN.md) |
 | M3+ | 检索增强、Repo Wiki、配额的动态调整 | ✅ **已完成**（① 检索增强：**零依赖**子词化 + 符号感知分块 + RRF 融合 + 按文件去冗余，`VIBE_RETRIEVAL_ENHANCED` 门控，默认关时逐字节一致；② Repo Wiki：**纯本机结构**生成 markdown、落盘走 `plan_overwrite`+审批、默认落 `docs/wiki/`；③ 配额**预算→每日额度**自动推导，**显式策略恒优先**） → [docs/M3+-PLAN.md](docs/M3+-PLAN.md) |
 | M4 | 规模化：高可用、监控告警、灰度分发 | 🟡 部分落地（监控告警 / 成本看板数据源 / 灰度分发已落代码；**高可用前置条件已落代码** —— 统一签名密钥硬校验 + **自研纯 stdlib PG 驱动** + TLS/来源 IP 收口，多实例三条硬门槛可运行、`replicas>1` 不再是空话；K8s 仍**只出设计、未落盘**） → [docs/M4-OPS-PLAN.md](docs/M4-OPS-PLAN.md) · [docs/M4+-PLAN.md](docs/M4+-PLAN.md) |
 | **M5** | IDE 能力补齐（P0 五条：上下文引用 / 语义检索 / Git 视图 / 编辑面 / LSP） | ✅ **已完成（A–E 五条全部闭合）**（`@file`/`@symbol`/`@folder` 引用；可选 embedding + 词法/依赖图回退的语义检索；只读 Git 面板；内联补全 + 行内改写 + 逐 hunk + 保存；LSP 诊断 / 跳转定义 / 重命名） → [docs/M5-PLAN.md](docs/M5-PLAN.md) |
 | **M6** | P1/P2 能力补齐（12 条） | ✅ **已完成（F–Q 十二阶段全部闭合）**（命令面板 / 计划视图 / 上下文窗口 / 多文件事务 / 增量索引 / 测试树 / MCP / 互动终端 / 多模态 / 预览自检 / 规则记忆 / 多租户登录页） → [docs/M6-PLAN.md](docs/M6-PLAN.md) |
+| **M7** | 受控联网检索 + Git 写操作面板 | ✅ **已完成（Part A + Part B 全部闭合）**（`web_search`/`web_fetch` 恒 REVIEW、默认关闭、SSRF 六步防护、治理面 `allowWeb`/`webDeniedHosts` 与搜索中转 `POST /api/v1/search`；Git 面板七个写操作 = 用户本人动作、discard 前置检查点、审计三重同步） → [docs/M7-PLAN.md](docs/M7-PLAN.md) |
 
 ---
 
@@ -36,7 +37,7 @@ VibeCoding/
 │  │  └─ README.md             配置项、安全边界、排查手册
 │  └─ server/                  ★ M2 交付物：治理面（Python，零第三方依赖）
 │     ├─ vibe_server/          源码：auth/ rbac / gateway/ audit / policy / store/
-│     ├─ tests/                383 个单元与端到端测试
+│     ├─ tests/                420 个单元与端到端测试（395 通过 / 25 跳过，490 子测试）
 │     └─ README.md             部署、配置项、接口清单、如何换存储驱动
 ├─ packages/
 │  └─ agent-core/              ★ M0 交付物：Agent 核心引擎（Python，零第三方依赖）
@@ -44,7 +45,7 @@ VibeCoding/
 │     │  ├─ governance/        ★ M2 新增：治理面客户端（令牌/策略/审计上报/网关）
 │     │  └─ host/              ★ M1 新增：桌面端接入层（HTTP + SSE + 会话/审批会合）
 │     │     └─ ui/             零构建前端：对话流 / Diff 审查 / 审批浮层
-│     ├─ tests/                754 个单元与端到端测试（752 通过 / 2 跳过）
+│     ├─ tests/                856 个单元与端到端测试（854 通过 / 2 跳过，98 子测试）
 │     ├─ scripts/              脚本化假模型服务 + 会话/桌面/打包/治理面端到端冒烟
 │     └─ README.md             详细文档
 └─ examples/
@@ -172,7 +173,7 @@ python scripts/build_desktop.py --backend --installer
 
 ## 文档
 
-- [整体架构设计](docs/ARCHITECTURE.md) —— 双平面架构、ADR-001~026、M0–M6 演进路线、选型矩阵
+- [整体架构设计](docs/ARCHITECTURE.md) —— 双平面架构、ADR-001~028、M0–M7 演进路线、选型矩阵
 - [agent-core 详细文档](packages/agent-core/README.md) —— 代码地图、安全模型、
   三级补丁匹配、审计设计、如何新增工具、M0 的边界
 - [桌面客户端文档](apps/desktop/README.md) —— 配置项、安全边界、排查手册、M1 的边界

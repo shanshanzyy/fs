@@ -134,6 +134,7 @@ npm start -- E:/path/to/your/project
 | 工作区 | 工作区路径 | 留空 = 保持不变；填了就顺手切换（走同一条 `POST /api/workspaces/open` 链路） |
 | 补全（FIM） | 启用 FIM / 输出 token 上限 / 光标前窗口 / 光标后窗口 | 走同一条 `GET` + `POST /api/settings`；前 / 后窗口为行对齐截断的字符数（`0` = 不截断），数值留空 = 不修改；保存后后端会清空补全缓存 |
 | 解释器 | Python 解释器路径 / 后端二进制路径 | **仅桌面壳**：写进 `config.json` 并重启应用；浏览器里整段隐藏 |
+| 联网检索 | 总开关 / 搜索形态（`gateway`/`searxng`）/ 搜索端点 / 允许私网 / host 白名单·黑名单 / 超时 / 上限 | **默认关闭**（ADR-027）：复用同一条 `GET` + `POST /api/settings`（字段 `webEnabled` 等）；被 `VIBE_WEB` 等环境变量锁定时置灰；`gateway` 形态的搜索端点为只读展示（由治理面 `serverUrl` 派生） |
 
 几条关键语义：
 

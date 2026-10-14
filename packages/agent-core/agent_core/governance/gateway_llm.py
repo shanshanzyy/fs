@@ -345,6 +345,67 @@ class GatewayLLMClient:
         )
 
 
+# --------------------------------------------------------------------------- 搜索中转（M7）
+def search_via_gateway(
+    *,
+    server_url: str,
+    token: str,
+    query: str,
+    max_results: int = 8,
+    timeout: int = 20,
+) -> list[dict[str, Any]]:
+    """经治理面网关中转一次 web 搜索（ADR-007：客户端零密钥、零公网出口）。
+
+    与 LLM 网关的语义差异（刻意）：**不可达就是明确报错**，不降级 ——
+    LLM 请求可以降级到本地模型继续，但搜索没有「本地假实现」，
+    静默降级只会让模型以为「网上没有相关资料」。401/403/5xx 的报错
+    文案与 LLM 网关同一口径（区分「令牌被拒」与「上游不可用」）。
+    """
+    url = server_url.rstrip("/") + "/api/v1/search"
+    body = json.dumps(
+        {"query": query, "maxResults": int(max_results)}, ensure_ascii=False
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "vibe-agent-core/0.1",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    opener = _build_opener(server_url)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:800]
+        if exc.code == _STATUS_UNAUTHORIZED:
+            raise TokenRejected(
+                f"搜索中转拒绝访问令牌（HTTP 401）。请重新登录治理面。", detail=detail
+            ) from exc
+        if exc.code == _STATUS_QUOTA:
+            raise QuotaUnavailable(
+                "搜索中转配额已用尽（HTTP 429）。", detail=detail
+            ) from exc
+        raise LLMError(
+            f"搜索中转返回 HTTP {exc.code}\n  地址: {url}\n  返回: {detail}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise LLMError(f"搜索中转不可达（{url}）: {reason}") from exc
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"搜索中转返回的不是合法 JSON: {exc}") from exc
+    results = parsed.get("results") if isinstance(parsed, dict) else None
+    if not isinstance(results, list):
+        raise LLMError("搜索中转返回缺少 results 数组")
+    return [item for item in results if isinstance(item, dict)][: max(0, int(max_results))]
+
+
 # --------------------------------------------------------------------------- 错误
 class GatewayUnavailable(LLMError):
     """网关连不上。**这是可降级的**，不是致命错误。"""

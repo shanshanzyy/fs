@@ -56,6 +56,7 @@ from .settings import (
     effective_completion_overrides,
     effective_mcp_overrides,
     effective_model_overrides,
+    effective_web_overrides,
     env_locked_fields,
     load_settings,
     save_settings,
@@ -419,6 +420,42 @@ class ServerContext:
         # MCP 开关（L 管理面）：按显式存在判断 —— false 也必须能落盘（关闭）。
         if "mcpEnabled" in body:
             changes["mcp_enabled"] = _require_bool(body["mcpEnabled"], "mcpEnabled")
+        # 联网检索（M7）：字符串键沿用「空串=不改」；bool/int 按显式存在判断。
+        # provider 是枚举，非法值**保存时就报错**（外层转 400）—— 界面存了个
+        # 不认识的值却回「成功」，比直接失败更误导。
+        if "webSearchProvider" in body:
+            provider = str(body["webSearchProvider"] or "").strip()
+            if provider and provider not in ("gateway", "searxng"):
+                raise ValueError("webSearchProvider 只支持 gateway / searxng")
+            if provider:
+                changes["web_search_provider"] = provider
+        for body_key, field in (
+            ("webSearchUrl", "web_search_url"),
+            ("webAllowHosts", "web_allow_hosts"),
+            ("webDenyHosts", "web_deny_hosts"),
+        ):
+            if body_key in body:
+                text = str(body[body_key] or "").strip()
+                if text:
+                    changes[field] = text
+        if "webEnabled" in body:
+            changes["web_enabled"] = _require_bool(body["webEnabled"], "webEnabled")
+        if "webFetchAllowPrivate" in body:
+            changes["web_fetch_allow_private"] = _require_bool(
+                body["webFetchAllowPrivate"], "webFetchAllowPrivate"
+            )
+        if "webTimeout" in body:
+            changes["web_timeout"] = _require_int_range(
+                body["webTimeout"], "webTimeout", 1, 120
+            )
+        if "webMaxBytes" in body:
+            changes["web_max_bytes"] = _require_int_range(
+                body["webMaxBytes"], "webMaxBytes", 1024, 50_000_000
+            )
+        if "webSearchMaxResults" in body:
+            changes["web_search_max_results"] = _require_int_range(
+                body["webSearchMaxResults"], "webSearchMaxResults", 1, 20
+            )
         if not changes and not workspace:
             raise ValueError("没有需要修改的配置项")
 
@@ -432,6 +469,11 @@ class ServerContext:
             mcp_changed = (
                 "mcp_enabled" in changes
                 and changes["mcp_enabled"] != current.config.mcp_enabled
+            )
+            # 联网开关（M7）真的变了才增删工具：不变时连 registry 都不碰。
+            web_changed = (
+                "web_enabled" in changes
+                and changes["web_enabled"] != current.config.web_enabled
             )
             if changes:
                 new_config = replace(current.config, **changes)
@@ -455,6 +497,13 @@ class ServerContext:
             # （关→摘除、开→并入）。读的是刚更新的 current.agent.config。
             if mcp_changed:
                 current.mcp_reload()
+            # 联网开关切换（M7）：摘掉或并入 web 工具。web_reload 同时把
+            # agent.ctx.config 换成新对象 —— 其余 web 字段（host 名单 / 超时 /
+            # 上限）不摘工具，靠 ctx.config 引用替换即可生效。
+            if web_changed:
+                current.web_reload()
+            elif changes:
+                current.agent.ctx.config = current.agent.config
 
         # 落盘：只写显式给出的非空字段（save_settings 本身忽略空值）。
         if changes:
@@ -859,6 +908,55 @@ class VibeHandler(BaseHTTPRequestHandler):
         if path == "/api/git/commit-message":
             self._read_json()  # keep-alive：排空请求体（该接口本身无参数）
             self._handle_commit_message(session)
+            return
+
+        # ---- Git（B3）：写操作 = 用户本人动作（ADR-028，不进审批浮层）---------
+        # 全部 POST；固定 argv + shell=False + scrub_env 由 gitinfo 统一保证。
+        # 状态码语义见 _handle_git_write。
+        if path == "/api/git/stage":
+            body = self._read_json()
+            self._handle_git_write(
+                session, lambda: session.git_stage(body.get("paths"), all=bool(body.get("all")))
+            )
+            return
+
+        if path == "/api/git/unstage":
+            body = self._read_json()
+            self._handle_git_write(
+                session, lambda: session.git_unstage(body.get("paths"), all=bool(body.get("all")))
+            )
+            return
+
+        if path == "/api/git/discard":
+            body = self._read_json()
+            self._handle_git_write(session, lambda: session.git_discard(body.get("paths")))
+            return
+
+        if path == "/api/git/commit":
+            body = self._read_json()
+            self._handle_git_write(
+                session, lambda: session.git_commit(str(body.get("message") or ""))
+            )
+            return
+
+        if path == "/api/git/push":
+            self._read_json()
+            self._handle_git_write(session, session.git_push)
+            return
+
+        if path == "/api/git/pull":
+            self._read_json()
+            self._handle_git_write(session, session.git_pull)
+            return
+
+        if path == "/api/git/branch":
+            body = self._read_json()
+            self._handle_git_write(
+                session,
+                lambda: session.git_branch(
+                    str(body.get("name") or ""), str(body.get("action") or "")
+                ),
+            )
             return
 
         # ---- 编辑面（D）：补全 / 改写 / 保存 ------------------------------
@@ -1381,6 +1479,20 @@ class VibeHandler(BaseHTTPRequestHandler):
                 "completionSuffixChars": cfg.completion_suffix_chars,
                 # MCP 开关（L 管理面）：面板回填用；envLocked 已自动带上 mcp_enabled
                 "mcpEnabled": bool(getattr(cfg, "mcp_enabled", False)),
+                # 联网检索（M7）：九字段面板回填用；webSearchEndpoint 是按
+                # provider 派生的只读展示（gateway = 治理面 <server>/api/v1/search），
+                # 界面在 searxng 模式下才编辑 webSearchUrl。
+                # envLocked 已自动带上全部 web 键。
+                "webEnabled": bool(cfg.web_enabled),
+                "webSearchProvider": cfg.web_search_provider,
+                "webSearchUrl": cfg.web_search_url,
+                "webSearchEndpoint": cfg.web_search_endpoint,
+                "webFetchAllowPrivate": bool(cfg.web_fetch_allow_private),
+                "webAllowHosts": cfg.web_allow_hosts,
+                "webDenyHosts": cfg.web_deny_hosts,
+                "webTimeout": cfg.web_timeout,
+                "webMaxBytes": cfg.web_max_bytes,
+                "webSearchMaxResults": cfg.web_search_max_results,
                 "envLocked": env_locked_fields(),
                 "governance": session.governance is not None,
             }
@@ -1558,6 +1670,42 @@ class VibeHandler(BaseHTTPRequestHandler):
                 "removed": data.get("removed", 0),
             }
         )
+
+    def _handle_git_write(self, session: Session, action) -> None:
+        """跑一个 Git 写操作并把结果翻成 HTTP 响应（B3）。
+
+        状态码语义（M7-PLAN B3）：非仓库 → 既有 `available:false` 范式（200）；
+        git 自身失败（无上游 / 钩子拒绝 / 非快进）→ **409 + stderr 首行摘要**；
+        路径越界 / 敏感 / `.vibe` → 400；执行中 → 409；成功 → 200 + 最新
+        `status()` 快照（省一次往返刷新）。
+        """
+        try:
+            result = action()
+        except BusyError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        except SandboxViolation as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if not result.get("available"):
+            self._send_json(result)  # 200：不是 git 仓库，界面显示原因
+            return
+        if not result.get("ok"):
+            self._send_json(
+                {"error": result.get("reason") or "git 操作失败"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        payload = {**gitinfo.status(session.agent.config.workspace), "ok": True}
+        if "checkpointId" in result:
+            payload["checkpointId"] = result.get("checkpointId")
+        if "oid" in result:
+            payload["oid"] = result.get("oid")
+        self._send_json(payload)
 
     # ------------------------------------------------------------------ SSE
     def _serve_events(self, query: dict[str, list[str]]) -> None:
@@ -1918,6 +2066,9 @@ def main(argv: list[str] | None = None) -> int:
     overrides.update(effective_completion_overrides(os.environ, load_settings()))
     # MCP 开关（L 管理面）：与模型/补全同一优先级链；关闭时不 spawn 任何子进程。
     overrides.update(effective_mcp_overrides(os.environ, load_settings()))
+    # 联网检索九字段（M7）：与模型/补全/MCP 同一优先级链；默认关闭时
+    # 工具清单与 M6 现状逐字节一致（web 工具不注册）。
+    overrides.update(effective_web_overrides(os.environ, load_settings()))
 
     try:
         config = Config.load(args.workspace, **overrides)

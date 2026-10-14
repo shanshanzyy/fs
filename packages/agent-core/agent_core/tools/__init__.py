@@ -26,6 +26,7 @@ from .search import FIND_FILES_SPEC, GREP_SPEC
 from .semantic import SEMANTIC_SEARCH_SPEC
 from .shell import RUN_COMMAND_SPEC
 from .task import TASK_SPEC
+from .web import WEB_FETCH_SPEC, WEB_SEARCH_SPEC
 
 __all__ = [
     "DEFAULT_IGNORED_DIRS",
@@ -44,6 +45,8 @@ __all__ = [
     "SEMANTIC_SEARCH_SPEC",
     "TASK_SPEC",
     "UPDATE_PLAN_SPEC",
+    "WEB_FETCH_SPEC",
+    "WEB_SEARCH_SPEC",
     "ChangeRecord",
     "ToolContext",
     "ToolPreview",
@@ -67,6 +70,7 @@ def build_default_registry(
     memory: bool = False,
     subagent: bool = False,
     wiki: bool = False,
+    web: bool = False,
     audit: object | None = None,
 ) -> ToolRegistry:
     """注册全部工具。
@@ -95,6 +99,11 @@ def build_default_registry(
 
     `wiki`（M3+）同样是**条件注册**：`repo_wiki` 只在 Repo Wiki 启用时才注册 ——
     关掉（`VIBE_WIKI=0`，默认）时工具列表与行为与未实现前逐字节一致。
+
+    `web`（M7）同样是**条件注册**：`web_search` / `web_fetch` 只在联网检索
+    启用时才注册 —— 关掉（`VIBE_WEB=0`，默认）时工具列表与行为与未实现前
+    逐字节一致。两个工具**恒 REVIEW**（查询词/URL 是外发内容，ADR-008/015），
+    且**不进 build_readonly_registry** —— 子 Agent 恒不联网。
     """
     registry = ToolRegistry()
     specs = [
@@ -128,6 +137,11 @@ def build_default_registry(
         # Repo Wiki（M3+）：恒 REVIEW（写盘，落盘走审批）；未启用时列表逐字节不变。
         # 注意 `repo_wiki` **不进** build_readonly_registry() —— 子 Agent 恒只读。
         specs.append(REPO_WIKI_SPEC)
+    if web:
+        # 联网检索（M7）：恒 REVIEW（查询词/URL 外发必经人审，ADR-008/015）；
+        # 未启用时列表逐字节不变。同样**不进** build_readonly_registry()。
+        specs.append(WEB_SEARCH_SPEC)
+        specs.append(WEB_FETCH_SPEC)
     if lsp is None:
         # 延迟导入：tools 与 lsp 互相引用，模块级 import 会成环（见 diagnostics.py）
         from ..lsp import servers

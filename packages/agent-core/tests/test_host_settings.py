@@ -184,6 +184,15 @@ class EnvLockTests(unittest.TestCase):
                 "completion_max_tokens": False,
                 "completion_prefix_chars": False,
                 "completion_suffix_chars": False,
+                "web_enabled": False,
+                "web_search_provider": False,
+                "web_search_url": False,
+                "web_allow_hosts": False,
+                "web_deny_hosts": False,
+                "web_fetch_allow_private": False,
+                "web_timeout": False,
+                "web_max_bytes": False,
+                "web_search_max_results": False,
             },
         )
 
@@ -317,6 +326,15 @@ class SettingsEndpointTests(unittest.TestCase):
                 "completion_max_tokens": False,
                 "completion_prefix_chars": False,
                 "completion_suffix_chars": False,
+                "web_enabled": False,
+                "web_search_provider": False,
+                "web_search_url": False,
+                "web_allow_hosts": False,
+                "web_deny_hosts": False,
+                "web_fetch_allow_private": False,
+                "web_timeout": False,
+                "web_max_bytes": False,
+                "web_search_max_results": False,
             },
         )
         # 补全参数也随 GET 回传，供面板回填
@@ -326,6 +344,20 @@ class SettingsEndpointTests(unittest.TestCase):
         self.assertIn("completionSuffixChars", data)
         # MCP 开关（L 管理面）也随 GET 回传
         self.assertIn("mcpEnabled", data)
+        # 联网检索九字段（M7）也随 GET 回传，供设置面板回填
+        for key in (
+            "webEnabled",
+            "webSearchProvider",
+            "webSearchUrl",
+            "webSearchEndpoint",
+            "webFetchAllowPrivate",
+            "webAllowHosts",
+            "webDenyHosts",
+            "webTimeout",
+            "webMaxBytes",
+            "webSearchMaxResults",
+        ):
+            self.assertIn(key, data)
 
     def test_post_settings_hot_swaps_and_persists(self) -> None:
         with self._request(
@@ -384,6 +416,51 @@ class SettingsEndpointTests(unittest.TestCase):
                 "/api/settings", method="POST", body={"completionMaxTokens": 4}
             )
         self.assertEqual(ctx.exception.code, 400)
+
+    # ------------------------------------------------- 联网检索（M7）
+    def test_post_settings_toggles_web_tools_hot(self) -> None:
+        """webEnabled 保存后立即增删工具，且不重建会话（对话保留）。"""
+        self.assertNotIn("web_search", self.host.session.registry.names())
+        with self._request(
+            "/api/settings", method="POST", body={"webEnabled": True}
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(data["ok"])
+        names = self.host.session.registry.names()
+        self.assertIn("web_search", names)
+        self.assertIn("web_fetch", names)
+        # 再次关闭 → 摘除，清单回到基线
+        with self._request("/api/settings", method="POST", body={"webEnabled": False}):
+            pass
+        names = self.host.session.registry.names()
+        self.assertNotIn("web_search", names)
+        self.assertNotIn("web_fetch", names)
+
+    def test_post_settings_web_string_and_int_persist(self) -> None:
+        """字符串键（host 名单）与数值键（超时）无需开总开关也能落盘并热生效。"""
+        with self._request(
+            "/api/settings",
+            method="POST",
+            body={"webTimeout": 33, "webDenyHosts": "evil.test", "webSearchMaxResults": 5},
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(data["settings"]["web_timeout"], 33)
+        self.assertEqual(data["settings"]["web_deny_hosts"], "evil.test")
+        self.assertEqual(data["settings"]["web_search_max_results"], 5)
+        # ctx.config 引用被替换 —— 工具执行时读到的就是新值
+        self.assertEqual(self.host.session.agent.ctx.config.web_timeout, 33)
+
+    def test_post_settings_rejects_bad_web_provider(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self._request(
+                "/api/settings", method="POST", body={"webSearchProvider": "bing"}
+            )
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_post_settings_rejects_out_of_range_web_timeout(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self._request("/api/settings", method="POST", body={"webTimeout": 0})
+        self.assertEqual(caught.exception.code, 400)
 
     def test_get_models_returns_shape(self) -> None:
         with self._request("/api/models") as response:

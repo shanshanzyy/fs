@@ -8,6 +8,9 @@
    启动（E4 定档：内网无 Vault），并额外跑两轮真进程 `doctor`：一份有效
    密钥文件要认得出、缺文件要 FAIL 且给修复建议。
 2. 建组织 + 签发注册令牌 → 客户端 `register` 拿令牌。
+2b. 搜索中转（可达 / 不可达）：服务端经 `VIBE_SRV_SEARCH_URL` 指向脚本内起的
+   假 SearXNG → `POST /api/v1/search` 回清洗后的结果；把上游停掉后再打 →
+   明确 502（不静默降级到空结果）。
 3. 策略收紧：发布 `allowCloud=false` → `wire()` 后必须 `status=governed`、
    `constraints.allow_cloud is False`、模型客户端是本地 `OpenAICompatClient`。
 4. 云端路由：发布 `allowCloud=true` → 一轮非流式 + 一轮流式（声明 `reasoning`），
@@ -26,6 +29,8 @@
 * 第 1~2 档 → 服务端起不来，或 bootstrap / 注册链路断了（看打印的 stderr）。
   **若服务端起不来且提示密钥文件相关，说明 `file` provider 的启动闸门生效了**
   —— 优先看临时目录里的 `secrets.json` 是否写成、权限是否为 `600`。
+* 第 2b 档 → 搜索中转断了。可达分支失败多半是 `VIBE_SRV_SEARCH_URL` 没接上；
+  不可达分支没回 502 说明服务端在静默降级（客户端会以为「搜了，真没结果」）。
 * 第 3 档 → 策略「只收紧」没生效，客户端仍在用网关（合规风险）。
 * 第 4 档 → 网关流式或路由判定异常。**若报 400「暂不支持 stream=true」，
   说明 `gateway/proxy.py` 的 `require_json_object` 又被加回了对 `stream` 的拒绝**
@@ -59,6 +64,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +189,32 @@ def recorded_auth(path: Path) -> list[str]:
         except json.JSONDecodeError:
             continue
     return values
+
+
+def start_fake_searxng(results: list[dict]) -> tuple[ThreadingHTTPServer, str]:
+    """起一个脚本内的假 SearXNG JSON 端点（真 HTTP，但不占独立进程）。
+
+    不另起子进程：搜索上游只是被请求的一环，而本脚本已断言「退出后无残留
+    进程」，少一个子进程就少一处误差来源。
+    """
+    payload = json.dumps({"results": results}, ensure_ascii=False).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: Any) -> None:  # 静音
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}/search"
 
 
 def run_doctor(tmp: Path, extra_env: dict[str, str]) -> tuple[int, str]:
@@ -329,6 +361,7 @@ def main() -> int:  # noqa: C901 —— 冒烟脚本按验收档顺序线性展�
     workspace = tmp / "workspace"
     workspace.mkdir(parents=True)
     procs: list[tuple[str, subprocess.Popen]] = []
+    searxng_server: Any = None  # 脚本内起的假 SearXNG；档 2b 末会被停掉
     pids_before = all_pids()
 
     say("=== M2 治理面 E2E 冒烟（真进程）===")
@@ -357,6 +390,21 @@ def main() -> int:  # noqa: C901 —— 冒烟脚本按验收档顺序线性展�
         procs.append(("mock-local", local_proc))
         say(f"  假模型: 云端 {cloud_url} / 本地 {local_url}")
 
+        # 假 SearXNG（M7 搜索中转的上游）：脚本内起，供档 2b 的「可达」分支用；
+        # 档 2b 末尾把它停掉，同一个服务端实例就此走上「不可达」分支 ——
+        # 两个分支用同一份配置，才证明差别真来自上游通不通，而不是配置换过。
+        searxng_server, searxng_url = start_fake_searxng(
+            [
+                {
+                    "title": "检索结果甲",
+                    "url": "https://docs.example/1",
+                    "content": "摘要甲",
+                    "engine": "searxng",
+                }
+            ]
+        )
+        say(f"  假 SearXNG: {searxng_url}")
+
         file_secret_env = {
             "VIBE_SRV_SECRETS_PROVIDER": "file",
             "VIBE_SRV_SECRETS_FILE": str(secrets_file),
@@ -367,6 +415,7 @@ def main() -> int:  # noqa: C901 —— 冒烟脚本按验收档顺序线性展�
             {
                 "VIBE_SRV_LOCAL_UPSTREAM_URL": local_url + "/v1",
                 "VIBE_SRV_CLOUD_UPSTREAM_URL": cloud_url + "/v1",
+                "VIBE_SRV_SEARCH_URL": searxng_url,
                 **file_secret_env,
             },
         )
@@ -419,6 +468,46 @@ def main() -> int:  # noqa: C901 —— 冒烟脚本按验收档顺序线性展�
         expect(bool(dev.access_token) and bool(dev.device_id), "档2 开发者注册并拿到令牌/设备")
         dev_user_id = dev.user_id
         dev_token = dev_client.ensure_token()
+
+        # ---------------- 档 2b：搜索中转（可达 / 不可达） ----------------
+        say("\n[档2b] 搜索中转：上游可达回清洗结果，上游挂掉后明确 502（不静默降级）…")
+        relay_status, relay_body = http_json(
+            server_url + "/api/v1/search",
+            method="POST",
+            payload={"query": "asyncio 教程", "maxResults": 5},
+            token=dev_token,
+        )
+        relay_results = relay_body.get("results") if isinstance(relay_body, dict) else None
+        expect(
+            relay_status == 200 and isinstance(relay_results, list) and len(relay_results) == 1,
+            "档2b 上游可达时回 200 + 清洗后的结果",
+            f"HTTP {relay_status} {relay_body}",
+        )
+        if isinstance(relay_results, list) and relay_results:
+            expect(
+                set(relay_results[0]) == {"title", "url", "content"},
+                "档2b 结果只含 title/url/content 三字段（上游其余字段被丢）",
+                str(sorted(relay_results[0])),
+            )
+
+        # 把上游停掉：不可达时必须**明确 502**。静默回空结果会让客户端以为
+        # 「搜了，真没结果」——这正是「不静默降级」要守住的那条线。
+        searxng_server.shutdown()
+        searxng_server.server_close()
+        dead_status, dead_body = http_json(
+            server_url + "/api/v1/search",
+            method="POST",
+            payload={"query": "asyncio 教程"},
+            token=dev_token,
+        )
+        dead_code = (
+            dead_body.get("error", {}).get("code") if isinstance(dead_body, dict) else None
+        )
+        expect(
+            dead_status == 502 and dead_code == "search_upstream_error",
+            "档2b 上游不可达时明确 502",
+            f"HTTP {dead_status} {dead_body}",
+        )
 
         # 客户端配置：base_url 指向「本地」假模型（回退/本地直连用）
         config = Config.load(
@@ -627,6 +716,13 @@ def main() -> int:  # noqa: C901 —— 冒烟脚本按验收档顺序线性展�
     finally:
         # ---------------- 档 8：按进程树清理 + 残留断言 ----------------
         say("\n[档8] 按进程树终止子进程并比对进程快照…")
+        # 假 SearXNG 是脚本内线程服务：正常路径在档 2b 已停；异常提前退出时兜底。
+        if searxng_server is not None:
+            try:
+                searxng_server.shutdown()
+                searxng_server.server_close()
+            except Exception:  # noqa: BLE001 —— 收尾动作，失败不掩盖主因
+                pass
         for _name, proc in procs:
             kill_tree(proc.pid)
         time.sleep(0.8)

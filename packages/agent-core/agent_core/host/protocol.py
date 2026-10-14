@@ -54,8 +54,8 @@
 |---|---|
 | `GET  /api/health` | 就绪探测（Electron 主进程靠它决定何时加载页面） |
 | `GET  /api/state` | 会话快照：配置、工具清单、风险分级、当前运行状态 |
-| `GET  /api/settings` | 模型 / 补全设置（可编辑部分）：`{model, baseUrl, apiKeyMasked, apiKeySet, workspace, settingsPath, fimEnabled, completionMaxTokens, completionPrefixChars, completionSuffixChars, envLocked{model,base_url,api_key,fim_enabled,completion_max_tokens,completion_prefix_chars,completion_suffix_chars}, governance}`；密钥只回末 4 位掩码，`envLocked` 标出被环境变量锁死、界面改不动的字段 |
-| `POST /api/settings` | 保存模型 / 补全设置：`{model?, baseUrl?, apiKey?, workspace?, fimEnabled?, completionMaxTokens?, completionPrefixChars?, completionSuffixChars?}`（字符串字段留空 = 保留原值；补全字段仅在显式给出时落盘，`0`/`false` 均为合法值）→ `{ok, switched, settingsPath, settings, session}`；**空闲态**热替换 LLM 客户端并保留当前对话（执行中 409，治理面接管时 400），补全设置变更同时清空补全缓存。真源为用户级 `~/.vibe/settings.json`（`VIBE_SETTINGS` 可覆盖路径） |
+| `GET  /api/settings` | 模型 / 补全 / MCP / 联网检索设置（可编辑部分）：`{model, baseUrl, apiKeyMasked, apiKeySet, workspace, settingsPath, fimEnabled, completionMaxTokens, completionPrefixChars, completionSuffixChars, mcpEnabled, webEnabled, webSearchProvider, webSearchUrl, webSearchEndpoint, webFetchAllowPrivate, webAllowHosts, webDenyHosts, webTimeout, webMaxBytes, webSearchMaxResults, envLocked{…}, governance}`（`envLocked` 覆盖模型/补全/MCP/web 全部可持久化键：环境变量已设置的键为 true、界面改不动）；密钥只回末 4 位掩码；`webSearchEndpoint` 为按 provider 派生的只读展示（gateway = 治理面 `<server>/api/v1/search`，searxng = `webSearchUrl`） |
+| `POST /api/settings` | 保存模型 / 补全 / MCP / 联网检索设置：`{model?, baseUrl?, apiKey?, workspace?, fimEnabled?, completionMaxTokens?, completionPrefixChars?, completionSuffixChars?, mcpEnabled?, webEnabled?, webSearchProvider?("gateway" 或 "searxng"), webSearchUrl?, webAllowHosts?, webDenyHosts?, webFetchAllowPrivate?, webTimeout?(1~120), webMaxBytes?(1024~50000000), webSearchMaxResults?(1~20)?}`（字符串字段留空 = 保留原值；bool/数值字段仅在显式给出时落盘，`false`/`0` 均为合法值）→ `{ok, switched, settingsPath, settings, session}`；**空闲态**热替换 LLM 客户端并保留当前对话（执行中 409，治理面接管时 400），补全设置变更同时清空补全缓存，`mcpEnabled` 变更触发 `mcp_reload`、`webEnabled` 变更热增删 `web_search`/`web_fetch` 工具（其余 web 字段经 `ctx.config` 引用替换即时生效）。真源为用户级 `~/.vibe/settings.json`（`VIBE_SETTINGS` 可覆盖路径） |
 | `GET  /api/models?baseUrl=&apiKey=` | 列出端点可用模型名：`{baseUrl, models[]}`；`list_models()` 吞错返回空，**不代表不可达**（判可达性请用 `POST /api/model/test`） |
 | `POST /api/model/test` | 连通性探测（不落盘、无副作用）：`{baseUrl?, apiKey?}` → `{ok, message, baseUrl, models[]}`；先 `probe_endpoint()`（不吞错）确认可达，再 `list_models()`（吞错返回空） |
 | `POST /api/run` | `{text, refs?}` 提交任务；已有任务在跑时返回 409 |
@@ -65,6 +65,17 @@
 | `GET  /api/tree` | 工作区文件树 |
 | `GET  /api/file?path=` | 读取单个文件（经路径沙箱，敏感文件会被拒）；返回含 `digest`（乐观锁指纹） |
 | `GET  /api/diffs` | 本会话累计产生的所有 diff |
+| `GET  /api/git/status` | Git 仓库视图（P0-C，只读）：`gitinfo.status()` 输出 —— 分支 / upstream / ahead / behind / 改动条目 / 冲突清单；**非 git 仓库时回 `available:false + reason`**（不是 500） |
+| `GET  /api/git/branches` | 本地与远端分支清单（P0-C，只读）：`{available, branches[], current}` |
+| `GET  /api/git/diff?ref=&staged=&path=` | 相对某基准的 unified diff（P0-C，只读）；`path` 经 PathGuard，越权 403 |
+| `POST /api/git/commit-message` | 生成提交信息文本（P0-C）**不提交**：`{}` → `{message, branch, files, added, removed}`；非仓库 / 无改动 400、模型失败 502 |
+| `POST /api/git/stage` | 暂存（B3，用户动作 ADR-028）：`{paths[], all?}` → 200 + 最新 status 快照；非仓库 `available:false`；git 失败 / 执行中 409；路径越界·敏感·`.vibe` 400 |
+| `POST /api/git/unstage` | 取消暂存（B3）：`{paths[], all?}`；unborn 仓库自动走 `rm --cached` |
+| `POST /api/git/discard` | 放弃改动（B3/B5，破坏性）：`{paths[]}` → 200 + status 快照 + `{checkpointId}`；**执行前强制落检查点**，可经 `/api/checkpoints` 回滚找回；`.vibe` 与敏感路径拒收 400 |
+| `POST /api/git/commit` | 提交（B3）：`{message}` → 200 + status 快照 + `{oid}`；空 message 400、超 500 字符 409；**不加 `--no-verify`**（用户钩子照跑） |
+| `POST /api/git/push` | 推送当前分支（B3）：`{}` → 200 + status 快照；无上游 / 远端拒绝 409（带 stderr 首行） |
+| `POST /api/git/pull` | 快进拉取（B3）：`{}` → 200 + status 快照；非快进（不产生任何改动）/ 有未解决冲突 409 |
+| `POST /api/git/branch` | 分支新建 / 切换（B3）：`{name, action:"create"|"switch"}` → 200 + status 快照；非法 refname 400、git 失败 409 |
 | `GET  /api/refs?type=&q=&limit=` | 上下文引用（P0-A）候选：type ∈ file/symbol/folder，上限 50 |
 | `POST /api/complete` | 内联补全（D5）：`{path, prefix, suffix, maxTokens?}` → `{text, backend, path, chars, truncated, cached}`；后端按 `completionPrefixChars`/`completionSuffixChars` 对前后文做行对齐截断（`truncated` 标出是否发生截断），`maxTokens` 缺省回退 `completionMaxTokens`；相同 `(path,prefix,suffix,limit,fim)` 在 TTL 30s 内直接命中内存缓存（`cached=true`） |
 | `POST /api/rewrite` | 行内改写预览（D8）：`{path, startLine, endLine, instruction}` → `{token, hunks[], noChange, …}` |

@@ -810,6 +810,75 @@ Vibe Coding 的输出质量 ≈ 上下文质量。三层递进：
   存储取舍不冲突。
 - **状态**：已接受
 
+### ADR-027：联网检索「受控外发」——恒 REVIEW + 默认关闭 + 治理面可一刀切
+
+- **背景**：M0–M6 内核**无任何联网工具**（全库零匹配）。遇到「查某 API 的最新用法、
+  对着报错搜 issue」这类任务，Agent 只能靠模型参数里的陈旧知识硬答 —— 可用性硬缺口。
+  但一旦引入联网，「代码不出本机」这条红线就多出一个**外发面**，必须显式收口。
+- **场景**：用户让 Agent 查文档 / 搜报错；团队形态要求搜索密钥托管在治理面（客户端零密钥）。
+- **决策**：
+  1. **两个新内置工具 `web_search` / `web_fetch`，默认关闭**（`web_enabled=False`）。
+     关闭时工具注册表、对话行为、审计流与 M6 收口**逐字节一致**（同 `subagent`/`wiki`
+     既有范式）。
+  2. **两工具恒 `Risk.REVIEW`、不可配置放行** —— 审批浮层就是「外发内容人工确认」这道闸
+     （同 ADR-015 MCP 前例）。`web_search` 的 preview 显示**完整 query + provider + 目标
+     端点**；`web_fetch` 显示**完整 URL + 解析出的 IP + Content-Type 判定** —— 用户永远
+     看得到要外发什么。
+  3. **结果恒 `wrap_untrusted`** —— 取回正文是注入面（正文里可能藏指令），与 `task` 工具
+     结果同一处理（ADR-021 同款纪律）。
+  4. **上传只留指纹**：`query` / 抓取正文只上传 `*_digest + *_chars`（ADR-006）；
+     URL 上传 `host + path`，**query string 换 digest**（参数里可能有 token/敏感词）。
+  5. **搜索分两形态**：`gateway`（团队默认，密钥与公网出口都在治理面，`POST /api/v1/search`
+     中转，客户端零密钥）/ `searxng`（单机内网自部署 JSON 端点）。**fetch 恒直连、不走网关**
+     —— 让正文过服务端内存只会扩大服务端敏感面。
+  6. **SSRF 六步防护**（协议白名单 → host 名单 → **DNS 解析后校验 IP** → 重定向逐跳重跑 →
+     响应限制 → 解码回退）；`web_deny_hosts` 恒优先于白名单，私网/环回默认拒
+     （`web_fetch_allow_private` 显式开）。
+  7. **治理面策略** `allowWeb`（BOOL，AND，默认 False）+ `webDeniedHosts`（LIST，并集，
+     默认 `[]`）；stale 受限模式 `allowWeb` 恒 False。
+  8. **不进只读子 Agent 面**（`build_readonly_registry` 不收录，同 MCP）。
+- **理由**：把「Agent 能联网」这件有用的事，收敛到「外发内容必经人审 + 关闭时逐字节不变 +
+  团队可一刀切」三条约束里 —— 既不牺牲红线也不牺牲可用性。
+- **代价**：REVIEW 恒不可关意味着每次检索都要人点一次（弱模型可能高频触发）；gateway 形态
+  依赖治理面可达，不可达时**明确报错**（不静默降级到本地假实现）。
+- **明确不做**：❌ 客户端直连公网商业搜索 API（密钥落本机，违反 ADR-007）❌ `fetch` 走网关
+  中转 ❌ 子 Agent 联网 ❌ 在线文档问答 / 语音 / 多语言。
+- **复核**：ADR-007（密钥集中托管）—— 公网搜索密钥只在服务端；ADR-006（原文只留本机）——
+  query/正文只上传指纹；ADR-021（不可信文本纪律）—— 取回正文包裹后才进提示词。
+- **状态**：已接受
+
+### ADR-028：Git 写操作 = 用户本人动作，与 Agent 通道彻底隔离
+
+- **背景**：`gitinfo.py` 刻意只读（文件头写明），用户被改动面板「看着 diff 却不能提交」，
+  每次要切出终端手敲 `git add/commit/push`。「AI 改完 → 人审完 → 顺手提交」的闭环是断点。
+- **场景**：用户在面板上暂存 / 提交 / 推送**自己已审过**的改动。
+- **决策**：
+  1. **七个动作（stage/unstage/discard/commit/push/pull --ff-only/分支新建切换）全部是
+     用户本人动作**，不进 Agent 审批浮层（ADR-011 编辑面保存 / ADR-016 交互式终端的同构范式）。
+  2. **不给 Agent 加任何 git 写工具** —— 把提交收进 Agent 工具面，等于给「改动落盘唯一
+     入口是补丁引擎」（ADR-004）开新口子；Agent 想提交，让用户在面板上点。
+  3. **改动落盘的唯一入口仍是补丁引擎** —— Git 面板只 commit/推送**已落盘**的改动，
+     **不产生新改动**。
+  4. **破坏性动作有兜底** —— `discard` 先逐文件 `snapshot_before` 落检查点，确认弹层列
+     文件清单 + 检查点 ID，事后可从「回滚」面板 restore；`.vibe/` 内与敏感路径**拒绝
+     discard**（防误清审计）。
+  5. **零网络、零注入面** —— 全部固定 argv + `shell=False` + `scrub_env()`；commit message
+     单 argv 元素（数组传递天然无注入），长度上限 500、空拒、**不加 `--no-verify`**（尊重
+     钩子）；`push` 不带 `--force`；`pull` 只 `--ff-only`（非快进直接报错，**绝不自动产生
+     合并**）；分支名走 refname 白名单正则。
+  6. **审计** `git.stage/unstage/commit/push/pull/branch/discard`；批量路径只传
+     `count + paths_digest`；commit message 恒 digest（ADR-006）。
+  7. **路径语义收窄** —— workspace 可能是 repo 子目录，PathGuard 会把「repo 根内、workspace
+     外」的路径拒绝；这是**收窄而非漏洞**（子目录场景仅操作 workspace 内文件）。
+- **理由**：让提交闭环在界面上闭合，同时**不碰 Agent 通道**、不放松补丁引擎这条唯一落盘入口。
+- **代价**：用户已审过的改动也必须在面板上点（不能交给 Agent 自动提交）；merge/rebase/
+  stash/tag 不做，冲突面留给内置终端。
+- **明确不做**：❌ Agent git 写工具 ❌ merge/rebase/revert/cherry-pick/stash/tag ❌ 3-way
+  冲突编辑器 ❌ 治理面下发分支保护策略（V1 依赖远端仓库自身保护规则）。
+- **复核**：ADR-004（结构化补丁 = 唯一落盘入口）—— Git 只提交已落盘改动，未开口子；
+  ADR-016（终端与 Agent 通道隔离）—— 同款隔离。
+- **状态**：已接受
+
 ---
 
 ## 6. 分阶段演进路线

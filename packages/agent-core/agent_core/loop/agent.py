@@ -300,6 +300,8 @@ class Agent:
             subagent=config.subagent_enabled,
             # Repo Wiki（M3+）：默认关 —— 不配置时工具清单逐字节不变。
             wiki=config.wiki_enabled,
+            # 联网检索（M7）：默认关 —— 会外发的能力必须显式开（VIBE_WEB=1）。
+            web=config.web_enabled,
         )
         # 跨会话记忆（P2-15）：host 侧注入同一个实例，让 `/api/memories` 与 Agent
         # 共用一份；直接建 Agent 的场景（CLI / 测试）自己按配置构建。

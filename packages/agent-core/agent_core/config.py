@@ -55,6 +55,9 @@ _CACHE_MODES = ("auto", "on", "off")
 # 多模态输入（N / P1-10）同样是三态：off 不接受图片、auto 探测上游是否支持、
 # on 强制发送并把报错如实回传。
 _VISION_MODES = ("auto", "on", "off")
+# 联网检索上游（M7）两形态：gateway = 经治理面网关中转（客户端零密钥）；
+# searxng = 直连 SearXNG JSON 端点（内网自部署/公共实例）。
+_WEB_SEARCH_PROVIDERS = ("gateway", "searxng")
 
 
 def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
@@ -249,6 +252,32 @@ class Config:
     # 单次生成最多覆盖多少个源文件，防止在超大仓库上拉爆内存与耗时。
     wiki_max_files: int = 400
 
+    # --- 受控联网检索（M7）---
+    # 默认**关**：web_search / web_fetch 都会把内容送出本机（查询词进搜索上游、
+    # URL 进目标服务器），会外发的能力必须显式开（与 vision_mode / mcp_enabled
+    # 同一纪律）。关着时两个工具不注册，行为与未实现前逐字节一致。
+    web_enabled: bool = False
+    # 搜索上游形态：gateway = 经治理面网关中转（客户端零密钥、零公网出口，
+    # 密钥托管在服务端，ADR-007 同范式）；searxng = 直连 SearXNG JSON 端点。
+    web_search_provider: str = "gateway"
+    # SearXNG 的 JSON 端点（searxng 形态用）；gateway 形态忽略
+    #（由 server_url 派生 <server>/api/v1/search）。
+    web_search_url: str = ""
+    # 是否允许 fetch 私网/环回地址（内网文档服务器场景）。
+    # 默认关：仅公网可取 —— SSRF 的最基本闸（解析后校验 IP 见 tools/web.py）。
+    web_fetch_allow_private: bool = False
+    # host 白名单（逗号分隔 glob）。非空时仅白名单内 host 可 fetch。
+    web_allow_hosts: str = ""
+    # host 黑名单（逗号分隔 glob），**恒优先于白名单**；
+    # 治理面策略下发的 webDeniedHosts 并进这里。
+    web_deny_hosts: str = ""
+    # 单次 web 请求超时（秒）。
+    web_timeout: int = 20
+    # 单次 fetch 字节上限，超限拒绝而非截断（截断的正文比没有更危险）。
+    web_max_bytes: int = 2_000_000
+    # 搜索返回条数上限。
+    web_search_max_results: int = 8
+
     # --- 治理面接入（M3，历史标注：此处指 M2 完成的治理接线）---
     # 空 = 未接入治理面，M0/M1 的纯本地行为一行不变。
     # 设置后：启动时拉策略收紧本机配置、模型请求走网关（客户端永不持云端密钥）、
@@ -377,6 +406,22 @@ class Config:
             wiki_enabled=_env_bool("VIBE_WIKI", cls.wiki_enabled),
             wiki_dir=_env_str("VIBE_WIKI_DIR", cls.wiki_dir),
             wiki_max_files=_env_int("VIBE_WIKI_MAX_FILES", cls.wiki_max_files),
+            # 受控联网检索（M7）：默认关 —— 会外发，必须显式开
+            web_enabled=_env_bool("VIBE_WEB", cls.web_enabled),
+            web_search_provider=_env_choice(
+                "VIBE_WEB_SEARCH", cls.web_search_provider, _WEB_SEARCH_PROVIDERS
+            ),
+            web_search_url=_env_str("VIBE_WEB_SEARCH_URL", cls.web_search_url),
+            web_fetch_allow_private=_env_bool(
+                "VIBE_WEB_ALLOW_PRIVATE", cls.web_fetch_allow_private
+            ),
+            web_allow_hosts=_env_str("VIBE_WEB_ALLOW_HOSTS", cls.web_allow_hosts),
+            web_deny_hosts=_env_str("VIBE_WEB_DENY_HOSTS", cls.web_deny_hosts),
+            web_timeout=_env_int("VIBE_WEB_TIMEOUT", cls.web_timeout),
+            web_max_bytes=_env_int("VIBE_WEB_MAX_BYTES", cls.web_max_bytes),
+            web_search_max_results=_env_int(
+                "VIBE_WEB_MAX_RESULTS", cls.web_search_max_results
+            ),
             # 治理面接入（M3）
             server_url=_env_str("VIBE_SERVER_URL", "").rstrip("/"),
             gateway_url=_env_str("VIBE_GATEWAY_URL", "").rstrip("/"),
@@ -407,6 +452,18 @@ class Config:
         if self.mcp_config:
             return Path(self.mcp_config).expanduser()
         return self.workspace / ".vibe" / "mcp.json"
+
+    @property
+    def web_search_endpoint(self) -> str:
+        """搜索的实际请求端点。searxng 形态用配置值；gateway 形态由
+        server_url 派生 `<server>/api/v1/search`（客户端零密钥，认证头由
+        governance.gateway_llm 注入）。gateway 形态且未接入治理面 → 空，
+        web_search 调用时明确报错，不静默降级。"""
+        if self.web_search_provider == "searxng":
+            return self.web_search_url
+        if self.server_url:
+            return f"{self.server_url}/api/v1/search"
+        return ""
 
     @property
     def provider(self) -> str:

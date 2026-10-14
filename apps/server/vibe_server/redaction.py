@@ -163,6 +163,61 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "diff_chars": "int",
         "message_chars": "int",
     },
+    # Git 面板写操作（M7 / B4）：全部是「用户本人在面板上点」的动作（ADR-028）。
+    # 批量路径只收条数 + 指纹；提交信息与远端报错文本只收指纹/长度（ADR-006）——
+    # 后者可能引述带凭据的远端 URL，与 web 工具的 error_digest 同口径。
+    "git.stage": {"count": "int", "paths_digest": "digest"},
+    "git.unstage": {"count": "int", "paths_digest": "digest"},
+    "git.discard": {
+        "count": "int",
+        "paths_digest": "digest",
+        "checkpoint_id": "str",
+    },
+    "git.commit": {
+        "message_digest": "digest",
+        "message_chars": "int",
+        "oid": "str",
+    },
+    "git.push": {
+        "remote": "str",
+        "branch": "str",
+        "ok": "bool",
+        "reason_digest": "digest",
+        "reason_chars": "int",
+    },
+    "git.pull": {
+        "remote": "str",
+        "branch": "str",
+        "ok": "bool",
+        "reason_digest": "digest",
+        "reason_chars": "int",
+    },
+    "git.branch": {"name": "str", "action": "str"},
+    # 联网检索（M7）：query 原文与抓取正文一个字符都不收（ADR-006）。
+    # web_search 只收 provider/计数/指纹；web_fetch 只收 host+path（query string
+    # 换 digest）、状态、字节数与内容指纹。报错文本走 error_digest+error_chars
+    # —— 异常消息会引述 URL/查询词/响应片段，与 sandbox.* / verify.run 的
+    # 机器报错同一口径（error 键在 DENIED_KEYS 里钉死，原文键名必被拒）。
+    "tool.web_search": {
+        "provider": "str",
+        "query_digest": "digest",
+        "query_chars": "int",
+        "max_results": "int",
+        "result_count": "int",
+        "error_digest": "digest",
+        "error_chars": "int",
+    },
+    "tool.web_fetch": {
+        "host": "str",
+        "path": "path",
+        "query_digest": "digest",
+        "status": "int",
+        "bytes": "int",
+        "content_digest": "digest",
+        "truncated": "bool",
+        "error_digest": "digest",
+        "error_chars": "int",
+    },
     "tool.edit_file": {
         "path": "path",
         "strategy": "str",
@@ -454,6 +509,13 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "degraded_from": "str",
     },
     "gateway.denied": {"kind": "str", "route": "str"},
+    # 搜索中转（M7）：客户端经治理面转发的一次搜索。查询词对服务端也只记
+    # 指纹 —— 服务端不做查询内容留存，与客户端 tool.web_search 同口径。
+    "web.search_relay": {
+        "query_digest": "digest",
+        "query_chars": "int",
+        "results": "int",
+    },
     # --- 策略 ---
     "policy.fetch": {"version": "int", "scope": "str"},
     "policy.rejected": {"reason": "str"},

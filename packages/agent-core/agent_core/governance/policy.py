@@ -34,6 +34,8 @@ DEFAULTS: dict[str, Any] = {
     "allowShell": True,
     "allowWrite": True,
     "autoApproveReview": False,
+    # 联网检索（M7）：默认关 —— 会外发的能力，缺字段的文档按最保守处理。
+    "allowWeb": False,
     "maxIterations": 40,
     "maxContextChars": 400_000,
     "toolOutputLimit": 40_000,
@@ -42,6 +44,7 @@ DEFAULTS: dict[str, Any] = {
     "deniedCommands": [],
     "requireApproval": [],
     "allowedModels": [],
+    "webDeniedHosts": [],
     "routing": {"allowCloud": False, "sensitiveForceLocal": True},
 }
 
@@ -50,6 +53,8 @@ _BOOL_TIGHTEN = (
     ("allowShell", "allow_shell"),
     ("allowWrite", "allow_write"),
     ("autoApproveReview", "auto_approve_review"),
+    # web_enabled 是 Config 字段，标准的「只关不开」循环即可收紧
+    ("allowWeb", "web_enabled"),
 )
 _INT_TIGHTEN = (
     ("maxIterations", "max_iterations"),
@@ -61,6 +66,7 @@ _LIST_UNION = (
     ("deniedPaths", "denied_paths"),
     ("deniedCommands", "denied_commands"),
     ("requireApproval", "require_approval"),
+    ("webDeniedHosts", "web_deny_hosts"),
 )
 
 
@@ -166,6 +172,8 @@ def apply(
             {
                 "allowCloud": False,
                 "autoApproveReview": False,
+                # 外发能力在受限模式里恒关（M7，同 allowCloud 的处理）
+                "allowWeb": False,
                 "commandTimeout": min(int(policy["commandTimeout"]), 60),
             }
         )
@@ -206,6 +214,21 @@ def apply(
             f"当前模型 {model!r} 不在策略允许清单内，云端路由不会被允许；"
             f"允许的模型：{', '.join(allowed_models)}"
         )
+
+    # --- Web 拒绝 host 名单：并集进 web_deny_hosts（M7）---
+    # 与 denied_paths 不同，它是 Config 的**逗号分隔字符串**字段，不进
+    # RuntimeConstraints —— tools/web.py 的 SSRF host 闸直接读它。
+    policy_hosts = [str(h).strip() for h in policy["webDeniedHosts"] if str(h).strip()]
+    if policy_hosts:
+        current = str(getattr(config, "web_deny_hosts", "") or "")
+        existing = [h.strip() for h in current.split(",") if h.strip()]
+        seen = {h.lower() for h in existing}
+        merged = existing + [h for h in policy_hosts if h.lower() not in seen]
+        if len(merged) != len(existing):
+            overrides["web_deny_hosts"] = ",".join(merged)
+            notes.append(
+                f"web_deny_hosts 新增 {len(merged) - len(existing)} 条来自策略的拒绝 host"
+            )
 
     new_config = replace(config, **overrides) if overrides else config
 

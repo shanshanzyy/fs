@@ -93,6 +93,7 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 | `DEFAULT_RPM` | 60 | 默认每分钟请求数上限 |
 | `CLOUD_UPSTREAM_URL` / `CLOUD_UPSTREAM_KEY_REF` | 空 | 云端上游地址 + 密钥**引用名**（不是密钥本身） |
 | `LOCAL_UPSTREAM_URL` / `LOCAL_UPSTREAM_KEY_REF` | 空 | 本地上游；不配则客户端直连本地模型，不经网关 |
+| `SEARCH_URL` | 空 | SearXNG 的 JSON 端点（如 `http://searx.internal:8080/search`）。留空 = **不提供搜索中转**（客户端 `web_search` 的 `gateway` 模式明确报错） |
 | `UPSTREAM_TIMEOUT` | 300 | 上游超时（秒） |
 | `SECRETS_PROVIDER` | `env` | 密钥托管后端：`env` / `file` / `vault`（`vault` **未验证**，见 §边界） |
 | `SECRETS_FILE` | `<DATA_DIR>/secrets.json` | `file` 后端读取的文件（JSON 对象，键=引用名，值=字符串；权限须 `600`） |
@@ -239,12 +240,18 @@ VIBE_SRV_OIDC_REDIRECT_URI=https://vibe.corp.example/api/v1/auth/oidc/callback
 > `default`）与 `derived` / `budget` 明细，便于界面显示「额度从哪来」。
 > `GET/POST /api/v1/quota/budget` 在服务层做**作用域校验**（读其他团队预算 → 403）。
 
+> **M7 新增策略字段**：`allowWeb`（BOOL，AND 合并，**默认 False** —— 默认策略最保守，
+> 客户端 `web_enabled` 随之被收紧）与 `webDeniedHosts`（LIST，**并集**合并，默认 `[]`，
+> 客户端键 `web_deny_hosts`，恒优先于白名单）。二者都进 `validate_document` 的既有约束
+> （非空字符串、无换行、条数上限）；**stale 受限模式里 `allowWeb` 恒 False**（同 `allowCloud`）。
+
 ### 模型网关
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/api/v1/gateway/models` | `gateway:use` | 可用模型（受策略白名单约束） |
 | POST | `/api/v1/gateway/v1/chat/completions` | `gateway:use` | OpenAI 兼容代理：路由 → 配额 → 注入密钥 → 上游 |
+| POST | `/api/v1/search` | `gateway:use` | **搜索中转（M7）**：转调服务端 `SEARCH_URL`（SearXNG JSON），客户端**零密钥**；未配上游 / 不可达 / 非 JSON → 502，**不静默降级** |
 
 > 客户端**永不持有**云端 API Key。密钥在网关注入，客户端只拿短期 token。
 
@@ -475,7 +482,7 @@ cd apps/server
 python -m unittest discover -s tests -t .
 ```
 
-383 个用例，分十九组（其中 25 条 skip —— 2 条按平台跳过（Windows 上没有可用的 `echo`），
+420 个用例，分二十组（其中 25 条 skip —— 2 条按平台跳过（Windows 上没有可用的 `echo`），
 23 条为 **PG 契约用例**：仅在设了 `VIBE_SRV_TEST_PG_DSN` 指向真实可清空的 PG 时才跑，
 否则按「环境相关 skip」处理，默认 hermetic 不受影响）：
 
@@ -488,7 +495,7 @@ python -m unittest discover -s tests -t .
 | `test_quota.py` | 31 | 预留-结算-释放、**20 线程并发抢配额**（TOCTOU）、跨天重置、限流、作用域 |
 | `test_quota_derive.py` | 29 | 预算→每日额度**推导数学**（单价换算 / 窗口 / 成员分摊 / 向下取整 / 0 与负值）、**解析链显式恒优先**（含 `0=不限`）、推导额度被 `reserve` 真拦住、`status()` 来源标注、`GET/POST /api/v1/quota/budget` 的权限与作用域（越权 403） |
 | `test_redaction.py` | 32 | 键黑/白名单、值形状拒码、摘要、整条拒收 |
-| `test_policy.py` | 43 | 只收紧、**交换律（6 个排列同一 etag）**、`sensitiveForceLocal` 拒收、客户端映射、过期降级 |
+| `test_policy.py` | 51 | 只收紧、**交换律（6 个排列同一 etag）**、`sensitiveForceLocal` 拒收、客户端映射、过期降级、**M7 `allowWeb`/`webDeniedHosts` 合并与默认最保守** |
 | `test_cli_bootstrap.py` | 11 | CLI 首跑链路：`bootstrap` 且**用签出的令牌真的注册一个开发者**；`invite` 的权限（口令错误 / 账号不存在均返回 1）、批量签发互异、`--role`/`--uses` 语义、缺凭据返回 2 |
 | `test_oidc.py` | 7 | 假 IdP 上走完 begin → callback → `/auth/me`；PKCE 与 client_secret 真被核验；state 重放 / nonce 不符 / 邮箱未验证 / IdP 自称 owner 全被拒 |
 | `test_gateway_stream.py` | 16 | 流式透传 SSE（HTTP 层不再被 `stream=true` 拦下）、流式下的配额结算、`X-Vibe-Route-*` 与非流式一致、降级与失败路径 |
@@ -500,6 +507,7 @@ python -m unittest discover -s tests -t .
 | `test_store_contract.py` | 23（+23 PG skip） | **Store 契约双后端对拍**：同一批断言在 SQLite 全量跑、PG（`VIBE_SRV_TEST_PG_DSN`）**同批跑**。覆盖用户 / 团队 / 成员 / bootstrap 单语句原子、项目授权、设备刷新令牌、注册令牌占用、**配额原子预留（含 24 线程并发不超发）** / 结算 / 释放、固定窗口限流、配额与预算策略、审计幂等 + 链头/会话尾/批次顺序、吊销清理、密钥台账、认证事件 |
 | `test_config_multi_instance.py` | 13 | 多实例意图判定（共享 URL / 开关）、**默认单机逐字节不变**（仍自动落 `jwt.key`）、三门槛校验（缺 `JWT_SECRET` / 过短、拒 SQLite、必须 `REQUIRE_TLS`、必须 `TRUST_FORWARDED_FOR`）、`open_store` 分派（**PG 不静默退回 SQLite**、未知 scheme 报错）、`doctor` 单机无「多实例」行 / 多实例就绪时输出就绪行 |
 | `test_migrate.py` | 7 | SQLite→PG 迁移：`--dry-run` 只统计源、round-trip 计数一致、**重跑幂等**、审计事件按 `seq` 顺序搬、缺表计数为 0、CLI 缺源 / 缺 DSN 返回 1 |
+| `test_search.py` | 13 | **搜索中转（M7）**：结果字段白名单清洗、上游收到 `q`/`format=json`、`maxResults` 上限 20、需认证、未配上游 / 不可达 / 上游报错 / 非 JSON / 无 `results` 数组 → 502、空 query 与超长 query 拒 400、**审计只记 `query_digest`**、上游失败不写审计 |
 
 > 这组测试的价值不只在「通过」：写它们的时候抓出并修掉了四个真缺陷 ——
 > 外发扫描漏判明文口令与带凭据的连接串、十六进制摘要只认小写（会**永久丢审计**）、

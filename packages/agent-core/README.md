@@ -385,6 +385,31 @@ markdown（总览 README + 每模块一页），是给**人**看、可提交进�
   （**元数据，无正文**）。
 - **不在只读面**：`repo_wiki` **不进** `build_readonly_registry()`（子 Agent 恒只读，不写盘）。
 
+### 受控联网检索（M7，见 ADR-027）
+
+两个新内置工具 `web_search` / `web_fetch`，**默认关闭**（`web_enabled=False` 时工具注册表、
+对话行为与审计流与 M6 收口**逐字节一致**）。
+
+| 环境变量 | `Config` 字段 | 默认 | 作用 | 缺失 / 关闭时的行为 |
+|---|---|---|---|---|
+| `VIBE_WEB`（M7） | `web_enabled` | `false` | 总开关：是否注册 `web_search` / `web_fetch` | `0`/未设 = **关闭**：不注册两个工具，清单逐字节不变 |
+| `VIBE_WEB_SEARCH`（M7） | `web_search_provider` | `gateway` | 搜索形态：`gateway`（治理面中转）/ `searxng`（内网自部署 JSON） | 非法值**启动前报错** |
+| `VIBE_WEB_SEARCH_URL`（M7） | `web_search_url` | `""` | searxng 的 JSON 端点（gateway 模式忽略，由 `server_url` 派生 `<server>/api/v1/search`） | 空且 searxng 模式 → 调用时明确报错 |
+| `VIBE_WEB_ALLOW_PRIVATE`（M7） | `web_fetch_allow_private` | `false` | 允许 fetch 私网 / 环回地址 | 未设 = 仅公网 |
+| `VIBE_WEB_ALLOW_HOSTS`（M7） | `web_allow_hosts` | `""` | 逗号分隔 glob 白名单 | 非空时仅白名单内 host 可 fetch |
+| `VIBE_WEB_DENY_HOSTS`（M7） | `web_deny_hosts` | `""` | 逗号分隔 glob 黑名单（**恒优先**；策略下发项并进这里） | —— |
+| `VIBE_WEB_TIMEOUT`（M7） | `web_timeout` | `20` | 单次请求超时（秒） | —— |
+| `VIBE_WEB_MAX_BYTES`（M7） | `web_max_bytes` | `2000000` | 单次 fetch 字节上限（**超限拒绝，不截断**） | —— |
+| `VIBE_WEB_MAX_RESULTS`（M7） | `web_search_max_results` | `8` | 搜索返回条数上限 | —— |
+
+**三条纪律**（ADR-027）：**恒 `Risk.REVIEW`、不可配置放行**（审批浮层 = 外发内容人工确认闸门）；
+结果恒 `wrap_untrusted`（取回正文是注入面）；`query`/正文上传只留 `*_digest + *_chars`
+（URL 只上传 host + path，query string 换 digest）。**SSRF 六步防护**：协议白名单 → host 名单
+（deny 优先）→ **DNS 解析后校验 IP** → 重定向逐跳重跑（≤3 跳）→ Content-Type 白名单 + 字节上限
+→ 按 charset 解码（多字节切点按字符回退）。**不进 `build_readonly_registry()`**（子 Agent 恒不联网）。
+
+**零依赖**：`urllib.request` + `socket.getaddrinfo` + `html.parser`，不引 requests/httpx/bs4。
+
 ---
 
 ## 代码地图
@@ -629,7 +654,7 @@ cd packages/agent-core
 python -m unittest discover -s tests -t .
 ```
 
-782 个用例（780 通过 / 2 跳过：ConPTY 与符号链接各一，均为本机环境相关）；下表挑出价值最高的几组：
+856 个用例（854 通过 / 2 跳过：ConPTY 与符号链接各一，均为本机环境相关；98 个子测试）；下表挑出价值最高的几组：
 
 | 文件 | 覆盖内容 |
 |---|---|
@@ -706,7 +731,7 @@ def _preview(ctx, args) -> ToolPreview:
 
 **注意**：工具数量要克制。工具越多，弱模型的选错率越高。当前 12 个内置工具已覆盖
 「看懂 → 定位 → 修改 → 验证」全部动作，没有为了"看起来强"而凑数的工具
-（`remember` / `task` / `lsp_diagnostics` / `mcp__*` 属**条件注册**，不配置时不出现）。
+（`remember` / `task` / `lsp_diagnostics` / `mcp__*` / `web_search` / `web_fetch` 属**条件注册**，不配置时不出现）。
 
 ---
 
@@ -715,7 +740,8 @@ def _preview(ctx, args) -> ToolPreview:
 已经做完的：**M0（CLI 闭环）**、**M1（桌面客户端）**、**M1.5（效果与体验补全）**、
 **M2（服务端治理面，且已接进 CLI 与桌面端）**、**M3（多 Agent 编排，主从只读子 Agent）**，
 以及 M6 系列能力（编辑面 / 语言服务器 / 计划视图 / 上下文窗口 / 增量索引 / 外部 MCP /
-交互式终端 / 多模态图片 / 规则与记忆 / 网页自检 / 多租户运营落地）。
+交互式终端 / 多模态图片 / 规则与记忆 / 网页自检 / 多租户运营落地），
+**M7（受控联网检索 `web_search`/`web_fetch` + Git 写操作面板）**。
 
 尚未做的：
 

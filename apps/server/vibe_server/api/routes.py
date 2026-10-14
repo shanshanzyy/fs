@@ -16,9 +16,11 @@ from http import HTTPStatus
 from typing import Any
 
 from .. import rbac, redaction
-from ..errors import BadRequest, Forbidden, NotFound
+from ..errors import ApiError, BadRequest, Forbidden, NotFound
 from ..gateway import proxy
+from ..gateway.search import MAX_QUERY_CHARS, MAX_RESULTS_CAP, searxng_search
 from ..gateway.secrets import fingerprint as secret_fingerprint
+from ..hashing import fingerprint
 from ..httpd import (
     AUTH_OPTIONAL,
     AUTH_PUBLIC,
@@ -516,6 +518,42 @@ def register_gateway(router: Router) -> None:
             content_type="application/json; charset=utf-8",
             headers=headers,
         )
+
+    @router.post(API + "/search", permissions=(rbac.PERM_GATEWAY_USE,))
+    def search_relay(request: Request) -> Response:
+        """搜索中转（M7）：客户端零密钥，搜索上游只活在服务端。
+
+        认证与 LLM 网关同源（JWT + gateway:use）。查询词在服务端也只记
+        指纹 —— 服务端不做查询内容留存，与客户端 tool.web_search 同口径。
+        未配置上游 / 上游不可达都明确回 502，不静默降级。
+        """
+        body = _obj(request)
+        query = _str_field(body, "query").strip()
+        if not query:
+            raise BadRequest("缺少 query")
+        if len(query) > MAX_QUERY_CHARS:
+            raise BadRequest(f"查询词过长（上限 {MAX_QUERY_CHARS} 字符）")
+        max_results = min(max(1, _int_field(body, "maxResults", 8)), MAX_RESULTS_CAP)
+
+        search_url = request.app.config.search_url
+        if not search_url:
+            raise ApiError(
+                502, "search_upstream_error", "服务端未配置搜索上游（VIBE_SRV_SEARCH_URL）"
+            )
+
+        results = searxng_search(search_url, query, max_results)
+
+        request.app.audit_recorder(
+            actor=request.actor,
+            device_id=request.actor.device_id,
+            event_type="web.search_relay",
+            payload={
+                "query_digest": fingerprint(query),
+                "query_chars": len(query),
+                "results": len(results),
+            },
+        )
+        return Response.json({"results": results})
 
 
 def _parse_paths(raw: str) -> tuple[str, ...]:

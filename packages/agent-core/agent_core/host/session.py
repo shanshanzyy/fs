@@ -38,6 +38,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .. import gitinfo
 from ..audit import digest, record_session_end, record_session_start, verify_chain
 from ..config import Config
 from ..context import build_refs_prompt
@@ -81,7 +82,14 @@ from ..terminal.manager import (
     get_manager as get_terminal_manager,
 )
 from ..testing import collect as collect_tests, run as run_tests
-from ..tools import ToolRegistry, ToolResult, ToolPreview, build_default_registry
+from ..tools import (
+    WEB_FETCH_SPEC,
+    WEB_SEARCH_SPEC,
+    ToolRegistry,
+    ToolResult,
+    ToolPreview,
+    build_default_registry,
+)
 from ..tools.plan import PLAN_STATUSES
 from ..governance.client import GovernanceClient, GovernanceError
 from ..governance.credentials import CredentialStore
@@ -271,6 +279,8 @@ class Session:
             # 子 Agent（M3）：默认关 —— 不配置时工具清单逐字节不变。
             # 显式传是因为 host 侧自建 registry，绕过 Agent 的默认注册调用。
             subagent=config.subagent_enabled,
+            # 联网检索（M7）：默认关；恒 REVIEW + 结果 wrap_untrusted（tools/web.py）。
+            web=config.web_enabled,
         )
         self.approval_timeout = approval_timeout
         self._client = client  # resume 重建 Agent 时要用同一个客户端
@@ -967,6 +977,147 @@ class Session:
             "notice": note,
         }
 
+    # ------------------------------------------------------------------ Git（B3/B4/B5）
+    # 全部是「用户本人在 Git 面板上点」的动作（ADR-028：Git 写操作 = 用户本人
+    # 动作），与 Agent 通道彻底隔离：不给 Agent 加任何 git 写工具，也不进审批
+    # 浮层。固定 argv + shell=False + scrub_env 的纪律由 gitinfo 统一保证。
+    # 破坏性动作（discard）强制前置检查点，误丢的工作可从检查点面板找回。
+    def _git_root(self) -> Path:
+        return self.agent.config.workspace
+
+    def _git_guard_idle(self, action: str) -> None:
+        """Git 写操作与编辑面同口径：任务执行中一律 409，避免与 Agent 写盘争用。"""
+        with self._lock:
+            if self._state != P.STATE_IDLE:
+                raise BusyError(f"任务执行中，无法{action}，请等任务结束或先中断")
+
+    def _git_rel_paths(self, raw_paths: Any) -> list[str]:
+        """把前端给的相对路径逐个过 PathGuard 写校验。
+
+        越界 / 敏感 / `.vibe` 内一律抛 `SandboxViolation`（调用方转 400）——
+        与 `check_write` 同一口径，杜绝「借 git 动作绕过写保护」。
+        """
+        if raw_paths is None:
+            return []
+        if not isinstance(raw_paths, list):
+            raise ValueError("paths 必须是数组")
+        paths = self.agent.paths
+        out: list[str] = []
+        for raw in raw_paths:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            out.append(paths.relative(paths.check_write(text)))
+        return out
+
+    @staticmethod
+    def _git_paths_digest(rels: list[str]) -> str:
+        # 批量路径只上传「条数 + 指纹」（ADR-006）：路径本身可能含业务名词。
+        return digest("\n".join(sorted(rels)))
+
+    def git_stage(self, paths: Any = None, all: bool = False) -> dict[str, Any]:
+        self._git_guard_idle("暂存改动")
+        rels = self._git_rel_paths(paths)
+        result = gitinfo.stage(self._git_root(), rels, all=bool(all))
+        self.agent.audit.record(
+            "git.stage", count=len(rels), paths_digest=self._git_paths_digest(rels)
+        )
+        return result
+
+    def git_unstage(self, paths: Any = None, all: bool = False) -> dict[str, Any]:
+        self._git_guard_idle("取消暂存")
+        rels = self._git_rel_paths(paths)
+        result = gitinfo.unstage(self._git_root(), rels, all=bool(all))
+        self.agent.audit.record(
+            "git.unstage", count=len(rels), paths_digest=self._git_paths_digest(rels)
+        )
+        return result
+
+    def git_discard(self, paths: Any = None) -> dict[str, Any]:
+        """放弃改动（破坏性）：**先落检查点再执行**（B5）。
+
+        检查点快照失败必须让本次 discard 失败 —— 「不能回滚的破坏性动作宁可不
+        发生」（与审批闸门 / 检查点写入同一失效安全哲学）。
+        """
+        self._git_guard_idle("放弃改动")
+        rels = self._git_rel_paths(paths)
+        if not rels:
+            raise ValueError("paths 不能为空")
+
+        paths_guard = self.agent.paths
+        self.agent.checkpoints.begin()
+        for rel in rels:
+            self.agent.ctx.snapshot_before(paths_guard.check_write(rel), rel)
+        result = gitinfo.discard(self._git_root(), rels)
+        info = self.agent.checkpoints.commit(prompt_digest=self._git_paths_digest(rels))
+        checkpoint_id = info.id if info is not None else ""
+        self.agent.audit.record(
+            "git.discard",
+            count=len(rels),
+            paths_digest=self._git_paths_digest(rels),
+            checkpoint_id=checkpoint_id,
+        )
+        if result.get("ok"):
+            note = f"已放弃 {len(rels)} 个文件的改动（检查点 {checkpoint_id or '无'}，可回滚）"
+            self._record_notice(note)
+            self.bus.publish(P.event(P.RUN_NOTICE, runId=self.run_id, text=note))
+        return {**result, "checkpointId": checkpoint_id}
+
+    def git_commit(self, message: str) -> dict[str, Any]:
+        self._git_guard_idle("提交")
+        text = str(message or "")
+        if not text.strip():
+            raise ValueError("提交信息不能为空")
+        # message 是用户手打的，可能在描述里复述敏感细节 —— 本地存原文、上传只留指纹
+        result = gitinfo.commit(self._git_root(), text)
+        self.agent.audit.record(
+            "git.commit", message=text, oid=str(result.get("oid") or "")
+        )
+        return result
+
+    def git_push(self) -> dict[str, Any]:
+        self._git_guard_idle("推送")
+        root = self._git_root()
+        state = gitinfo.status(root)
+        result = gitinfo.push(root)
+        # 远端错误文本（stderr 首行）可能引述带凭据的远端 URL —— 与 web 工具同口径，
+        # 本地存原文、上传只留指纹（ADR-006）。
+        self.agent.audit.record(
+            "git.push",
+            remote=str(state.get("upstream") or ""),
+            branch=str(state.get("branch") or ""),
+            ok=bool(result.get("ok")),
+            reason=str(result.get("reason") or ""),
+        )
+        return result
+
+    def git_pull(self) -> dict[str, Any]:
+        self._git_guard_idle("拉取")
+        root = self._git_root()
+        state = gitinfo.status(root)
+        result = gitinfo.pull_ff(root)
+        self.agent.audit.record(
+            "git.pull",
+            remote=str(state.get("upstream") or ""),
+            branch=str(state.get("branch") or ""),
+            ok=bool(result.get("ok")),
+            reason=str(result.get("reason") or ""),
+        )
+        return result
+
+    def git_branch(self, name: str, action: str) -> dict[str, Any]:
+        self._git_guard_idle("切换分支")
+        text = str(name or "").strip()
+        act = str(action or "").strip().lower()
+        if act == "create":
+            result = gitinfo.branch_create(self._git_root(), text)
+        elif act == "switch":
+            result = gitinfo.branch_switch(self._git_root(), text)
+        else:
+            raise ValueError("action 只能是 create 或 switch")
+        self.agent.audit.record("git.branch", name=text, action=act)
+        return result
+
     # ------------------------------------------------------------------ 编辑面（D）
     def _ensure_write_enabled(self) -> None:
         if not self.agent.config.allow_write:
@@ -1310,6 +1461,27 @@ class Session:
         if servers:
             merge_mcp(self.registry, servers, audit=self.agent.audit, manager=manager)
         return self.mcp_status()
+
+    def web_reload(self) -> None:
+        """联网开关热切换（M7）：按当前 config 摘掉 / 并入 web 工具。
+
+        `apply_settings` 保存 webEnabled 时调用 —— 关→摘除、开→并入，
+        与 `mcp_reload` 同一范式（区别：web 工具是内置 spec，无外部进程）。
+        同时把 `agent.ctx.config` 换成新 Config 对象：其余 web 字段
+        （host 名单 / 超时 / 上限 / allow_private）不增删工具，工具执行时
+        从 `ctx.config` 读 —— 引用一换即热生效，无需重建会话。
+
+        工具面纪律不变：web 工具恒 REVIEW、不进只读面、结果 wrap_untrusted
+        （见 tools/web.py 文档），本方法只做清单增删，不改任何行为面。
+        """
+        config = self.agent.config
+        self.agent.ctx.config = config
+        for name in ("web_search", "web_fetch"):
+            if name in self.registry.names():
+                self.registry.unregister(name)
+        if config.web_enabled:
+            self.registry.register(WEB_SEARCH_SPEC)
+            self.registry.register(WEB_FETCH_SPEC)
 
     def _mcp_write_guard(self) -> None:
         """MCP 管理写入的前置闸门：未启用 400、执行中 409、治理面接管 400。

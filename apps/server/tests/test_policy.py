@@ -293,6 +293,71 @@ class ClientMappingTests(unittest.TestCase):
         self.assertTrue(client["allow_cloud"], "原地改掉了调用方的字典")
 
 
+class WebPolicyTests(unittest.TestCase):
+    """联网检索策略（M7）：allowWeb + webDeniedHosts。
+
+    与 allowCloud 同一纪律：BOOL 用 AND（默认最保守）、LIST 并集、
+    过期恒关。区别在客户端表达 —— `web_deny_hosts` 是**逗号分隔字符串**
+    （见 config.py），并集时必须按 glob 项而非字符处理。
+    """
+
+    def test_default_is_most_conservative(self) -> None:
+        self.assertFalse(DEFAULT_POLICY["allowWeb"], "默认策略不该默认放开联网")
+        self.assertEqual(DEFAULT_POLICY["webDeniedHosts"], [])
+
+    def test_allow_web_uses_and(self) -> None:
+        merged = merge_documents([{"allowWeb": True}, {"allowWeb": False}])
+        self.assertFalse(merged["allowWeb"], "任一层说不许就是不许")
+        both_on = merge_documents([{"allowWeb": True}, {"allowWeb": True}])
+        self.assertTrue(both_on["allowWeb"])
+
+    def test_denied_hosts_use_union(self) -> None:
+        merged = merge_documents(
+            [{"webDeniedHosts": ["a.test"]}, {"webDeniedHosts": ["b.test"]}]
+        )
+        self.assertEqual(set(merged["webDeniedHosts"]), {"a.test", "b.test"})
+
+    def test_validate_requires_boolean_allow_web(self) -> None:
+        self.assertFalse(validate_document({"allowWeb": False})["allowWeb"])
+        with self.assertRaises(BadRequest):
+            validate_document({"allowWeb": "yes"})
+
+    def test_apply_writes_web_enabled_when_client_lacks_it(self) -> None:
+        """客户端没这个字段时要显式写进去 —— 否则客户端用默认值，策略形同虚设。"""
+        effective, _ = apply_to_client_config({"allowWeb": False}, client={}, stale=False)
+        self.assertIs(effective["web_enabled"], False)
+
+    def test_apply_unions_denied_hosts_into_comma_string(self) -> None:
+        """策略下发的拒绝 host 必须并进客户端已有的逗号串，且不拆字符。"""
+        effective, notes = apply_to_client_config(
+            {"webDeniedHosts": ["evil.test", "meta.internal"]},
+            client={"web_deny_hosts": "mine.test"},
+            stale=False,
+        )
+        hosts = [h.strip() for h in effective["web_deny_hosts"].split(",") if h.strip()]
+        self.assertEqual(set(hosts), {"mine.test", "evil.test", "meta.internal"})
+        self.assertTrue(any("web_deny_hosts" in n for n in notes))
+
+    def test_apply_denied_hosts_dedupes_case_insensitively(self) -> None:
+        effective, _ = apply_to_client_config(
+            {"webDeniedHosts": ["EVIL.test"]},
+            client={"web_deny_hosts": "evil.test"},
+            stale=False,
+        )
+        self.assertEqual(effective["web_deny_hosts"], "evil.test")
+
+    def test_stale_forces_web_off(self) -> None:
+        """过期策略降级：allowWeb 恒 False，哪怕文档写 true。"""
+        effective, notes = apply_to_client_config(
+            {"allowWeb": True},
+            client={"web_enabled": True},
+            stale=True,
+            max_staleness=3600,
+        )
+        self.assertFalse(effective["web_enabled"])
+        self.assertTrue(any("受限模式" in n for n in notes))
+
+
 class PolicyServiceTests(TempDirTestCase):
     def setUp(self) -> None:
         super().setUp()

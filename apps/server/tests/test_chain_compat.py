@@ -163,6 +163,7 @@ class VocabularyContractTests(unittest.TestCase):
         server_side = {
             "gateway.request", "gateway.response", "gateway.denied",
             "policy.fetch", "policy.rejected",
+            "web.search_relay",   # 搜索中转（M7）：服务端自己产生，无客户端调用点
         }
         # 目前没有「客户端已实现但尚未接线」的事件，故集合留空；
         # 若将来有，在此登记，避免上面那条反向检查把未接线误报为漂移。
@@ -290,7 +291,10 @@ class EndToEndHeadAgreementTests(TempDirTestCase):
             entry = dict(sample)
             entry["seq"] = index
             entry["session"] = session
-            entry["ts"] = "2026-09-24T10:00:%02d" % index
+            # 秒位只有 0–59：样本数一旦超过 59，`%02d` 会造出 "10:00:60" 这种
+            # 非法时间 → 两端解析失败 → ts 回退成 0 → 服务端把 0 当空值换成 now，
+            # 链头当场分叉。用 divmod 进位到分钟，样本再多也合法。
+            entry["ts"] = "2026-09-24T10:%02d:%02d" % divmod(index, 60)
             entries.append(entry)
         return entries
 
@@ -767,6 +771,34 @@ def _sample_locals() -> dict[str, dict]:
             "hits": 5,
             "backend": "lexical",
         },
+        # 联网检索（M7）：字段形状取自 tools/web.py 的 ctx.audit.record 调用点。
+        # query / error 原文在本地日志可读，上传前被词汇表规则 drop。
+        "tool.web_search": {
+            "event": "tool.web_search",
+            "provider": "searxng",
+            "query": "python asyncio 教程",
+            "query_chars": 16,
+            "query_digest": "a1b2c3d4e5f60718",
+            "max_results": 8,
+            "result_count": 5,
+            "error": "",
+            "error_digest": "e3b0c44298fc1c14",
+            "error_chars": 0,
+        },
+        "tool.web_fetch": {
+            "event": "tool.web_fetch",
+            "url": "https://example.com/docs?page=2",
+            "host": "example.com",
+            "path": "/docs",
+            "query_digest": "9f8e7d6c5b4a3021",
+            "status": 200,
+            "bytes": 4096,
+            "content_digest": "1a2b3c4d5e6f7081",
+            "truncated": False,
+            "error": "",
+            "error_digest": "e3b0c44298fc1c14",
+            "error_chars": 0,
+        },
         "index.rebuild": {
             "event": "index.rebuild",
             "added": 1,
@@ -801,6 +833,48 @@ def _sample_locals() -> dict[str, dict]:
             "removed": 3,
             "diff": "diff --git a/src/main.py b/src/main.py\n+import os\n",
             "message_chars": 68,
+        },
+        # Git 面板写操作（M7 / B4）：形状取自 host/session.py 的 audit.record 调用点。
+        # message / reason 原文在本地可读，上传前被词汇表规则 drop（ADR-006）。
+        "git.stage": {
+            "event": "git.stage",
+            "count": 3,
+            "paths_digest": "a1b2c3d4e5f60718",
+        },
+        "git.unstage": {
+            "event": "git.unstage",
+            "count": 1,
+            "paths_digest": "b2c3d4e5f6071829",
+        },
+        "git.discard": {
+            "event": "git.discard",
+            "count": 2,
+            "paths_digest": "c3d4e5f607182930",
+            "checkpoint_id": "cp-20261013-abcdef",
+        },
+        "git.commit": {
+            "event": "git.commit",
+            "message": "fix: 修复登录跳转",
+            "oid": "1a2b3c4",
+        },
+        "git.push": {
+            "event": "git.push",
+            "remote": "origin/main",
+            "branch": "main",
+            "ok": True,
+            "reason": "",
+        },
+        "git.pull": {
+            "event": "git.pull",
+            "remote": "origin/main",
+            "branch": "main",
+            "ok": False,
+            "reason": "fatal: Not possible to fast-forward, aborting.",
+        },
+        "git.branch": {
+            "event": "git.branch",
+            "name": "feature/login",
+            "action": "create",
         },
         "tool.edit_file": {
             "event": "tool.edit_file",

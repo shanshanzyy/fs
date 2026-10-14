@@ -178,6 +178,11 @@ class ServerConfig:
     # 上游请求超时。推理请求天然慢，默认给足
     upstream_timeout: int = 300
 
+    # --- 搜索上游（M7）---
+    # SearXNG 的 JSON 端点（如 http://searx.internal:8080/search）。
+    # 留空 = 治理面不提供搜索中转，客户端 web_search 的 gateway 模式会明确报错。
+    search_url: str = ""
+
     # --- 配额默认值（0 表示不限）---
     default_daily_cloud_tokens: int = 200_000
     default_daily_requests: int = 0
@@ -259,6 +264,7 @@ class ServerConfig:
             cloud_upstream_url=_str("CLOUD_UPSTREAM_URL", cls.cloud_upstream_url),
             cloud_upstream_key_ref=_str("CLOUD_UPSTREAM_KEY_REF", cls.cloud_upstream_key_ref),
             upstream_timeout=_int("UPSTREAM_TIMEOUT", cls.upstream_timeout),
+            search_url=_str("SEARCH_URL", cls.search_url),
             default_daily_cloud_tokens=_int(
                 "DEFAULT_DAILY_CLOUD_TOKENS", cls.default_daily_cloud_tokens
             ),

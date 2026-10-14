@@ -2842,27 +2842,36 @@ const GIT_STATUS_LABEL = { M: '修改', A: '新增', D: '删除', R: '改名', C
 
 async function refreshGit() {
   try {
-    const data = await api.get('/api/git/status');
+    // 分支清单与状态并行取；分支取不到（网络抖动）不该把整面板打红，故 catch 成 null。
+    const [data, branches] = await Promise.all([
+      api.get('/api/git/status'),
+      api.get('/api/git/branches').catch(() => null),
+    ]);
     S.git = data;
-    renderGitPanel(data);
+    renderGitPanel(data, branches);
   } catch (err) {
     $('git-head').replaceChildren(el('div', 'empty', `读取 git 状态失败：${err.message}`));
   }
 }
 
-function renderGitPanel(data) {
+function renderGitPanel(data, branches) {
   const head = $('git-head');
-  const btn = $('btn-commit-msg');
+  const toolbar = $('git-toolbar');
+  const commitbar = $('git-commitbar');
   if (!data || !data.available) {
-    btn.disabled = true;
-    $('git-msg').hidden = true;
+    // 关闭态：工具栏与提交条整体隐藏 —— 不留任何点不动的交互件（DoD：状态为空 ⟺ 不可见）
+    toolbar.hidden = true;
+    commitbar.hidden = true;
     head.replaceChildren(el('div', 'empty', (data && data.reason) || '当前工作区不是 git 仓库。'));
-    $('git-list').replaceChildren(el('div', 'empty', '初始化 git 仓库后可在这里查看改动、起草提交信息。'));
-    $('badge-git').textContent = '0';
-    $('badge-git').classList.remove('has');
+    $('git-staged').replaceChildren(el('div', 'empty', ''));
+    $('git-unstaged').replaceChildren(el('div', 'empty', ''));
+    setGitBadge('badge-git-staged', 0);
+    setGitBadge('badge-git', 0);
     return;
   }
-  btn.disabled = false;
+  toolbar.hidden = false;
+  commitbar.hidden = false;
+
   const branch = el('span', 'git-branch',
     data.detached ? `@ ${data.branch || 'HEAD'}（游离头）` : (data.branch || '（未知分支）'));
   head.replaceChildren(branch);
@@ -2870,6 +2879,7 @@ function renderGitPanel(data) {
   if (data.upstream) {
     const ahead = data.ahead || 0;
     const behind = data.behind || 0;
+    // 徽标直接用 status() 已有的 ahead/behind，不额外算
     sub.textContent = `${data.upstream}${ahead || behind ? `（↑${ahead} ↓${behind}）` : ''}`;
   } else {
     sub.textContent = data.unborn ? '还没有任何提交' : '无上游分支';
@@ -2881,11 +2891,182 @@ function renderGitPanel(data) {
   if (conflictPaths.length) {
     head.appendChild(el('span', 'git-sub git-conflict', `⚠ ${conflictPaths.length} 个文件处于冲突状态，需先解决`));
   }
-  renderGitEntries($('git-list'), data);
-  const n = (data.entries || []).length;
-  const badge = $('badge-git');
+
+  fillBranchSelect(branches, data);
+
+  // 双栏：冲突单独成组（动作禁用）；其余按「已 stage / 未 stage」分。
+  // 一个文件既 stage 又在工作区改过时会同时出现在两栏（与 VS Code 一致）。
+  const entries = data.entries || [];
+  const conflicted = entries.filter((e) => e.conflicted);
+  const rest = entries.filter((e) => !e.conflicted);
+  const staged = rest.filter(gitIsStaged);
+  const unstaged = rest.filter(gitIsUnstaged).concat(conflicted);
+
+  renderGitRows($('git-staged'), staged, 'staged');
+  renderGitRows($('git-unstaged'), unstaged, 'unstaged');
+  setGitBadge('badge-git-staged', staged.length);
+  setGitBadge('badge-git', unstaged.length);
+  $('btn-git-unstage-all').hidden = staged.length === 0;
+  $('btn-git-stage-all').hidden = !unstaged.some((e) => !e.conflicted);
+}
+
+function setGitBadge(id, n) {
+  const badge = $(id);
   badge.textContent = n;
   badge.classList.toggle('has', n > 0);
+}
+
+/** 已进入索引（index 位不是空格/问号）—— 暂存栏的依据。 */
+function gitIsStaged(entry) {
+  return !!entry.index && entry.index !== ' ' && entry.index !== '?';
+}
+
+/** 工作区有改动或未跟踪 —— 工作区栏的依据。 */
+function gitIsUnstaged(entry) {
+  return entry.status === '??'
+    || (!!entry.worktree && entry.worktree !== ' ' && entry.worktree !== '?');
+}
+
+function fillBranchSelect(branches, data) {
+  const sel = $('git-branch-select');
+  if (!branches || !branches.available) {
+    sel.disabled = true;
+    sel.replaceChildren();
+    return;
+  }
+  sel.disabled = false;
+  // 只列本地分支：远端分支拿来 switch 会进 detached，不是这里想给的语义
+  const locals = (branches.branches || []).filter((b) => b.kind !== 'remote');
+  const opts = locals.map((b) => {
+    const o = document.createElement('option');
+    o.value = b.name;
+    o.textContent = b.current ? `${b.name}（当前）` : b.name;
+    o.selected = !!b.current || (!data.detached && b.name === data.branch);
+    return o;
+  });
+  if (!opts.length) {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = data.branch || '（未知分支）';
+    o.selected = true;
+    opts.push(o);
+  }
+  sel.replaceChildren(...opts);
+}
+
+function renderGitRows(host, entries, kind) {
+  host.replaceChildren();
+  if (!entries.length) {
+    host.appendChild(el('div', 'empty', kind === 'staged' ? '暂存区是空的。' : '工作区干净。'));
+    return;
+  }
+  for (const entry of entries) host.appendChild(gitRow(entry, kind));
+}
+
+/** 一行改动：状态码 + 路径 + （stage/unstage/放弃）动作。冲突行禁用动作。 */
+function gitRow(entry, kind) {
+  const row = el('div', 'git-row' + (entry.conflicted ? ' is-conflict' : ''));
+  const meta = el('span', 'change-meta');
+  const code = el('span', 'git-code', entry.status);
+  code.dataset.c = entry.status;
+  meta.appendChild(code);
+  meta.appendChild(el('span', 'git-file', entry.path));
+  meta.title = '点击查看 diff';
+  meta.addEventListener('click', () => {
+    // 未跟踪文件没有 diff 可看 —— 直接看文件本身，别给用户一个空标签
+    if (entry.status === '??') { openFile(entry.path); return; }
+    openGitDiffTab(entry.path);
+  });
+  row.appendChild(meta);
+  if (entry.conflicted) {
+    row.appendChild(el('span', 'git-conflict-hint', '需在终端解决冲突'));
+    return row;
+  }
+  const acts = el('span', 'git-row-actions');
+  const act = (label, title, fn) => {
+    const b = el('button', 'icon-btn', label);
+    b.type = 'button';
+    b.title = title;
+    b.addEventListener('click', (event) => { event.stopPropagation(); fn(); });
+    return b;
+  };
+  if (kind === 'staged') acts.appendChild(act('−', '取消暂存', () => gitUnstage([entry.path])));
+  else acts.appendChild(act('＋', '暂存', () => gitStage([entry.path])));
+  acts.appendChild(act('⤺', '放弃改动（放弃前先落检查点，可从「回滚」面板找回）', () => gitDiscard([entry.path])));
+  row.appendChild(acts);
+  return row;
+}
+
+/** Git 写操作统一入口（ADR-028：用户本人动作，不过审批浮层）。
+ * 成功后局部刷新 status +（改动面板若在 git 模式）刷新它，绝不整页刷新。 */
+async function gitWrite(path, body, opts = {}) {
+  try {
+    const res = await api.post(path, body || {});
+    if (res && res.available === false) {
+      toast(res.reason || '当前工作区不是 git 仓库', 'error');
+      return null;
+    }
+    if (opts.toast) toast(opts.toast(res), 'ok');
+    await refreshGit();
+    if (S.changesMode === 'git') refreshChanges();
+    return res;
+  } catch (err) {
+    toast(`${opts.errorPrefix || 'Git 操作失败'}：${err.message}`, 'error');
+    return null;
+  }
+}
+
+function gitStage(paths, all = false) {
+  return gitWrite('/api/git/stage', { paths, all }, { errorPrefix: '暂存失败' });
+}
+function gitUnstage(paths, all = false) {
+  return gitWrite('/api/git/unstage', { paths, all }, { errorPrefix: '取消暂存失败' });
+}
+async function gitDiscard(paths) {
+  const list = paths.length === 1
+    ? paths[0]
+    : `以下 ${paths.length} 个文件：\n${paths.slice(0, 20).join('\n')}${paths.length > 20 ? '\n…' : ''}`;
+  if (!confirm(`放弃改动会丢弃工作区里未提交的内容：\n${list}\n\n（放弃前会自动落一个检查点，可从「回滚」面板找回）继续？`)) return null;
+  return gitWrite('/api/git/discard', { paths }, {
+    errorPrefix: '放弃改动失败',
+    toast: (res) => `已放弃改动${res && res.checkpointId ? `（检查点 ${res.checkpointId}，可回滚）` : ''}`,
+  });
+}
+async function gitCommit() {
+  const text = ($('git-msg-text').value || '').trim();
+  if (!text) { toast('先填写提交信息', 'error'); return; }
+  const res = await gitWrite('/api/git/commit', { message: text }, {
+    errorPrefix: '提交失败',
+    toast: (r) => `已提交${r && r.oid ? ` ${r.oid}` : ''}`,
+  });
+  if (res) $('git-msg-text').value = '';
+}
+async function gitPush() {
+  const info = S.git || {};
+  const okay = confirm(
+    `推送到 ${info.upstream || '（无上游，需先在终端设置）'}`
+    + `（当前分支 ${info.branch || '?'}，领先 ${info.ahead || 0} 个提交）？\n\n不带 --force，被拒绝时会原样报错。`
+  );
+  if (!okay) return null;
+  return gitWrite('/api/git/push', {}, { errorPrefix: '推送失败', toast: () => '已推送' });
+}
+function gitPull() {
+  return gitWrite('/api/git/pull', {}, { errorPrefix: '拉取失败', toast: () => '已拉取（快进）' });
+}
+function gitSwitchBranch(name) {
+  if (!name) return null;
+  return gitWrite('/api/git/branch', { name, action: 'switch' }, {
+    errorPrefix: '切换分支失败',
+    toast: () => `已切换到 ${name}`,
+  });
+}
+function gitNewBranch() {
+  const name = prompt('新分支名（将从当前分支新建并切换）：');
+  if (!name) return null;
+  return gitWrite('/api/git/branch', { name, action: 'create' }, {
+    errorPrefix: '新建分支失败',
+    toast: () => `已新建并切换到 ${name}`,
+  });
 }
 
 /** git 条目列表 —— Git 面板与「改动·相对 Git」视图共用同一份渲染。 */
@@ -2963,14 +3144,14 @@ async function generateCommitMessage() {
   btn.textContent = '生成中…';
   try {
     const res = await api.post('/api/git/commit-message');
-    $('git-msg-text').textContent = res.message;
-    $('git-msg').hidden = false;
-    toast('已起草提交信息 —— 只生成文本，不会自动提交', 'ok');
+    // 起草结果直接填进提交条（可编辑），提交仍由用户点「提交」触发
+    $('git-msg-text').value = res.message;
+    toast('已起草提交信息 —— 只生成文本，不会自动提交（可编辑后点「提交」）', 'ok');
   } catch (err) {
     toast(`生成提交信息失败：${err.message}`, 'error');
   } finally {
     btn.disabled = false;
-    btn.textContent = '生成提交信息';
+    btn.textContent = 'AI 生成';
   }
 }
 
@@ -2989,7 +3170,7 @@ function legacyCopyText(text) {
 }
 
 async function copyCommitMessage() {
-  const text = $('git-msg-text').textContent || '';
+  const text = $('git-msg-text').value || '';
   if (!text) return;
   let ok = false;
   if (navigator.clipboard) {
@@ -3010,12 +3191,9 @@ async function copyCommitMessage() {
     toast('已复制到剪贴板', 'ok');
     return;
   }
-  // 全选文本让用户自己 Ctrl+C
-  const range = document.createRange();
-  range.selectNodeContents($('git-msg-text'));
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
+  // 全选文本让用户自己 Ctrl+C（textarea 用 select()，Range 选不中它的内容）
+  $('git-msg-text').focus();
+  $('git-msg-text').select();
   toast('已全选，按 Ctrl+C 复制');
 }
 
@@ -4416,6 +4594,36 @@ function lockField(id, isLocked) {
   else node.removeAttribute('title');
 }
 
+/* ---- 联网检索段（M7）：总开关关闭时整段置灰（与 MCP 面板同一交互范式）
+   两层置灰来源互不打架：环境变量锁定（lockField，优先）与总开关关闭
+   （syncWebSection）。syncWebSection 跳过被 env 锁定的字段，避免抹掉
+   「被环境变量锁定」的提示。 */
+const WEB_FIELD_IDS = [
+  'set-web-enabled', 'set-web-provider', 'set-web-url', 'set-web-private',
+  'set-web-allow', 'set-web-deny', 'set-web-timeout', 'set-web-bytes', 'set-web-results',
+];
+let webLocks = {};
+let webEndpointShown = '';
+
+function syncWebSection(endpoint) {
+  if (typeof endpoint === 'string' && endpoint) webEndpointShown = endpoint;
+  const on = $('set-web-enabled').checked;
+  for (const id of WEB_FIELD_IDS) {
+    if (webLocks[id]) continue; // env 锁定的保持 lockField 状态
+    if (id === 'set-web-enabled') continue; // 总开关自身永远可点
+    const node = $(id);
+    node.disabled = !on;
+    if (!on) node.title = '先勾选「启用联网检索」';
+    else node.removeAttribute('title');
+  }
+  const ep = $('set-web-endpoint');
+  if ($('set-web-provider').value === 'searxng') {
+    ep.textContent = '搜索端点：使用上方 SearXNG JSON 端点';
+  } else {
+    ep.textContent = `搜索端点：${webEndpointShown || '—'}（由治理面地址派生）`;
+  }
+}
+
 /** 按当前接入地址高亮对应的服务商预设（识别不出来就落到「自定义」）。 */
 function highlightPresetFor(baseUrl) {
   const url = String(baseUrl || '').toLowerCase();
@@ -4489,6 +4697,28 @@ async function openSettingsModal() {
     lockField('set-completion-tokens', locked.completion_max_tokens);
     lockField('set-completion-prefix', locked.completion_prefix_chars);
     lockField('set-completion-suffix', locked.completion_suffix_chars);
+    // 联网检索（M7）：九字段回填 + envLocked 置灰；再按总开关整段联动。
+    webLocks = {
+      'set-web-enabled': locked.web_enabled,
+      'set-web-provider': locked.web_search_provider,
+      'set-web-url': locked.web_search_url,
+      'set-web-private': locked.web_fetch_allow_private,
+      'set-web-allow': locked.web_allow_hosts,
+      'set-web-deny': locked.web_deny_hosts,
+      'set-web-timeout': locked.web_timeout,
+      'set-web-bytes': locked.web_max_bytes,
+      'set-web-results': locked.web_search_max_results,
+    };
+    $('set-web-enabled').checked = info.webEnabled === true;
+    $('set-web-provider').value = info.webSearchProvider || 'gateway';
+    $('set-web-url').value = info.webSearchUrl || '';
+    $('set-web-private').checked = info.webFetchAllowPrivate === true;
+    $('set-web-allow').value = info.webAllowHosts || '';
+    $('set-web-deny').value = info.webDenyHosts || '';
+    $('set-web-timeout').value = info.webTimeout ?? '';
+    $('set-web-bytes').value = info.webMaxBytes ?? '';
+    $('set-web-results').value = info.webSearchMaxResults ?? '';
+    syncWebSection(info.webSearchEndpoint || '');
     if (bridge) {
       try {
         const cfg = (await bridge.readDesktopConfig()) || {};
@@ -4595,7 +4825,42 @@ async function saveSettings() {
     body[key] = parsed;
   }
   const hasCompletion = completionFields.some(([key]) => key in body);
-  if (!body.model && !body.baseUrl && !body.apiKey && !body.workspace && !hasCompletion) {
+  // 联网检索（M7）：bool 可改时始终提交（false 也落盘）；字符串留空 = 不改；
+  // 数值留空 = 不改。置灰（env 锁定或总开关关闭）的字段跳过 —— 后端照原样保留。
+  if (!$('set-web-enabled').disabled) body.webEnabled = $('set-web-enabled').checked;
+  if (!$('set-web-provider').disabled && $('set-web-provider').value) {
+    body.webSearchProvider = $('set-web-provider').value;
+  }
+  for (const [key, id] of [
+    ['webSearchUrl', 'set-web-url'],
+    ['webAllowHosts', 'set-web-allow'],
+    ['webDenyHosts', 'set-web-deny'],
+  ]) {
+    if ($(id).disabled) continue;
+    const text = $(id).value.trim();
+    if (text) body[key] = text;
+  }
+  if (!$('set-web-private').disabled) {
+    body.webFetchAllowPrivate = $('set-web-private').checked;
+  }
+  for (const [key, id] of [
+    ['webTimeout', 'set-web-timeout'],
+    ['webMaxBytes', 'set-web-bytes'],
+    ['webSearchMaxResults', 'set-web-results'],
+  ]) {
+    if ($(id).disabled) continue;
+    const raw = $(id).value.trim();
+    if (!raw) continue;
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      $('set-error').hidden = false;
+      $('set-error').textContent = '联网检索参数必须是正整数。';
+      return;
+    }
+    body[key] = parsed;
+  }
+  const hasWeb = Object.keys(body).some((key) => key.startsWith('web'));
+  if (!body.model && !body.baseUrl && !body.apiKey && !body.workspace && !hasCompletion && !hasWeb) {
     $('set-error').hidden = false;
     $('set-error').textContent = '没有需要修改的配置项。';
     return;
@@ -5135,6 +5400,9 @@ function bind() {
   $('settings-modal').addEventListener('click', (event) => {
     if (event.target === $('settings-modal')) closeSettingsModal();
   });
+  // 联网检索段（M7）：总开关切换整段置灰/解禁；provider 切换时更新端点提示
+  $('set-web-enabled').addEventListener('change', () => syncWebSection());
+  $('set-web-provider').addEventListener('change', () => syncWebSection());
   // 浮层内回车保存（与工作区弹窗同一套交互）
   $('settings-modal').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && event.target.tagName !== 'BUTTON') {
@@ -5197,6 +5465,15 @@ function bind() {
   $('btn-commit-msg').addEventListener('click', generateCommitMessage);
   $('btn-git-refresh').addEventListener('click', refreshGit);
   $('btn-copy-msg').addEventListener('click', copyCommitMessage);
+
+  // Git 写操作（B6/ADR-028）：全部是用户本人动作，不走审批浮层
+  $('btn-git-commit').addEventListener('click', gitCommit);
+  $('btn-git-pull').addEventListener('click', gitPull);
+  $('btn-git-push').addEventListener('click', gitPush);
+  $('btn-git-newbranch').addEventListener('click', gitNewBranch);
+  $('btn-git-stage-all').addEventListener('click', () => gitStage([], true));
+  $('btn-git-unstage-all').addEventListener('click', () => gitUnstage([], true));
+  $('git-branch-select').addEventListener('change', (event) => gitSwitchBranch(event.target.value));
 
   // 测试面板（K/P2-14）：跑全部 / 只跑失败 / 重新收集
   $('btn-tests-run-all').addEventListener('click', runAllTests);

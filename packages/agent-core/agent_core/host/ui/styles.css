@@ -275,6 +275,32 @@ pre, code, kbd { font-family: var(--mono); }
 .history-item.is-conflict { border-color: var(--danger); }
 .git-file { display: block; font-size: 12px; word-break: break-all; color: var(--fg); }
 
+/* ── Git 面板（B6）：工具栏 + 暂存/工作区双栏 + 提交条 ── */
+.git-toolbar { display: flex; gap: 6px; padding: 0 6px 8px; flex-wrap: wrap; align-items: center; }
+.git-toolbar .btn { flex: 0 0 auto; }
+.git-branch-select {
+  flex: 1 1 auto; min-width: 90px; padding: 3px 6px; border-radius: 6px;
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--line-soft);
+  font-family: var(--mono); font-size: 11.5px;
+}
+.git-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 8px; border-radius: 6px;
+}
+.git-row:hover { background: var(--raise); }
+.git-row .change-meta {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; cursor: pointer;
+}
+.git-row-actions { flex: 0 0 auto; display: flex; gap: 2px; }
+.git-row.is-conflict { border-left: 2px solid var(--danger); }
+.git-conflict-hint { font-size: 10.5px; color: var(--danger); }
+.git-commitbar { padding: 6px 6px 12px; }
+.git-commitbar .git-msg-text {
+  display: block; box-sizing: border-box; width: calc(100% - 12px);
+  margin: 0 6px 6px; min-height: 54px; resize: vertical;
+}
+.git-commitrow { display: flex; justify-content: flex-end; padding: 0 6px; }
+
 /* ── 测试面板（K/P2-14） ── */
 .tests-actions { display: flex; gap: 6px; padding: 2px 6px 8px; flex-wrap: wrap; }
 .tests-actions .btn { flex: 0 0 auto; }

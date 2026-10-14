@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable
@@ -382,12 +383,248 @@ def snapshot(root: str | Path) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- 写操作（B2）
+# 全部是「用户本人在面板上点」的动作（ADR-011/016），与 Agent 通道彻底隔离：
+# 这些函数只被 host 的用户动作端点调用，**不进任何 Agent 工具面** ——
+# 给 Agent 加 git_commit 等于给「改动落盘唯一入口是补丁引擎」开新口子。
+#
+# 统一返回形状（与只读函数同构，调用方无需分支）：
+#   非仓库        → {"available": False, "reason": ...}
+#   git 自身失败  → {"available": True, "ok": False, "reason": <stderr 首行>}
+#   成功          → {"available": True, "ok": True, "reason": "", "output": ...}
+_REFNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_MAX_MESSAGE_CHARS = 500
+_WRITE_TIMEOUT = 20
+# push/pull 走网络远端，20 秒不够；但也不能无限等 —— 卡住的远端要能被放弃。
+_NET_TIMEOUT = 120
+
+
+def _run_op(
+    root: Path, argv: Iterable[str], timeout: int = _WRITE_TIMEOUT, **extra: Any
+) -> dict[str, Any]:
+    """跑一条**写** git 子命令，把退出码翻成 ok/reason（永不抛异常）。"""
+    ok, out, _err, why = _git(root, argv, timeout=timeout)
+    if not ok:
+        return {"available": True, "ok": False, "reason": why, "output": out}
+    return {"available": True, "ok": True, "reason": "", "output": out, **extra}
+
+
+def _has_head(root: Path) -> bool:
+    """仓库是否已有提交（unborn HEAD）—— 决定 unstage 走 reset 还是 rm --cached。"""
+    ok, out, _, _ = _git(root, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    return ok and bool(out.strip())
+
+
+def valid_refname(name: str) -> bool:
+    """分支名合法性：白名单正则 + 几条 git refname 硬规则，拒绝怪名注入。
+
+    正则已挡住前导 `-`/`.`/空格；这里再补上 `..`、`@{`、`\\`、`//`、
+    结尾 `/`、结尾 `.`、结尾 `.lock` 这些 git 明确禁止的形态。
+    """
+    text = (name or "").strip()
+    if not text or len(text) > 200:
+        return False
+    if not _REFNAME_RE.match(text):
+        return False
+    if (
+        ".." in text
+        or "@{" in text
+        or "\\" in text
+        or "//" in text
+        or text.endswith("/")
+        or text.endswith(".")
+        or text.endswith(".lock")
+    ):
+        return False
+    return True
+
+
+def stage(root: str | Path, paths: Iterable[str] | None = None, all: bool = False) -> dict[str, Any]:
+    """暂存：`git add -- <paths...>`（all=True 时 `git add -A`）。"""
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    if all:
+        return _run_op(root, ["add", "-A"])
+    items = [str(p) for p in (paths or []) if str(p).strip()]
+    if not items:
+        return {"available": True, "ok": False, "reason": "未指定要暂存的路径", "output": ""}
+    return _run_op(root, ["add", "--", *items])
+
+
+def unstage(root: str | Path, paths: Iterable[str] | None = None, all: bool = False) -> dict[str, Any]:
+    """取消暂存。
+
+    已提交仓库用 `git reset -q HEAD -- <paths>`；**unborn**（一次提交都还没有）
+    时 HEAD 解析不了，改用 `git rm --cached` —— 否则用户在新仓库里第一次
+    「取消暂存」必然报错，而这恰恰是最常见的场景。
+    """
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    has_head = _has_head(root)
+    if all:
+        argv = (
+            ["reset", "-q", "HEAD"]
+            if has_head
+            else ["rm", "--cached", "-r", "--quiet", "--", "."]
+        )
+        return _run_op(root, argv)
+    items = [str(p) for p in (paths or []) if str(p).strip()]
+    if not items:
+        return {"available": True, "ok": False, "reason": "未指定要取消暂存的路径", "output": ""}
+    argv = (
+        ["reset", "-q", "HEAD", "--", *items]
+        if has_head
+        else ["rm", "--cached", "--quiet", "--", *items]
+    )
+    return _run_op(root, argv)
+
+
+def discard(root: str | Path, paths: Iterable[str] | None = None) -> dict[str, Any]:
+    """放弃改动（破坏性）：已跟踪文件 `git checkout --`，未跟踪文件 `git clean -f --`。
+
+    **只做 git，不做检查点** —— 前置检查点由 host 层负责（B5）：检查点属于
+    「落盘兜底」机制，依赖工作区与审计，不该塞进这个纯 git 模块。
+    """
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    items = [str(p) for p in (paths or []) if str(p).strip()]
+    if not items:
+        return {"available": True, "ok": False, "reason": "未指定要放弃的路径", "output": ""}
+    state = status(root)
+    untracked = {
+        e.get("path") for e in (state.get("entries") or []) if e.get("status") == "??"
+    }
+    tracked = [p for p in items if p not in untracked]
+    loose = [p for p in items if p in untracked]
+    outputs: list[str] = []
+    if tracked:
+        result = _run_op(root, ["checkout", "--", *tracked])
+        if not result["ok"]:
+            return result
+        outputs.append(str(result.get("output") or ""))
+    if loose:
+        result = _run_op(root, ["clean", "-f", "--", *loose])
+        if not result["ok"]:
+            return result
+        outputs.append(str(result.get("output") or ""))
+    return {
+        "available": True,
+        "ok": True,
+        "reason": "",
+        "output": "\n".join(o for o in outputs if o),
+    }
+
+
+def commit(root: str | Path, message: str) -> dict[str, Any]:
+    """提交："git commit -m <message>"。
+
+    message 作为**单个 argv 元素**传递：数组天然没有注入面，也不需引号转义。
+    空消息 / 超 500 字符拒绝；**刻意不加 `--no-verify`** —— 用户装的钩子
+    必须照跑（那正是用户把它装上的目的）。
+    """
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    text = (message or "").strip()
+    if not text:
+        return {"available": True, "ok": False, "reason": "提交信息不能为空", "output": ""}
+    if len(text) > _MAX_MESSAGE_CHARS:
+        return {
+            "available": True,
+            "ok": False,
+            "reason": f"提交信息过长（上限 {_MAX_MESSAGE_CHARS} 字符）",
+            "output": "",
+        }
+    result = _run_op(root, ["commit", "-m", text])
+    if not result["ok"]:
+        return result
+    oid = ""
+    ok, out, _, _ = _git(root, ["rev-parse", "--short", "HEAD"])
+    if ok:
+        oid = out.strip()
+    result["oid"] = oid
+    return result
+
+
+def push(root: str | Path) -> dict[str, Any]:
+    """推送当前分支到已设上游（无参 `git push`）。
+
+    不带 `--force`；没有上游时 git 自己报错，原样透出引导用户先在终端设上游
+    —— 代设上游 = 替用户决定推哪去，超出「用户本人动作」的边界。
+    """
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    return _run_op(root, ["push"], timeout=_NET_TIMEOUT)
+
+
+def pull_ff(root: str | Path) -> dict[str, Any]:
+    """快进拉取（`git pull --ff-only`）。
+
+    非快进 git 自己报错、**不产生任何改动**（绝不自动产生合并）；有未解决的
+    冲突文件时前置拒绝 —— 带着冲突去 pull 只会把状态搅得更乱。
+    """
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    conflicts = unmerged(root)
+    if conflicts:
+        return {
+            "available": True,
+            "ok": False,
+            "reason": "存在未解决的冲突文件，请先在终端解决后再拉取",
+            "conflicts": conflicts,
+            "output": "",
+        }
+    return _run_op(root, ["pull", "--ff-only"], timeout=_NET_TIMEOUT)
+
+
+def branch_create(root: str | Path, name: str) -> dict[str, Any]:
+    """新建并切换到分支：`git switch -c <name>`。"""
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    if not valid_refname(name):
+        return {"available": True, "ok": False, "reason": f"分支名非法：{name!r}", "output": ""}
+    return _run_op(root, ["switch", "-c", name])
+
+
+def branch_switch(root: str | Path, name: str) -> dict[str, Any]:
+    """切换分支：`git switch <name>`。"""
+    root = Path(root)
+    reason = _repo_reason(root)
+    if reason:
+        return _unavailable(reason)
+    if not valid_refname(name):
+        return {"available": True, "ok": False, "reason": f"分支名非法：{name!r}", "output": ""}
+    return _run_op(root, ["switch", name])
+
+
 __all__ = [
+    "branch_create",
+    "branch_switch",
     "branches",
+    "commit",
     "diff",
+    "discard",
     "is_repo",
     "log",
+    "pull_ff",
+    "push",
     "snapshot",
+    "stage",
     "status",
     "unmerged",
+    "unstage",
+    "valid_refname",
 ]

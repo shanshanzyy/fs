@@ -405,6 +405,68 @@ _RULES: dict[str, Rule] = {
         note="只记「生成过一条提交信息、覆盖多少改动」。**提交本身不在这里发生**，"
         "所以这类事件不构成「谁提交了代码」的证据",
     ),
+    # Git 面板动作（M7 / B4）：全部是「用户本人在面板上点」的写操作（ADR-028），
+    # 与 Agent 通道隔离。批量路径只上传「条数 + 指纹」（路径可能含业务名词）；
+    # 提交信息与远端报错文本在本地存原文、上传只留指纹/长度（ADR-006）。
+    "git.stage": Rule(
+        upload="git.stage",
+        fields={"count": ("count", "int"), "paths_digest": ("paths_digest", "digest")},
+        note="暂存了几个文件；路径只留条数与指纹",
+    ),
+    "git.unstage": Rule(
+        upload="git.unstage",
+        fields={"count": ("count", "int"), "paths_digest": ("paths_digest", "digest")},
+        note="取消暂存了几个文件；口径同 git.stage",
+    ),
+    "git.discard": Rule(
+        upload="git.discard",
+        fields={
+            "count": ("count", "int"),
+            "paths_digest": ("paths_digest", "digest"),
+            "checkpoint_id": ("checkpoint_id", "str"),
+        },
+        note="放弃了几个文件的改动；checkpoint_id 指向可回滚找回的检查点",
+    ),
+    "git.commit": Rule(
+        upload="git.commit",
+        fields={
+            "message_digest": ("message", "digest"),
+            "message_chars": ("message", "chars"),
+            "oid": ("oid", "str"),
+        },
+        drop={"message": "提交信息由用户手打，可能复述改动细节，只上传指纹与长度"},
+        note="**这才是真正的提交动作**（git.commit_message 只是生成文本）；"
+        "oid 是提交后的短哈希",
+    ),
+    "git.push": Rule(
+        upload="git.push",
+        fields={
+            "remote": ("remote", "str"),
+            "branch": ("branch", "str"),
+            "ok": ("ok", "bool"),
+            "reason_digest": ("reason", "digest"),
+            "reason_chars": ("reason", "chars"),
+        },
+        drop={"reason": "远端报错文本可能引述带凭据的远端 URL，只上传指纹与长度"},
+        note="推送当前分支；结果与报错长度用来发现「推不上去」的环境问题",
+    ),
+    "git.pull": Rule(
+        upload="git.pull",
+        fields={
+            "remote": ("remote", "str"),
+            "branch": ("branch", "str"),
+            "ok": ("ok", "bool"),
+            "reason_digest": ("reason", "digest"),
+            "reason_chars": ("reason", "chars"),
+        },
+        drop={"reason": "同 git.push：只上传指纹与长度"},
+        note="快进拉取当前分支；非快进不会产生任何改动",
+    ),
+    "git.branch": Rule(
+        upload="git.branch",
+        fields={"name": ("name", "str"), "action": ("action", "str")},
+        note="新建 / 切换分支；name 经 refname 白名单校验，不含内容敏感信息",
+    ),
     "tool.edit_file": Rule(
         upload="tool.edit_file",
         fields={
@@ -443,6 +505,54 @@ _RULES: dict[str, Rule] = {
             "truncated": ("truncated", "bool"),
         },
         note="落点是工作区相对目录；正文（markdown）只留本机，不上传",
+    ),
+    # 联网检索（M7）：查询词与抓取正文都是**外发/外部内容**。
+    # query 只上传 digest+长度（可能含代码片段，ADR-006）；fetch 的 URL 只上传
+    # host+path，query string 换 digest（URL 参数里可能有 token —— 与 host 静态壳
+    # 的 Referer 泄露防线同一考虑）；抓取的正文只上传内容指纹。
+    # 报错文本一律 error_digest+error_chars —— 异常消息会引述 URL/查询词/响应片段，
+    # 与 sandbox.* / verify.run 的机器报错同一处理（服务端 DENIED_KEYS 钉死了
+    # error 键，白名单列了也过不了闸门 3，原文键名上传必被整条拒收）。
+    "tool.web_search": Rule(
+        upload="tool.web_search",
+        fields={
+            "provider": ("provider", "str"),
+            "query_chars": ("query_chars", "int"),
+            "query_digest": ("query_digest", "digest"),
+            "max_results": ("max_results", "int"),
+            "result_count": ("result_count", "int"),
+            "error_digest": ("error_digest", "digest"),
+            "error_chars": ("error_chars", "int"),
+        },
+        drop={
+            "query": "查询词会外发给搜索上游且常含业务名词/代码片段，"
+            "按 ADR-006 只留本机，上传指纹与长度",
+            "error": "异常消息会引述 URL 与响应片段，按 ADR-006 只留本机，"
+            "上传指纹与长度",
+        },
+        note="一次联网搜索的元数据",
+    ),
+    "tool.web_fetch": Rule(
+        upload="tool.web_fetch",
+        fields={
+            "host": ("host", "str"),
+            "path": ("path", "path"),
+            "query_digest": ("query_digest", "digest"),
+            "status": ("status", "int"),
+            "bytes": ("bytes", "int"),
+            "content_digest": ("content_digest", "digest"),
+            "truncated": ("truncated", "bool"),
+            "error_digest": ("error_digest", "digest"),
+            "error_chars": ("error_chars", "int"),
+        },
+        drop={
+            "url": "URL 的 query string 里可能有 token/敏感参数，"
+            "只上传 host+path，query string 换 digest",
+            "error": "异常消息会引述 URL 与响应片段，按 ADR-006 只留本机，"
+            "上传指纹与长度",
+        },
+        note="一次网页抓取的元数据。抓取正文恒 wrap_untrusted 进模型上下文，"
+        "不出本机，这里只上传指纹与计数",
     ),
     # ---------------------------------------------------------------- 本地编辑面（D）
     # 用户在编辑器里直接写代码（补全 / 行内改写 / 保存）也算「代码是怎么进仓库的」，
