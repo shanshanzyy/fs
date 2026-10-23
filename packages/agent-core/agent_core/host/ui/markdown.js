@@ -64,6 +64,88 @@ function splitRow(line) {
   return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
 }
 
+/* ---------------------------------------------------------------------------
+   轻量语法高亮（零依赖）
+   ---------------------------------------------------------------------------
+   目标不是「语义正确」，而是「一眼分得清」：注释、字符串、数字、关键字、
+   函数名各有颜色，和 Trae 的代码块观感接近即可。认不出的语言按纯文本渲染。
+   和上面一样，全部走 DOM 节点拼接，不拼 innerHTML。
+   ------------------------------------------------------------------------- */
+const KEYWORDS = {
+  py: 'False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield',
+  js: 'as async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof undefined var void while with yield true false null',
+  sh: 'case do done elif else esac export fi for function if in then until while local echo cd exit return set unset readonly',
+  go: 'break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var true false nil',
+  rs: 'as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true false type unsafe use where while',
+  c: 'auto break case char const continue default do double else enum extern float for goto if inline int long register return short signed sizeof static struct switch typedef union unsigned void volatile while class public private protected new delete this namespace using template typename try catch throw true false null',
+  sql: 'select from where insert into update delete create table drop alter join left right inner outer on group by order having limit offset values set primary key index distinct union as and or not null',
+};
+
+const KW_SETS = {};
+for (const [lang, words] of Object.entries(KEYWORDS)) {
+  KW_SETS[lang] = new Set(words.split(/\s+/).filter(Boolean));
+}
+
+function langKind(lang) {
+  const l = String(lang || '').toLowerCase();
+  if (l === 'py' || l === 'python' || l === 'python3') return 'py';
+  if (['js', 'javascript', 'jsx', 'ts', 'typescript', 'tsx', 'json', 'jsonc', 'node'].includes(l)) return 'js';
+  if (['sh', 'bash', 'shell', 'zsh', 'console', 'powershell', 'ps1'].includes(l)) return 'sh';
+  if (['go', 'golang'].includes(l)) return 'go';
+  if (['rs', 'rust'].includes(l)) return 'rs';
+  if (['sql', 'mysql', 'postgres', 'sqlite'].includes(l)) return 'sql';
+  if (['java', 'kt', 'kotlin', 'c', 'cpp', 'c++', 'h', 'hpp', 'cs', 'csharp'].includes(l)) return 'c';
+  return 'txt';
+}
+
+function tokenPattern(kind) {
+  const comment =
+    kind === 'py' || kind === 'sh' ? '#[^\\n]*'
+    : kind === 'sql' ? '--[^\\n]*|/\\*[\\s\\S]*?\\*/'
+    : kind === 'html' ? '<!--[\\s\\S]*?-->'
+    : '//[^\\n]*|/\\*[\\s\\S]*?\\*/';
+  const str = '`(?:\\\\.|[^`\\\\])*`|"(?:\\\\.|[^"\\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\\n])*\'';
+  return new RegExp(
+    `(${comment})|(${str})|\\b(0[xX][0-9a-fA-F]+|\\d+(?:\\.\\d+)?)\\b|([A-Za-z_$][\\w$]*)|([{}()\\[\\];,.:+\\-*/%=<>!&|^~?]+)`,
+    'g',
+  );
+}
+
+function token(cls, value) {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = value;
+  return span;
+}
+
+/** 把 source 着色后填进 <code>。lang 为空/未知时保持纯文本。 */
+export function highlight(codeEl, source, lang) {
+  const kind = langKind(lang);
+  const words = KW_SETS[kind];
+  if (!words) { text(codeEl, source); return; }
+  const pattern = tokenPattern(kind);
+  let last = 0;
+  for (const m of String(source).matchAll(pattern)) {
+    if (m.index > last) text(codeEl, source.slice(last, m.index));
+    const piece = m[0];
+    if (m[1]) {
+      codeEl.appendChild(token('tok-com', piece));
+    } else if (m[2]) {
+      codeEl.appendChild(token('tok-str', piece));
+    } else if (m[3]) {
+      codeEl.appendChild(token('tok-num', piece));
+    } else if (m[4]) {
+      if (words.has(piece)) codeEl.appendChild(token('tok-kw', piece));
+      else if (/^\s*\(/.test(source.slice(m.index + piece.length))) codeEl.appendChild(token('tok-fn', piece));
+      else text(codeEl, piece);
+    } else {
+      codeEl.appendChild(token('tok-op', piece));
+    }
+    last = m.index + piece.length;
+  }
+  if (last < source.length) text(codeEl, source.slice(last));
+}
+
 function render(md) {
   const root = document.createElement('div');
   root.className = 'md-preview';
@@ -91,7 +173,7 @@ function render(md) {
       const pre = document.createElement('pre');
       if (lang) pre.dataset.lang = lang;
       const c = document.createElement('code');
-      text(c, body.join('\n'));
+      highlight(c, body.join('\n'), lang);
       pre.appendChild(c);
       root.appendChild(pre);
       continue;
@@ -201,6 +283,22 @@ function render(md) {
 
 export function isMarkdown(path) {
   return /\.(md|markdown)$/i.test(path);
+}
+
+/* 文件后缀 → 高亮语言。只登记 highlighter 认得的语言，其余返回空串按纯文本。 */
+const EXT_LANG = {
+  py: 'python', pyw: 'python',
+  js: 'js', mjs: 'js', cjs: 'js', jsx: 'js', ts: 'ts', tsx: 'ts', json: 'json', jsonc: 'json',
+  sh: 'bash', bash: 'bash', zsh: 'bash', ps1: 'powershell',
+  go: 'go', rs: 'rust',
+  java: 'java', kt: 'kotlin',
+  c: 'c', h: 'c', cc: 'c++', cpp: 'c++', cxx: 'c++', hpp: 'c++', hxx: 'c++', cs: 'csharp',
+  sql: 'sql',
+};
+
+export function langForPath(path) {
+  const m = String(path || '').match(/\.([A-Za-z0-9]+)$/);
+  return m ? EXT_LANG[m[1].toLowerCase()] || '' : '';
 }
 
 export { render };

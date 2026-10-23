@@ -40,4 +40,12 @@ contextBridge.exposeInMainWorld('vibeShell', Object.freeze({
   readDesktopConfig: () => ipcRenderer.invoke('vibe:read-config'),
   saveDesktopConfig: (patch) => ipcRenderer.invoke('vibe:save-config', patch),
   relaunch: () => ipcRenderer.invoke('vibe:relaunch'),
+  // 终端复制 / 粘贴（P1-7 补强）：与 pick-folder 同一纪律 —— **只渡纯文本**，
+  // 不暴露 fs / child_process；写入在主进程侧再做一次「非空字符串 + 长度封顶」校验。
+  clipboardRead: () => ipcRenderer.invoke('vibe:clipboard-read'),
+  clipboardWrite: (text) => ipcRenderer.invoke('vibe:clipboard-write', text),
+  // 应用更新（M9）：只传入一个 staging 路径字符串，**只回传 {ok, reason}**。
+  // 与 relaunch 同一纪律 —— 桥只渡字符串，绝不暴露 fs / child_process；
+  // 路径形态由主进程再校验一次（非字符串一律被拒，不会 spawn）。
+  applyUpdate: (stagingPath) => ipcRenderer.invoke('vibe:update-apply', stagingPath),
 }));

@@ -15,6 +15,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -22,9 +23,15 @@ from agent_core.config import Config  # noqa: E402
 from agent_core.host import protocol as P  # noqa: E402
 from agent_core.host.bus import EventBus  # noqa: E402
 from agent_core.host.session import Session, _SessionHooks  # noqa: E402
-from agent_core.llm import ChatResponse, OpenAICompatClient, ToolCall  # noqa: E402
+from agent_core.llm import (  # noqa: E402
+    ChatResponse,
+    OpenAICompatClient,
+    StreamInterrupted,
+    ToolCall,
+)
 from agent_core.llm.openai_compat import _DeltaGuard  # noqa: E402
 from agent_core.loop import Agent, AgentHooks  # noqa: E402
+from agent_core.sandbox import Risk  # noqa: E402
 from tests.test_agent_loop import FakeClient  # noqa: E402
 
 
@@ -169,6 +176,80 @@ class ChatStreamTest(SSEHarness):
         self.assertEqual(response.tool_calls[0].name, "read_file")
         self.assertEqual(response.tool_calls[0].arguments, {"path": "a.py"})
 
+    def test_reasoning_content_streams_on_its_own_channel(self) -> None:
+        """推理与正文是两条独立通道：reasoning_content 只经 on_reasoning 外送，
+        绝不混进 response.content（混进去会污染最终答案、也骗过围栏守卫）。"""
+        self.server.spec = {
+            "frames": [
+                _chunk({"role": "assistant", "reasoning_content": "先看"}),
+                _chunk({"reasoning_content": "一下目录。"}),
+                _chunk({"content": "好的"}),
+                _chunk({"reasoning": "（兼容字段名）"}),  # 少数字段叫 reasoning
+                _chunk({}, finish="stop"),
+            ]
+        }
+        reasons: list[str] = []
+        response = self.client.chat_stream(
+            [{"role": "user", "content": "hi"}], on_reasoning=reasons.append
+        )
+        self.assertEqual("".join(reasons), "先看一下目录。（兼容字段名）")
+        self.assertEqual(response.content, "好的")
+        self.assertNotIn("目录", response.content, "思考不得混入正文")
+
+    def test_reasoning_accepts_parts_array(self) -> None:
+        """少数服务把 reasoning 返回成分片数组（与 content 同款容错）。"""
+        self.server.spec = {
+            "frames": [
+                _chunk({"reasoning_content": [{"text": "甲"}, {"text": "乙"}]}),
+                _chunk({"content": "答"}),
+                _chunk({}, finish="stop"),
+            ]
+        }
+        reasons: list[str] = []
+        response = self.client.chat_stream(
+            [{"role": "user", "content": "hi"}], on_reasoning=reasons.append
+        )
+        self.assertEqual("".join(reasons), "甲乙")
+        self.assertEqual(response.content, "答")
+
+    def test_reasoning_absent_is_noop(self) -> None:
+        """上游不返回思考时，on_reasoning 一次都不该被调用。"""
+        self.server.spec = {"frames": [_chunk({"content": "答"}), _chunk({}, finish="stop")]}
+        reasons: list[str] = []
+        self.client.chat_stream(
+            [{"role": "user", "content": "hi"}], on_reasoning=reasons.append
+        )
+        self.assertEqual(reasons, [])
+
+    def test_should_stop_aborts_mid_stream(self) -> None:
+        """停止按钮必须在下**一帧**生效，而不是等整段回答生成完。
+
+        这里让第一段增量回调把 stop 置真：守卫吐字后，下一行必须立刻抛
+        `StreamInterrupted`，且不会再消费到第二段内容。
+        """
+        state = {"stop": False}
+        deltas: list[str] = []
+
+        def on_delta(text: str) -> None:
+            deltas.append(text)
+            state["stop"] = True
+
+        self.server.spec = {
+            "frames": [
+                _chunk({"content": "这是第一段很长的内容，用来触发增量回调。"}),
+                _chunk({"content": "第二段不应该被消费到。"}),
+                _chunk({}, finish="stop"),
+            ]
+        }
+        with self.assertRaises(StreamInterrupted):
+            self.client.chat_stream(
+                [{"role": "user", "content": "hi"}],
+                on_delta=on_delta,
+                should_stop=lambda: state["stop"],
+            )
+        self.assertTrue(deltas, "第一段应当已经推给界面")
+        self.assertNotIn("第二段", "".join(deltas))
+
     def test_non_sse_response_silently_falls_back(self) -> None:
         payload = {
             "choices": [
@@ -236,7 +317,14 @@ class FakeStreamClient:
         ]
         return ChatResponse(content="", tool_calls=calls)
 
-    def chat_stream(self, messages, tools=None, temperature=None, on_delta=None):
+    def chat_stream(
+        self,
+        messages,
+        tools=None,
+        temperature=None,
+        on_delta=None,
+        should_stop=None,
+    ):
         self.stream_calls += 1
         self.seen_messages.append(copy.deepcopy(messages))
         if not self.steps:
@@ -245,6 +333,9 @@ class FakeStreamClient:
         if isinstance(step, str):
             if on_delta is not None:
                 for i in range(0, len(step), 5):
+                    # 与真实 SSE 消费同频：每片前后都查一次中断。
+                    if should_stop is not None and should_stop():
+                        raise StreamInterrupted("用户中止了流式生成")
                     on_delta(step[i : i + 5])
             return ChatResponse(content=step)
         calls = [
@@ -285,6 +376,33 @@ class AgentStreamTest(unittest.TestCase):
         self.assertEqual("".join(hooks.deltas), "任务完成。")
         # 完整文本仍通过 on_assistant_text 送达一次
         self.assertEqual(hooks.texts, ["任务完成。"])
+
+    def test_interrupt_cancels_generation_and_keeps_history_valid(self) -> None:
+        """流式中途停止：立刻收口、历史以 assistant 收尾、下一句能接着说。"""
+        config = Config.load(self.ws)
+        flag = threading.Event()
+
+        class InterruptHooks(CollectHooks):
+            def on_assistant_delta(self, text: str) -> None:
+                super().on_assistant_delta(text)
+                flag.set()  # 用户在看到第一个增量时按下停止
+
+        hooks = InterruptHooks()
+        text = "这是一段会被中途打断的很长的回答内容。"
+        client = FakeStreamClient([text])
+        agent = Agent(config=config, client=client, hooks=hooks)
+        agent.should_stop = flag.is_set
+
+        answer = agent.run("hi")
+
+        self.assertIn("已中断本次任务", answer)
+        # 只收到开头几片，后面的生成被真正掐断
+        self.assertTrue(hooks.deltas)
+        self.assertLess(len("".join(hooks.deltas)), len(text))
+        self.assertEqual(hooks.texts, [], "中断不该再走「完整回答」回调")
+        # 历史可继续：最后一条必须是 assistant，不能残留半截 tool 消息
+        self.assertEqual(agent.messages[-1]["role"], "assistant")
+        self.assertEqual(agent.messages[-1]["content"], answer)
 
     def test_agent_tool_rounds_produce_no_deltas(self) -> None:
         config = Config.load(self.ws)
@@ -373,6 +491,52 @@ class SessionDeltaTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["text"], "字" * 96)
         sub.close()
+
+    def test_deltas_do_not_leak_across_runs(self) -> None:
+        """跨轮串味回归锁（「回答重复」根因）：上一轮未发布的答案尾巴不许拼进
+        下一轮首个增量。Session.submit 在新任务开始前调用 hooks.reset_deltas()
+        清空残留缓冲 —— 这里直接锁这条语义：残留 + reset + 新文本 → 只剩新文本。
+        """
+        session = Session(self.config, client=FakeStreamClient([]), bus=EventBus())
+        hooks = session.agent.hooks
+        assert isinstance(hooks, _SessionHooks)
+        sub = session.bus.subscribe()
+        hooks.on_assistant_delta("上一轮的回答尾巴")  # 不足阈值，滞留在缓冲
+        hooks.reset_deltas()  # 新一轮开始（Session.submit 会走这一步）
+        hooks.on_assistant_delta("这一轮的新回答")
+        hooks.flush_deltas()
+        events = self._drain(sub)
+        sub.close()
+        self.assertEqual([e["text"] for e in events], ["这一轮的新回答"])
+
+    def test_tool_call_flushes_pending_text_first(self) -> None:
+        """工具调用前必须先把本轮滞留文本补齐，否则它会拖到下一次发布。"""
+        session = Session(self.config, client=FakeStreamClient([]), bus=EventBus())
+        hooks = session.agent.hooks
+        sub = session.bus.subscribe()
+        hooks.on_assistant_delta("先说一句，然后调工具")
+        hooks.on_tool_call(
+            SimpleNamespace(id="call_1", name="read_file", arguments={}), Risk.SAFE, "普通读取"
+        )
+        events = self._drain(sub)
+        sub.close()
+        self.assertEqual(events[0]["type"], P.RUN_ASSISTANT_DELTA)
+        self.assertEqual(events[0]["text"], "先说一句，然后调工具")
+        self.assertEqual(events[1]["type"], P.RUN_TOOL_CALL)
+
+    def test_reasoning_events_are_kept_separate_from_answer(self) -> None:
+        """思考与回答各走各的缓冲，互不串味（思考不得混进回答事件）。"""
+        session = Session(self.config, client=FakeStreamClient([]), bus=EventBus())
+        hooks = session.agent.hooks
+        sub = session.bus.subscribe()
+        hooks.on_assistant_delta("答" * 48)  # 不足阈值，滞留回答缓冲
+        hooks.on_reasoning_delta("想" * 96)  # 达到字数阈值，立即发布思考
+        hooks.flush_deltas()  # 收口回答残留
+        events = self._drain(sub)
+        sub.close()
+        by_type = {e["type"]: e["text"] for e in events}
+        self.assertEqual(by_type[P.RUN_REASONING_DELTA], "想" * 96)
+        self.assertEqual(by_type[P.RUN_ASSISTANT_DELTA], "答" * 48)
 
     @staticmethod
     def _drain(subscription) -> list[dict]:

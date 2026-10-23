@@ -29,6 +29,11 @@ from ..httpd import AUTH_PUBLIC, Request, Response, Router
 #: 登录页与静态资源所在目录（本模块同级的 `static/`）。
 STATIC_DIR = Path(__file__).parent / "static"
 
+#: 治理面控制台（M8）资源目录。与登录页同目录下的子目录 ——
+#: 分开放是因为 Router 只匹配**定长单段** `{name}`：控制台要按
+#: `/console/assets/<name>` 走单段路由，只能把资源收进一个独立子目录。
+CONSOLE_DIR = STATIC_DIR / "console"
+
 #: 登录页的内容安全策略。
 #: 口径与 host 静态壳（agent_core/host/server.py 的 CSP）一致：默认全部锁回同源，
 #: `connect-src 'self'` 覆盖 fetch（登录页正是用 fetch 提交凭据），
@@ -70,11 +75,34 @@ def _read(path: Path, content_type: str) -> Response:
     )
 
 
+def _serve_asset(base_dir: Path, name: str) -> Response:
+    """在 `base_dir` 下安全地读一个静态资源。
+
+    路径穿越防护三道一起上（登录页与控制台共用同一份实现，避免各写一遍漏一处）：
+      1. 拒绝空名 / 含分隔符 / 含 `..`——Router 匹配 `{name}` 时会 `unquote`，
+         所以 `%2e%2e%2f…` 这类编码过的穿越也会在这里现出原形；
+      2. `resolve()` 后必须仍在 `base_dir` 内（兜底符号链接与边界情况）；
+      3. 必须是文件。
+    """
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise Forbidden("非法静态资源路径")
+    target = (base_dir / name).resolve()
+    base = base_dir.resolve()
+    if target != base and base not in target.parents:
+        raise Forbidden("非法静态资源路径")
+    if not target.is_file():
+        raise NotFound("资源不存在")
+    content_type = _MIME.get(target.suffix.lower(), "application/octet-stream")
+    return _read(target, content_type)
+
+
 def register_static(router: Router) -> None:
     """注册静态路由。
 
     **公开、不需 token** —— 登录页的用途正是「还没有 token 的人」打开它。
-    与既有 `/api/v1/auth/*` 无冲突：那批在 `/api/v1` 前缀下，这两个是顶层路径。
+    与既有 `/api/v1/auth/*` 无冲突：那批在 `/api/v1` 前缀下，这几个是顶层路径。
+    控制台外壳同样公开：它只是一个空壳，真正的数据请求都带 Bearer 令牌，
+    由服务端强制鉴权（前端隐藏权限面板只是体验，闸门始终在路由上）。
     """
 
     @router.get("/login", auth=AUTH_PUBLIC)
@@ -83,22 +111,15 @@ def register_static(router: Router) -> None:
 
     @router.get("/assets/{name}", auth=AUTH_PUBLIC)
     def asset(request: Request, name: str) -> Response:
-        # 路径穿越防护：`{name}` 只允许**单个**路径段。Router 在匹配时会做
-        # `urllib.parse.unquote`，所以 `%2e%2e%2f…` 这类编码过的穿越也会在
-        # 这里现出原形（name 里会带上 `/` 或 `..`）。三道一起上：
-        #   1. 拒绝空名 / 含分隔符 / 含 `..`；
-        #   2. resolve() 后必须仍在 STATIC_DIR 内（兜底符号链接与边界情况）；
-        #   3. 必须是文件。
-        if not name or "/" in name or "\\" in name or ".." in name:
-            raise Forbidden("非法静态资源路径")
-        target = (STATIC_DIR / name).resolve()
-        base = STATIC_DIR.resolve()
-        if target != base and base not in target.parents:
-            raise Forbidden("非法静态资源路径")
-        if not target.is_file():
-            raise NotFound("资源不存在")
-        content_type = _MIME.get(target.suffix.lower(), "application/octet-stream")
-        return _read(target, content_type)
+        return _serve_asset(STATIC_DIR, name)
+
+    @router.get("/console", auth=AUTH_PUBLIC)
+    def console_page(request: Request) -> Response:
+        return _read(CONSOLE_DIR / "console.html", _MIME[".html"])
+
+    @router.get("/console/assets/{name}", auth=AUTH_PUBLIC)
+    def console_asset(request: Request, name: str) -> Response:
+        return _serve_asset(CONSOLE_DIR, name)
 
 
-__all__ = ["CSP", "STATIC_DIR", "register_static"]
+__all__ = ["CONSOLE_DIR", "CSP", "STATIC_DIR", "register_static"]

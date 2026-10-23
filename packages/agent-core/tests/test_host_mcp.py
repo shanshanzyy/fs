@@ -4,7 +4,7 @@
 
 1. **只写配置文件、不拼命令** —— 界面提交的 server 配置只落到 `<ws>/.vibe/mcp.json`，
    argv 仍只来自受信配置（ADR-015）；写出的文档能被 `load_servers` 读回。
-2. **闸门顺序**：未启用 400、执行中 409、治理面 400、非法 400 —— 且**非法时不写文件**。
+2. **闸门顺序**：未启用 400、执行中 409、治理面**接管运行时** 400、非法 400 —— 且**非法时不写文件**。
 3. **改后自动重载** —— 新增后 `mcp__*` 出现在 registry、删除后消失。
 
 假 server 复用 `test_mcp.py` 里那份（`sys.executable` 启动，任何装了 Python 的机器都能跑）。
@@ -188,6 +188,13 @@ class McpTestConnectionTests(_McpHostFixture):
         self.assertTrue(data["error"])
 
 
+class _FakeRuntime:
+    """`GovernanceRuntime` 的最小替身：只提供「是否接管运行时」这一个判据。"""
+
+    def __init__(self, *, locked: bool) -> None:
+        self.locks_local_config = locked
+
+
 class McpGuardTests(_McpHostFixture):
     def test_busy_is_409(self) -> None:
         self.host.session._state = "running"
@@ -207,6 +214,34 @@ class McpGuardTests(_McpHostFixture):
             self.assertEqual(ctx.exception.code, 400)
         finally:
             self.host.session.governance = None
+
+    def test_governance_taking_over_is_400(self) -> None:
+        """治理面真的接管了运行时（模型请求经云端网关）→ MCP 目录拒绝写入。"""
+        self.host.session.governance = _FakeRuntime(locked=True)
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._request("/api/mcp/servers", method="POST", body=self._server_body())
+            self.assertEqual(ctx.exception.code, 400)
+        finally:
+            self.host.session.governance = None
+        self.assertFalse(self.mcp_file.exists())
+
+    def test_governance_not_taking_over_allows_write(self) -> None:
+        """治理面接入了但没接管运行时（禁云 / 降级）→ 本机 MCP 目录仍可写。
+
+        治理面从不托管 MCP 目录；此时本机文件就是唯一真源，
+        挡住保存只会让用户「明明能改却不给改」。
+        """
+        self.host.session.governance = _FakeRuntime(locked=False)
+        try:
+            with self._request(
+                "/api/mcp/servers", method="POST", body=self._server_body()
+            ) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        finally:
+            self.host.session.governance = None
+        self.assertIn("fake", {s["name"] for s in data["servers"]})
+        self.assertTrue(self.mcp_file.exists())
 
     def test_env_locks_mcp_field(self) -> None:
         with mock.patch.dict(os.environ, {"VIBE_MCP": "0"}, clear=False):

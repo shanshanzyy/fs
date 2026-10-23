@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import time
 import uuid
@@ -85,6 +86,9 @@ class CheckpointInfo:
     # id 字典序不可靠，必须用这个字段定先后。
     epoch: int = 0
     files: list[FileEntry] = field(default_factory=list)
+    # 这一轮由哪条用户消息触发（消息表 seq）。0 = 未知/旧检查点。
+    # 逐条回退（P3）靠它把「会话里的一条提问」精确映射到「这一轮改了哪些文件」。
+    user_seq: int = 0
 
     @property
     def file_count(self) -> int:
@@ -98,6 +102,7 @@ class CheckpointInfo:
             "kind": self.kind,
             "fileCount": self.file_count,
             "files": [f.path for f in self.files],
+            "userSeq": self.user_seq,
         }
 
 
@@ -160,6 +165,9 @@ class CheckpointManager:
         self._current_dir = None
         self._current_files = []
         self._snapshotted = set()
+        # 新一轮开始即清掉上一轮的「最近提交」：否则本轮零改动时，事件发布方
+        # 会把上一轮的检查点错认成本轮的（逐条回退的 userSeq 就会串轮）。
+        self._last_committed = ""
         return self._current_id
 
     def snapshot_before_write(self, abs_path: Path, rel: str) -> None:
@@ -229,6 +237,37 @@ class CheckpointManager:
         self._reset_current()
         return info
 
+    def annotate(self, checkpoint_id: str, user_seq: int) -> bool:
+        """把「这一轮由哪条用户消息触发」写进检查点 manifest（原子重写）。
+
+        为什么要事后标注而不是 commit 时传入：run 结束才知道本轮写完的
+        user 消息对应哪个 seq（消息在 hooks 里落库，seq 也由库分配）。
+        原子重写（同目录临时文件 + os.replace）保证不会读到半截 manifest ——
+        坏 manifest 会让检查点在列表里直接消失。
+        """
+        if not checkpoint_id or int(user_seq) <= 0:
+            return False
+        cp_dir = self.dir / checkpoint_id
+        manifest = cp_dir / "manifest.json"
+        try:
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if raw.get("userSeq") == int(user_seq):
+            return True
+        raw["userSeq"] = int(user_seq)
+        tmp = manifest.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, manifest)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        return True
+
     def abandon(self) -> None:
         """丢弃当前（尚未 commit 的）检查点。"""
         self._reset_current()
@@ -255,6 +294,7 @@ class CheckpointManager:
             "kind": info.kind,
             "epoch": info.epoch,
             "promptDigest": prompt_digest,
+            "userSeq": info.user_seq,
             "files": [
                 {
                     "path": f.path,
@@ -313,6 +353,10 @@ class CheckpointManager:
             epoch = int(raw.get("epoch") or 0)
         except (TypeError, ValueError):
             epoch = 0
+        try:
+            user_seq = int(raw.get("userSeq") or 0)
+        except (TypeError, ValueError):
+            user_seq = 0
         return CheckpointInfo(
             id=str(raw.get("id") or cp_dir.name),
             createdAt=str(raw.get("createdAt") or ""),
@@ -320,6 +364,7 @@ class CheckpointManager:
             kind=str(raw.get("kind") or "run"),
             epoch=epoch,
             files=files,
+            user_seq=user_seq,
         )
 
     # ------------------------------------------------------------------ 恢复

@@ -58,6 +58,8 @@ _VISION_MODES = ("auto", "on", "off")
 # 联网检索上游（M7）两形态：gateway = 经治理面网关中转（客户端零密钥）；
 # searxng = 直连 SearXNG JSON 端点（内网自部署/公共实例）。
 _WEB_SEARCH_PROVIDERS = ("gateway", "searxng")
+# 客户端更新渠道（M9）：stable/beta/canary。服务端按渠道选最新未撤销版本。
+_UPDATE_CHANNELS = ("stable", "beta", "canary")
 
 
 def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
@@ -91,9 +93,25 @@ class Config:
     # 这个开关是给「回退也失败」的极端环境留的手动闸。
     stream_enabled: bool = True
 
+    # --- 客户端模型选择器（M9-I）---
+    # 默认**关**：关着时走既有单模型路径，请求体与行为与未实现前**逐字节一致**。
+    # 开启后按任务难度在「服务端已授权的模型集合」内选型：简单任务走小模型、
+    # 复杂任务走大模型。选型**只能是授权集合的子集**（只能收紧，不能选出治理面
+    # 未允许的上游，红线 1「代码不出本机」不变）；选不出或越界时 fail-closed
+    # 回退默认模型（宁可退回也不硬选未授权上游）。
+    model_router_enabled: bool = False
+    # 选型策略：none（不选型，逐字节一致）/ static（固定映射表）/ size（按请求
+    # 上下文大小启发式选型）。策略非法时**回退 none 并告警**，不静默生效。
+    model_router_policy: str = "none"
+    # 兜底模型。空 = 沿用 `model`（VIBE_MODEL）。fail-closed 回退时用这个。
+    model_router_default: str = ""
+    # static 策略的映射表（小模型名 | 大模型名，用 | 分隔）。simple→小、complex→大。
+    # 留空时 static 策略退化、按「未匹配回退默认」处理。
+    model_router_static_map: str = ""
+
     # --- 循环 ---
     max_iterations: int = 25
-    max_context_chars: int = 120_000
+    max_context_chars: int = 400_000
     tool_output_limit: int = 8_000
 
     # --- 上下文窗口管理（P2-17）---
@@ -152,6 +170,13 @@ class Config:
     # --- 规则与记忆（P2-15）---
     # 额外规则路径 / glob（逗号分隔，相对工作区），叠加在内置的多层规则之后。
     rules_extra: str = ""
+    # 全局规则目录（M9-B）：指向一个**跨仓库共享**的规则目录（如公司统一编码规范），
+    # 作为比「用户级」更泛的最外层被继承。未设（默认空串）则无继承、合并结果与
+    # 改造前**逐字节一致**。只做只读合并，不新增写盘面（ADR-021 注入纪律沿用）。
+    global_rules: str = ""
+    # 全局层规则合计字节上限（跨仓库共享目录可能很杂，单独设上限防把系统提示挤爆）。
+    # 超限时先丢最泛层（与 M6-P「先丢最泛层」纪律一致），并如实标注。
+    global_rules_max_bytes: int = 64_000
     # 记忆总开关。关掉后：不读不写记忆、不注册 remember 工具、不注入记忆段
     #（行为与未实现前逐字节一致）。默认**开** —— 记忆只在本机、写入恒经人审。
     memory_enabled: bool = True
@@ -176,6 +201,27 @@ class Config:
     index_watch: bool = False
     # 轮询间隔（秒），下限 2（见 index/watch.MIN_INTERVAL）。再密就是白烧 CPU。
     index_watch_interval: int = 5
+
+    # --- 真实应用预览（P2 / ADR-039）---
+    # 允许预览面内嵌**本机 dev server**（`http://127.0.0.1:<port>`），用来看
+    # 真实跑起来的应用，而不是静态文件渲染结果。
+    #
+    # 默认**关**，因为开启后界面 CSP 的 `frame-src` 会从 `'self'` 放宽到
+    # `'self' http://127.0.0.1:*` —— 这是全项目唯一一处放宽 CSP 的地方。
+    # 关着时 CSP 响应头与改造前逐字节一致，`/api/preview/external` 直接 403。
+    #
+    # 隔离不靠 CSP 而靠**跨源**：预览帧是另一个源，读不到 `/api/*`。
+    # 所以这里放宽的只是「能不能把环回地址嵌进 iframe」，不是「能不能读数据」。
+    preview_external: bool = False
+
+    # --- 远端设备预览（P3 / ADR-040）---
+    # 允许把**远端设备上的环回端口**经 SSH 本地转发映射到本机环回，再用预览帧打开。
+    # 典型场景：代码在开发机上、`npm run dev` 也在开发机上，人坐在自己电脑前。
+    #
+    # 默认**关**，且要求 `VIBE_REMOTE=1`（要复用连接清单与既有 SSH 加固）。
+    # 它与 `preview_external` **共用同一处 CSP 放宽** —— 转发落地在 127.0.0.1，
+    # 正好落在 ADR-039 已经放行的那一条 `frame-src` 里，不新增第二个放宽点。
+    preview_remote: bool = False
 
     # --- 内联补全 / 行内改写（D3）---
     # 内联补全（Tab）开关。补全只产文本、不落盘，因此不触发审批闸门；
@@ -213,8 +259,9 @@ class Config:
     # 只接受**单条命令名/路径**，不接受带 shell 语法的整串 —— argv 由 /api/term/open
     # 固定组装，模型与前端都改不了它。
     terminal_shell: str = ""
-    # 同时最多几个终端会话；超了明确拒绝而不是无限起进程。
-    terminal_max_sessions: int = 3
+    # 同时最多几个终端会话。**0 = 不限**（默认）：用户可以开任意多个终端，
+    # 资源兜底交给空闲回收（30 分钟）。显式设正整数才回到有界模式。
+    terminal_max_sessions: int = 0
 
     # --- 多模态输入（N / P1-10）---
     # 默认**关**：图片会随请求发往**用户配置的模型端点**，端点非本地时图片就离开
@@ -251,6 +298,79 @@ class Config:
     wiki_dir: str = "docs/wiki"
     # 单次生成最多覆盖多少个源文件，防止在超大仓库上拉爆内存与耗时。
     wiki_max_files: int = 400
+
+    # --- Skill / 斜杠命令（M9-A）---
+    # 默认**关**：开启后 Agent 多出一个 `run_skill` 工具（SAFE，纯展开指令），
+    # 并从 `skills_dir` 加载用户手工放置的工作流（`<skills_dir>/**/SKILL.md`）。
+    # 关着时工具清单、系统提示与未实现前**逐字节一致**。Skill 是「组合既有工具
+    # 的高阶指令」，不新增底层工具、不新增写盘路径；正文与规则同源、注入一律
+    # wrap_untrusted（ADR-021）。
+    skills_enabled: bool = False
+    # Skill 落点（相对工作区）。**不得默认 .vibe/** —— .vibe 受 PathGuard 保护、
+    # 模型不可写；但 Skill 是**用户本人**手工放置的受信资产，需单独约定目录。
+    skills_dir: str = ".vibe/skills"
+    # 单次最多加载多少个 Skill 文件，防止目录里堆满垃圾把内存拉爆。
+    skills_max_files: int = 50
+    # 加载的 Skill 正文总量上限（字节）。超限从队首（按名字排序）丢弃并标注。
+    skills_max_bytes: int = 256_000
+
+    # --- 测试驱动的自动修复闭环（M9-C）---
+    # 默认**关**：开启后 Agent 多出一个 `test_loop` 工具（SAFE，只调度既有工具，
+    # 不直接写盘/执行），可驱动「跑测试 → 失败 → 喂回失败摘要 → 修复（恒走审批）
+    # → 重跑」的自治循环。关着时工具清单与行为与未实现前**逐字节一致**。
+    # 测试命令执行仍是 run_command（用户本人动作口径），Agent 的修复动作恒走审批
+    # （ADR-008，不可配置绕过）。
+    test_loop_enabled: bool = False
+    # 单任务重试上限。到顶仍未绿时**如实报告并停止**（不死循环），对齐 M0 的
+    # MAX_AUTO_VERIFY 防死循环纪律。
+    test_loop_max_rounds: int = 5
+    # 单次测试循环的总超时（秒）。超时即终止本轮循环并报告。
+    test_loop_timeout: int = 300
+
+    # --- 后台 / 并行 Agent（M9-D）---
+    # 默认**关**：开启后 host 侧才暴露 `/api/tasks` 端点，允许**用户本人**经界面
+    # 发起后台任务（异步执行、结果异步回传）。关着时无端点、行为与未实现前
+    # **逐字节一致**。后台任务由**用户本人**发起（对齐 ADR-011「用户本人动作」
+    # 口径），**不新增** Agent 发起的派生工具 —— 规避「Agent 自己派 Agent」的
+    # 越权 / 递归风险。子任务工具面 = 只读白名单（build_readonly_registry），
+    # 写回仍回父会话走审批漏斗（ADR-008）。
+    async_agent_enabled: bool = False
+    # 并行上限：同时最多跑多少个后台任务。超限明确拒绝新提交，而不是无限起线程。
+    async_agent_max: int = 4
+    # 单个后台任务的超时（秒）。超时即终止并报告（防单个任务把线程池占满）。
+    async_agent_timeout: int = 600
+
+    # --- 定时任务调度（M10）---
+    # 默认**关**：开启后 host 侧才暴露 `/api/schedules` 端点，允许**用户本人**
+    # 经界面 / API 创建定时任务（到点把 job 的 prompt 投进 M9-D 后台任务池）。
+    # 关着时无端点、无线程、无页签、无库文件，事件流与未实现前**逐字节一致**。
+    # **依赖 M9-D 池**：`VIBE_SCHEDULER=1` 但 `VIBE_ASYNC_AGENT=0` → 调度器不启动
+    # 并在界面 notices 说明（fail-closed，不静默降级）。定时任务由**用户本人**
+    # 创建，**不向 Agent 暴露任何调度工具**（对齐 ADR-011；堵死「Agent 自己给
+    # 自己排期」）。触发动作只有一种：投**只读**后台任务（ADR-032 沿用）。
+    scheduler_enabled: bool = False
+    # 任务库位置（显式值时覆盖）。空 → 默认 `<workspace>/.vibe/scheduler.db`
+    # （宿主资产，与 .vibe/checkpoints 同范式；模型仍不可写 .vibe）。
+    scheduler_db: str = ""
+    # 轮询粒度（秒），下限 5（防忙轮询）。
+    scheduler_tick: int = 30
+    # job 数上限。到顶后新建明确拒绝（400），而不是无限堆积。
+    scheduler_max_jobs: int = 50
+    # 单轮最多触发几个 job（防「到点任务同时起一堆」的风暴）。
+    scheduler_max_per_tick: int = 3
+    # 重启补跑开关：进程重启后对逾期 job **各补跑一次**（catch-up once，
+    # 不连补 N 次）；置 0 则只把 next_run_at 推到未来、不触发。
+    scheduler_catch_up: bool = True
+
+    # --- 代码审阅工作流（M9-H）---
+    # 默认**关**：开启后 Agent 多出一个 `review_changes` 工具（SAFE，只读：不改盘、
+    # 不执行、不派子 Agent），对「当前工作区相对 HEAD 的改动」产出一份结构化意见
+    # （严重级别 / 类别 / 定位 / 说明 / 建议）。关着时工具清单与行为与未实现前
+    # **逐字节一致**。审阅是**自审**，产出「意见」而非「补丁」，**不替代**人审
+    # （ADR-008 不变）—— 修复仍走既有 edit_* 审批漏斗。
+    review_enabled: bool = False
+    # 单次审阅最多覆盖多少个文件，防止在超大改动集上把上下文冲爆。
+    review_max_files: int = 50
 
     # --- 受控联网检索（M7）---
     # 默认**关**：web_search / web_fetch 都会把内容送出本机（查询词进搜索上游、
@@ -290,6 +410,59 @@ class Config:
     # 0 = 不做过期判定（单机内网、服务端常驻的场景可接受）。
     policy_max_staleness: int = 0
 
+    # --- 客户端自动更新（M9）---
+    # 默认**启用**：这条链路只在本机发生（检查走治理面/内网镜像、下载的是
+    # 一个已验签的安装器），不涉及源码外发，因此与 vision/web 那类「会外发
+    # 的能力」不同，不需要默认关。高合规环境可用 VIBE_UPDATE_DISABLE=1 整体
+    # 关掉 —— 关掉后**零网络请求**，不是「请求了但不用」。
+    update_channel: str = "stable"
+    # 本地/内网镜像基址（file:// 或 http，或裸路径）。空 = 仅走治理面通道。
+    # 两种源**逐源独立验签**：谁不可信只作废谁，可用性与信任解耦。
+    update_base_url: str = ""
+    # 整体开关（关掉后零网络请求）。
+    update_disabled: bool = False
+    # 启动时是否自动静默检查（手动「检查更新」不受它影响）。
+    update_check_on_start: bool = True
+    # 单包字节上限（本机兜底）。清单声明的 size 是发布者的承诺，这是本机自己
+    # 的闸；下载时取两者更紧的一条。默认 512 MiB。
+    update_max_bytes: int = 512 * 1024 * 1024
+    # 落盘根。空 = ~/.vibe/updates（用户级，跨工作区共享）。家目录不可写时
+    # （沙箱/CI）用它逃生，与 VIBE_MEMORY 同范式。
+    update_dir: str = ""
+    # 发布公钥覆盖（JSON 文本或文件路径）。空 = 用构建期内置公钥（发行版写入）。
+    # 支持客户自签内网镜像；显式设置时需记审计（见 update/keys.py 模块头）。
+    update_pubkey: str = ""
+
+    # --- 远程设备（M10）---
+    # 默认**关**：关着时远程工具**根本不注册**，工具列表与行为与未实现前
+    # 逐字节一致（与 M7 联网检索、M9 Skill 同范式）。
+    #
+    # 开启后 Agent 才能读写**用户自己的远端设备**。注意它改动的不是
+    # 「代码不上传治理面」这条红线（那条约束的是本机→治理面方向，
+    # 审计里依旧只有哈希与计数、没有正文），而是「执行面全在本机」
+    # 这一条实现假设 —— 详见 agent_core/remote/__init__.py 的说明。
+    remote_enabled: bool = False
+    # 连接清单路径覆盖。空 = <workspace>/.vibe/remote.json。
+    # 显式给出时可在多个工作区间共用同一份清单。
+    remote_config: str = ""
+    # 默认连接名。空 = 由清单里的 default 决定；两者都空且清单只有一条连接时
+    # 自动选那一条（降低使用门槛）。优先级：工具参数 > 本项 > 清单 default。
+    remote_default: str = ""
+
+    # --- 远程工作区（M13 / ADR-042）---
+    # 非空时该远端目录成为**默认落点**：模型写裸路径（`src/app.py`）也会被路由到
+    # 那条连接的那个子目录下（等价于写 `@remote/<连接名>/<子目录>/src/app.py`）。
+    # 取值必须写成 `@remote/<连接名>/<子目录>`；空串 = 本机模式（现状，逐字节不变）。
+    #
+    # 它改变的不是 `Config.workspace` 的语义 —— 后者恒为本机路径，此刻它会指向内核
+    # 自动生成的**本机锚点目录**（`<家目录>/.vibe/workspaces/remote/…`），
+    # 审计链 / 会话库 / 检查点 / 远端写的本机留底全部落在那里。
+    # 换句话说：**jail 的根由本项决定，`.vibe` 资产的落点仍在本机**（ADR-006 不动）。
+    #
+    # 这不是门控 —— 真正的开关是 `VIBE_REMOTE`；本项只是「启动时的默认锚点」，
+    # 与 `remote_default` 同范式：给了也只是省一次手动切换，绕不开 `VIBE_REMOTE`。
+    remote_workspace: str = ""
+
     @classmethod
     def load(cls, workspace: str | Path, **overrides: object) -> "Config":
         """从环境变量 + 显式覆盖构建配置。"""
@@ -312,6 +485,19 @@ class Config:
             temperature=float(_env_str("VIBE_TEMPERATURE", str(cls.temperature))),
             request_timeout=_env_int("VIBE_REQUEST_TIMEOUT", cls.request_timeout),
             stream_enabled=_env_bool("VIBE_STREAM", cls.stream_enabled),
+            # 客户端模型选择器（M9-I）：默认关，关着时请求体逐字节不变
+            model_router_enabled=_env_bool(
+                "VIBE_MODEL_ROUTER", cls.model_router_enabled
+            ),
+            model_router_policy=_env_str(
+                "VIBE_MODEL_ROUTER_POLICY", cls.model_router_policy
+            ),
+            model_router_default=_env_str(
+                "VIBE_MODEL_ROUTER_DEFAULT", cls.model_router_default
+            ),
+            model_router_static_map=_env_str(
+                "VIBE_MODEL_ROUTER_STATIC_MAP", cls.model_router_static_map
+            ),
             max_iterations=_env_int("VIBE_MAX_ITERATIONS", cls.max_iterations),
             max_context_chars=_env_int("VIBE_MAX_CONTEXT_CHARS", cls.max_context_chars),
             tool_output_limit=_env_int("VIBE_TOOL_OUTPUT_LIMIT", cls.tool_output_limit),
@@ -349,6 +535,11 @@ class Config:
             test_collect_args=_env_str("VIBE_TEST_COLLECT_ARGS", cls.test_collect_args),
             # 规则与记忆（P2-15）
             rules_extra=_env_str("VIBE_RULES_EXTRA", cls.rules_extra),
+            # 全局规则目录（M9-B）：默认空 = 无继承、逐字节一致
+            global_rules=_env_str("VIBE_RULES_GLOBAL", cls.global_rules),
+            global_rules_max_bytes=_env_int(
+                "VIBE_RULES_GLOBAL_MAX_BYTES", cls.global_rules_max_bytes
+            ),
             memory_enabled=_env_bool("VIBE_MEMORY", cls.memory_enabled),
             memory_max_items=_env_int("VIBE_MEMORY_MAX", cls.memory_max_items),
             memory_inject_limit=_env_int(
@@ -366,6 +557,10 @@ class Config:
                 MIN_WATCH_INTERVAL,
                 _env_int("VIBE_INDEX_WATCH_INTERVAL", cls.index_watch_interval),
             ),
+            # 真实应用预览（P2）：默认关；开启才会放宽界面 CSP 的 frame-src。
+            preview_external=_env_bool("VIBE_PREVIEW_EXTERNAL", cls.preview_external),
+            # 远端设备预览（P3）：默认关；开启后界面可把远端环回端口转发到本机。
+            preview_remote=_env_bool("VIBE_PREVIEW_REMOTE", cls.preview_remote),
             # 内联补全 / 行内改写（D3）
             fim_enabled=_env_bool("VIBE_FIM", cls.fim_enabled),
             completion_max_tokens=_env_int(
@@ -406,6 +601,39 @@ class Config:
             wiki_enabled=_env_bool("VIBE_WIKI", cls.wiki_enabled),
             wiki_dir=_env_str("VIBE_WIKI_DIR", cls.wiki_dir),
             wiki_max_files=_env_int("VIBE_WIKI_MAX_FILES", cls.wiki_max_files),
+            # Skill / 斜杠命令（M9-A）：默认关，启用后才加载并注册 run_skill 工具
+            skills_enabled=_env_bool("VIBE_SKILLS", cls.skills_enabled),
+            skills_dir=_env_str("VIBE_SKILLS_DIR", cls.skills_dir),
+            skills_max_files=_env_int("VIBE_SKILLS_MAX_FILES", cls.skills_max_files),
+            skills_max_bytes=_env_int("VIBE_SKILLS_MAX_BYTES", cls.skills_max_bytes),
+            # 测试驱动的自动修复闭环（M9-C）：默认关，启用后才注册 test_loop 工具
+            test_loop_enabled=_env_bool("VIBE_TEST_LOOP", cls.test_loop_enabled),
+            test_loop_max_rounds=_env_int(
+                "VIBE_TEST_LOOP_MAX", cls.test_loop_max_rounds
+            ),
+            test_loop_timeout=_env_int(
+                "VIBE_TEST_LOOP_TIMEOUT", cls.test_loop_timeout
+            ),
+            # 后台 / 并行 Agent（M9-D）：默认关，启用后才暴露 /api/tasks 端点
+            async_agent_enabled=_env_bool("VIBE_ASYNC_AGENT", cls.async_agent_enabled),
+            async_agent_max=_env_int("VIBE_ASYNC_AGENT_MAX", cls.async_agent_max),
+            async_agent_timeout=_env_int(
+                "VIBE_ASYNC_AGENT_TIMEOUT", cls.async_agent_timeout
+            ),
+            # 定时任务调度（M10）：默认关，启用后才暴露 /api/schedules 端点
+            scheduler_enabled=_env_bool("VIBE_SCHEDULER", cls.scheduler_enabled),
+            scheduler_db=_env_str("VIBE_SCHEDULER_DB", cls.scheduler_db),
+            scheduler_tick=_env_int("VIBE_SCHEDULER_TICK", cls.scheduler_tick),
+            scheduler_max_jobs=_env_int("VIBE_SCHEDULER_MAX", cls.scheduler_max_jobs),
+            scheduler_max_per_tick=_env_int(
+                "VIBE_SCHEDULER_MAX_PER_TICK", cls.scheduler_max_per_tick
+            ),
+            scheduler_catch_up=_env_bool(
+                "VIBE_SCHEDULER_CATCHUP", cls.scheduler_catch_up
+            ),
+            # 代码审阅工作流（M9-H）：默认关，启用后才注册 review_changes 工具
+            review_enabled=_env_bool("VIBE_REVIEW", cls.review_enabled),
+            review_max_files=_env_int("VIBE_REVIEW_MAX_FILES", cls.review_max_files),
             # 受控联网检索（M7）：默认关 —— 会外发，必须显式开
             web_enabled=_env_bool("VIBE_WEB", cls.web_enabled),
             web_search_provider=_env_choice(
@@ -428,6 +656,25 @@ class Config:
             policy_max_staleness=_env_int(
                 "VIBE_POLICY_MAX_STALENESS", cls.policy_max_staleness
             ),
+            # 客户端自动更新（M9）
+            update_channel=_env_choice(
+                "VIBE_UPDATE_CHANNEL", cls.update_channel, _UPDATE_CHANNELS
+            ),
+            update_base_url=_env_str("VIBE_UPDATE_URL", cls.update_base_url),
+            update_disabled=_env_bool("VIBE_UPDATE_DISABLE", cls.update_disabled),
+            update_check_on_start=_env_bool(
+                "VIBE_UPDATE_CHECK_ON_START", cls.update_check_on_start
+            ),
+            update_max_bytes=_env_int("VIBE_UPDATE_MAX_BYTES", cls.update_max_bytes),
+            update_dir=_env_str("VIBE_UPDATE_DIR", cls.update_dir),
+            update_pubkey=_env_str("VIBE_UPDATE_PUBKEY", cls.update_pubkey),
+            # 远程设备（M10）：默认关，关着时远程工具不注册、工具列表逐字节不变
+            remote_enabled=_env_bool("VIBE_REMOTE", cls.remote_enabled),
+            remote_config=_env_str("VIBE_REMOTE_CONFIG", cls.remote_config),
+            remote_default=_env_str("VIBE_REMOTE_DEFAULT", cls.remote_default),
+            # 远程工作区（M13 / ADR-042）：初值可选，空 = 本机模式。
+            # 真正的门控是 `VIBE_REMOTE` —— 本项给值也绕不开它。
+            remote_workspace=_env_str("VIBE_REMOTE_WORKSPACE", cls.remote_workspace),
         )
 
         if overrides:
@@ -445,6 +692,17 @@ class Config:
     @property
     def checkpoint_dir(self) -> Path:
         return self.workspace / ".vibe" / "checkpoints"
+
+    @property
+    def scheduler_db_path(self) -> Path:
+        """定时任务库落点（M10）：显式 `scheduler_db` 优先，否则 `.vibe/scheduler.db`。
+
+        宿主资产（与 `.vibe/checkpoints` 同范式）—— 宿主用绝对路径直写，
+        不走模型写盘通道，模型仍不可写 `.vibe/`。
+        """
+        if self.scheduler_db:
+            return Path(self.scheduler_db).expanduser()
+        return self.workspace / ".vibe" / "scheduler.db"
 
     @property
     def mcp_config_path(self) -> Path:

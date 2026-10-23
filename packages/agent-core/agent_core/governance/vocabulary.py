@@ -259,6 +259,46 @@ _RULES: dict[str, Rule] = {
         upload="approval.timeout",
         fields={"tool": ("tool", "str"), "timeout_s": ("timeout_s", "int")},
     ),
+    # 草稿预览（P1-2）：审批期内「看一眼改动后长什么样」，正文**不落盘**。
+    # 要留痕的是「谁在什么时候打开过一份未落盘的草稿」，不是草稿里写了什么
+    # —— 后者就在审批 diff 里（ADR-006），所以 token 与正文一律只留指纹。
+    "preview.draft": Rule(
+        upload="preview.draft",
+        fields={
+            "path": ("path", "path"),
+            "token": ("token", "digest"),
+            "files": ("files", "int"),
+            "chars": ("chars", "int"),
+        },
+        note="草稿预览是**只读且不落盘**的渲染：记下渲染的主文档、涉及几个文件、"
+        "共多少字符。token 是客户端生成的一次性短标识，只上传指纹",
+    ),
+    # 真实应用预览（P2 / ADR-039）：host 只**登记**用户自己起的本机 dev server，
+    # 不起进程、也不转发字节。要留痕的是「连了哪个本机端口」，路径与内容不入库。
+    "preview.external": Rule(
+        upload="preview.external",
+        fields={"port": ("port", "int"), "host": ("host", "str")},
+        note="记「预览指向了本机哪个端口」。只登记不转发，"
+        "URL 路径与页面内容都不上传（ADR-006）",
+    ),
+    # 远端预览转发（P3 / ADR-040）：状态机每次跃迁落一条，只记连接名与两个端口。
+    # `reason` 是传输层的短类型标志（transport / timeout），不是报错正文。
+    "preview.tunnel": Rule(
+        upload="preview.tunnel",
+        fields={
+            "action": ("action", "str"),
+            "connection": ("connection", "str"),
+            "remote_port": ("remote_port", "int"),
+            "local_port": ("local_port", "int"),
+            "ok": ("ok", "bool"),
+            "ms": ("ms", "int"),
+            "reason": ("reason", "str"),
+            "closed": ("closed", "bool"),
+            "refs": ("refs", "int"),
+        },
+        note="远端环回端口转发的开 / 关 / 重连 / 恢复事件：只记连接名与两个端口号，"
+        "**被转发的字节一个字都不上传**（ADR-006）",
+    ),
     # ---------------------------------------------------------------- 工具调用
     "tool.execute": Rule(
         upload="tool.execute",
@@ -427,6 +467,19 @@ _RULES: dict[str, Rule] = {
         },
         note="放弃了几个文件的改动；checkpoint_id 指向可回滚找回的检查点",
     ),
+    "rollback.truncate": Rule(
+        upload="rollback.truncate",
+        fields={
+            "count": ("count", "int"),
+            "first_seq": ("first_seq", "int"),
+            "last_seq": ("last_seq", "int"),
+            "checkpoint_id": ("checkpoint_id", "str"),
+            "restored": ("restored", "int"),
+            "deleted": ("deleted", "int"),
+        },
+        note="逐条回退删掉了几条消息（首末 seq）、对应哪个检查点、恢复了/删除了几个文件 "
+        "—— 消息正文与文件正文都不出机（ADR-006）",
+    ),
     "git.commit": Rule(
         upload="git.commit",
         fields={
@@ -490,6 +543,101 @@ _RULES: dict[str, Rule] = {
             "bytes": ("bytes", "int"),
             "content_digest": ("content_digest", "digest"),
         },
+    ),
+    # ---------------------------------------------------------------- 远端设备 tool 面（M10/M11）
+    # 远端 Agent 工具的动作事件**只判本地**（upload=""）。
+    # 理由有三条，任一条都足以让它们不出机：
+    #   1. 记录里带 `connection`（用户内网主机名/别名）与**远端相对路径** ——
+    #      那是「关于用户基础设施的信息」，不属于 ADR-006 允许的「做了什么」；
+    #   2. `tool.remote_edit` 记录 `backup`（本机留底的**绝对路径**），
+    #      正是 ADR-006 明确禁止外发的那类本机路径信息；
+    #   3. 面向用户/界面的远端审计面由 M11 的 `remote.connection` / `remote.file`
+    #      承载（见下文），这两条才是设计过的上传口径。
+    # 这里显式登记而不是"忘了登记"：未登记会让 `unclassified()` 把真缺陷信号淹掉。
+    "tool.remote_probe": Rule(
+        upload="",
+        note="远端连通性探测。记录含连接名与远端主机信息，只留本机（ADR-006）",
+    ),
+    "tool.remote_read_file": Rule(
+        upload="",
+        note="远端读文件。记录含连接名与远端路径，只留本机（ADR-006）",
+    ),
+    "tool.remote_list_dir": Rule(
+        upload="",
+        note="远端列目录。记录含连接名与远端路径，只留本机（ADR-006）",
+    ),
+    "tool.remote_grep": Rule(
+        upload="",
+        note="远端检索。命中数与模式长度已足够本机排查，连接名/远端路径不出机（ADR-006）",
+    ),
+    "tool.remote_edit": Rule(
+        upload="",
+        note="远端结构化编辑。记录含连接名、远端路径与本机留底**绝对路径**，只留本机（ADR-006）",
+    ),
+    "tool.remote_write_file": Rule(
+        upload="",
+        note="远端整文件写。记录含连接名与远端路径，只留本机（ADR-006）",
+    ),
+    "tool.remote_run_command": Rule(
+        upload="",
+        note="远端命令执行。记录含连接名与可执行名，只留本机（ADR-006）",
+    ),
+    "tool.remote_review_changes": Rule(
+        upload="",
+        note="远端改动自审。记录含连接名与本机留底目录是否存在，只留本机（ADR-006）",
+    ),
+    # ---------------------------------------------------------------- 远端设备 file 面（M11）
+    # 与上面 8 条 tool.* 不同，这两条是**设计过的上传口径**：
+    # 它们面向的是「用户本人经界面做的一次远端操作」——回答「在哪台设备上、
+    # 对哪个文件、做了什么、多少字节、增删多少行」，**一个字符的正文都没有**。
+    # 连接名在这里是可上传的（它标识归属，与 `task_id` / `job_id` 同性质），
+    # 远端相对路径也可上传（路径本身不含内容，ADR-006 允许路径与计数）。
+    # 注意这两条与 `tool.remote_*` 是**两套面**：前者面向用户审计，后者是 Agent 动作。
+    "remote.connection": Rule(
+        upload="remote.connection",
+        fields={
+            "connection": ("connection", "str"),
+            "action": ("action", "str"),
+            "allow_write": ("allow_write", "bool"),
+            "allow_shell": ("allow_shell", "bool"),
+            "ok": ("ok", "bool"),
+            "ms": ("ms", "int"),
+        },
+        note="用户本人对远程连接做的一次管理动作。只记归属、动作枚举"
+        "（added/updated/removed/default/permissions/open/test、"
+        "以及 M12 的「加入工作区」root_add / 「移出工作区」root_remove）、"
+        "两个权限位、成功与否与耗时 —— host / 密钥路径等基础设施信息不出机（ADR-006）"
+        "。M12 的根动作**复用本条**（`action` 两处均为 `str`、不做枚举），"
+        "不新增事件、不动 `fields`。",
+    ),
+    "remote.file": Rule(
+        upload="remote.file",
+        fields={
+            "connection": ("connection", "str"),
+            "path": ("path", "path"),
+            "action": ("action", "str"),
+            "bytes": ("bytes", "int"),
+            "sha256": ("sha256", "digest"),
+            "added": ("added", "int"),
+            "removed": ("removed", "int"),
+            "backed_up": ("backed_up", "bool"),
+        },
+        note="用户本人对远端文件做的一次读/写动作。只记归属、相对路径、"
+        "动作枚举（list/read/save/create）、字节数、内容 sha256 与增删行数 —— "
+        "**文件正文与 diff 正文只走端点响应与界面，一个字符都不出机**（ADR-006）",
+    ),
+    "remote.rollback": Rule(
+        upload="remote.rollback",
+        fields={
+            "connection": ("connection", "str"),
+            "path": ("path", "path"),
+            "action": ("action", "str"),
+            "bytes": ("bytes", "int"),
+            "backed_up": ("backed_up", "bool"),
+        },
+        note="按轮次回退远端文件：哪个连接、哪个相对路径、动作枚举"
+        "（restore/delete/skip）、多少字节、是否留下回退前副本 —— "
+        "**文件正文与 diff 正文都不出机**（ADR-006）",
     ),
     # Repo Wiki（M3+）：只报「往哪写、写了几个文件、多少字节、有没有被截断」。
     # Wiki 正文由本机代码结构生成，按 ADR-006 一律不出机 —— 上传它回答的是
@@ -773,10 +921,11 @@ _RULES: dict[str, Rule] = {
             "cols": ("cols", "int"),
             "rows": ("rows", "int"),
             "mode": ("mode", "str"),
+            "remote": ("remote", "str"),
             "ms": ("ms", "int"),
         },
         note="起一个交互式终端。命令正文（用户 shell 的 argv）只留本机，"
-        "上传的是大小/尺寸/后端模式（pty 或降级 pipe）与耗时",
+        "上传的是大小/尺寸/后端模式（pty 或降级 pipe）、远程连接名与耗时",
     ),
     "term.close": Rule(
         upload="term.close",
@@ -860,6 +1009,53 @@ _RULES: dict[str, Rule] = {
         },
         note="退出码是「这次改动到底成没成」的最高信号，单独成一类",
     ),
+    # ---------------------------------------------------------------- 测试闭环（M9-C）
+    "test_loop.run": Rule(
+        upload="test_loop.run",
+        fields={
+            "command_digest": ("command", "digest"),
+            "command_chars": ("command", "chars"),
+            "rounds": ("rounds", "int"),
+            "passed": ("passed", "int"),
+            "failed": ("failed", "int"),
+            "ms": ("ms", "int"),
+        },
+        drop={
+            "command": "测试命令行原文只留本机（同 tool.run_command）",
+        },
+        note="测试闭环跑一轮的元数据：命令指纹、轮次、通过/失败计数与耗时。"
+        "测试输出正文**只留本机**（ADR-006），这三个计数已够回答「闭环跑了几轮、成没成」",
+    ),
+    # 后台 / 并行 Agent（M9-D）：`task.spawn` 记一次后台任务的生命周期节点。
+    # 只记 task_id 归属 + 状态 + 摘要长度 + 耗时；任务**正文与结论**一个字符
+    # 都不出机（ADR-006）。状态是枚举（running/succeeded/failed），不是自由文本。
+    "task.spawn": Rule(
+        upload="task.spawn",
+        fields={
+            "task_id": ("task_id", "str"),
+            "state": ("state", "str"),
+            "chars": ("chars", "int"),
+            "ms": ("ms", "int"),
+        },
+        note="后台任务一次生命周期节点的元数据。正文与结论只留本机，"
+        "这里只记 task_id 归属、状态枚举、摘要长度与耗时",
+    ),
+    # 定时任务调度（M10）：`schedule.job` 记一次 job 的生命周期动作。
+    # 只记 job_id 归属 + 动作枚举 + 启用状态 + prompt 长度 + 耗时；job 的
+    # prompt **正文**一个字符都不出机（ADR-006）。动作是枚举
+    #（created/updated/deleted/toggled/triggered/skipped/failed），不是自由文本。
+    "schedule.job": Rule(
+        upload="schedule.job",
+        fields={
+            "job_id": ("job_id", "str"),
+            "action": ("action", "str"),
+            "state": ("state", "str"),
+            "chars": ("chars", "int"),
+            "ms": ("ms", "int"),
+        },
+        note="定时任务一次生命周期动作的元数据。prompt 正文只留本机，"
+        "这里只记 job_id 归属、动作与状态枚举、prompt 长度与耗时",
+    ),
     # ---------------------------------------------------------------- 上下文裁剪
     "context.compact": Rule(
         upload="context.compact",
@@ -934,6 +1130,48 @@ _RULES: dict[str, Rule] = {
         note="每轮任务注入记忆段的条数与总字符数。**注入的正文不上传**——"
         "它会被拼进系统提示，本质与用户消息同级的自由文本",
     ),
+    # Skill / 斜杠命令（M9-A）：`run_skill` 展开一个工作流的动作。
+    # 只记 name / 字符数 / 来源路径（相对工作区）；Skill **正文**是用户放置的
+    # 自由文本（常含私有约定与步骤），按 ADR-006 一律不出机。
+    # 本地字段叫 source，上传前改名 origin：`source` 在服务端 DENIED_KEYS 里
+    #（它是「源代码正文」的同义词），照原样传会被整条拒掉。
+    "skill.run": Rule(
+        upload="skill.run",
+        fields={
+            "name": ("name", "str"),
+            "chars": ("chars", "int"),
+            "origin": ("source", "path"),
+        },
+        note="展开一个 Skill 工作流的元数据。正文只留本机，这里只记名字、长度与来源",
+    ),
+    # 代码审阅（M9-H）：`review.run` 记一次提交前自审的发起动作。
+    # 只记「审了多少文件、提了几条、几条是严重级、耗时」——审阅**意见正文**是
+    # 模型输出、属 ADR-006 的正文类，一个字符都不出机。计数已够回答
+    # 「自审到底做了没、有没有抓到大问题」。
+    "review.run": Rule(
+        upload="review.run",
+        fields={
+            "files": ("files", "int"),
+            "issues": ("issues", "int"),
+            "severity_high": ("severity_high", "int"),
+            "ms": ("ms", "int"),
+        },
+        note="一次提交前自审的元数据。意见正文只留本机，这里只记文件数、"
+        "问题数、严重级数与耗时",
+    ),
+    # 客户端模型选择器（M9-I）：`model.route` 记一次选型结果。
+    # 只记「任务意图 + 选出的模型名 + 原因枚举（none/static/size/fallback）」——
+    # 任务**正文**是 ADR-006 的正文类，一个字符都不出机。模型名与原因已够回答
+    # 「谁在按什么策略选了哪个模型」。
+    "model.route": Rule(
+        upload="model.route",
+        fields={
+            "intent": ("intent", "str"),
+            "model": ("model", "str"),
+            "reason": ("reason", "str"),
+        },
+        note="一次模型选型的元数据。任务正文只留本机，这里只记意图、模型名与原因枚举",
+    ),
     "governance.login": Rule(
         upload="governance.login",
         fields={
@@ -963,6 +1201,62 @@ _RULES: dict[str, Rule] = {
             "user_id": ("user_id", "str"),
         },
         note="用户退出治理面登录的动作。只记结果与不透明用户标识",
+    ),
+    # ---------------------------------------------------------------- 客户端自动更新（M9）
+    "update.check": Rule(
+        upload="update.check",
+        fields={
+            "result": ("result", "str"),
+            "version": ("version", "str"),
+            "origin": ("source", "str"),
+            "seq": ("seq", "int"),
+        },
+        note="一次更新检查的结论：available/idle/failed/declined。只记版本号、"
+        "来源名（governance/local）与发布序号 —— 来源地址是本机内网拓扑，不上传。"
+        "本地字段叫 source，上传前改名 origin：`source` 在服务端 DENIED_KEYS 里"
+        "（它是「源代码正文」的同义词），照原样传会被整条拒掉",
+    ),
+    "update.download": Rule(
+        upload="update.download",
+        fields={
+            "version": ("version", "str"),
+            "origin": ("source", "str"),
+            "size": ("size", "int"),
+            "result": ("result", "str"),
+        },
+        note="安装包下载的起止。只记字节数（清单声明值）与结果，不记下载地址",
+    ),
+    "update.staged": Rule(
+        upload="update.staged",
+        fields={
+            "version": ("version", "str"),
+            "origin": ("source", "str"),
+            "size": ("size", "int"),
+            "sha256_digest": ("sha256Digest", "digest"),
+        },
+        note="安装包已通过 sha256 校验并原子落盘，等待用户确认安装。"
+        "sha256 只上传前 16 位 —— 完整摘要配合已知包体可做确认性比对，"
+        "而这里只需要一个「同一份包」的短标识",
+    ),
+    "update.verify_failed": Rule(
+        upload="update.verify_failed",
+        fields={
+            "origin": ("source", "str"),
+            "kind": ("kind", "str"),
+        },
+        note="清单验签或包体校验失败。这是**被篡改/被损坏**信号，必须留痕；"
+        "kind 取值 shape/signature/sha256/size",
+    ),
+    "update.applied": Rule(
+        upload="update.applied",
+        fields={"version": ("version", "str")},
+        note="壳侧确认本机已更新到该版本（启动时读到 marker 后补记）",
+    ),
+    "update.apply_rejected": Rule(
+        upload="update.apply_rejected",
+        fields={"reason": ("reason", "str")},
+        note="壳侧拒绝执行 staging 路径（形态校验失败等）。记录被拒原因，"
+        "这是「本机拒绝了安装」的证据",
     ),
 }
 

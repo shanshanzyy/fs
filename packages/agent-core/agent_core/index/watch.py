@@ -50,6 +50,7 @@ class IndexWatcher:
         enhanced: bool = False,
         index: SearchIndex | None = None,
         audit: AuditLog | None = None,
+        on_change: Callable[[list[str]], None] | None = None,
     ) -> None:
         self.root = Path(root)
         self.interval = max(MIN_INTERVAL, int(interval))
@@ -63,6 +64,10 @@ class IndexWatcher:
         # 审计日志而不是回调：写入必须经过 AuditLog 的链锁（见 audit.py），
         # 而 watcher 跑在后台线程上 —— 自己拼一条 JSON 会把哈希链写坏。
         self._audit = audit
+        # `on_change` 与上面那条纪律**不冲突**：它只收「哪些相对路径变了」，
+        # 唯一用途是广播给界面（预览自动刷新），既不写链也不碰内容。
+        # 回调里抛异常会被吞掉 —— 后台轮询线程不能因为一次订阅方故障而死。
+        self._on_change = on_change
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -157,7 +162,19 @@ class IndexWatcher:
             if rel in previous and sig != previous[rel]
         ]
         total = len(added) + len(changed) + len(removed)
-        if index is None or total == 0:
+        if total == 0:
+            return None
+
+        # 先广播再喂索引：预览自动刷新只关心「哪些文件动了」，与索引是否可用无关。
+        # 一次 poll 就是一个天然的合并窗口（同一轮里的多文件改动只发一条事件），
+        # 因此这里不需要再叠一层节流器。
+        if self._on_change is not None:
+            try:
+                self._on_change(added + changed + removed)
+            except Exception:  # noqa: BLE001 - 订阅方故障不能杀轮询线程
+                pass
+
+        if index is None:
             return None
 
         started = time.time()

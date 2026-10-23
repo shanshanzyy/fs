@@ -173,6 +173,16 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "paths_digest": "digest",
         "checkpoint_id": "str",
     },
+    # 逐条回退（P3）：只收「删了几条消息、首末 seq、对应检查点、文件动作计数」，
+    # 消息正文与文件正文一个字符都不出机（ADR-006）。
+    "rollback.truncate": {
+        "count": "int",
+        "first_seq": "int",
+        "last_seq": "int",
+        "checkpoint_id": "str",
+        "restored": "int",
+        "deleted": "int",
+    },
     "git.commit": {
         "message_digest": "digest",
         "message_chars": "int",
@@ -393,6 +403,7 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "cols": "int",
         "rows": "int",
         "mode": "str",
+        "remote": "str",
         "ms": "int",
     },
     "term.close": {
@@ -436,6 +447,28 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "reason_digest": "digest",
         "reason_chars": "int",
     },
+    # 测试闭环（M9-C）：跑一轮的元数据。测试输出正文不出机（ADR-006），
+    # 只收命令指纹、轮次、通过/失败计数与耗时。
+    "test_loop.run": {
+        "command_digest": "digest",
+        "command_chars": "int",
+        "rounds": "int",
+        "passed": "int",
+        "failed": "int",
+        "ms": "int",
+    },
+    # 后台 / 并行 Agent（M9-D）。只收 task_id 归属、状态枚举、摘要长度与耗时；
+    # 任务正文与结论不出机（ADR-006）。
+    "task.spawn": {"task_id": "str", "state": "str", "chars": "int", "ms": "int"},
+    # 定时任务调度（M10）。只收 job_id 归属、动作/状态枚举、prompt 长度与耗时；
+    # job 的 prompt 正文不出机（ADR-006）。
+    "schedule.job": {
+        "job_id": "str",
+        "action": "str",
+        "state": "str",
+        "chars": "int",
+        "ms": "int",
+    },
     # 上下文裁剪（C4）。只收「压掉了几条」与「摘要多长」——
     # 摘要**正文**必然引述对话里的约束、路径与命令原文，属于 ADR-006 的正文类，
     # 客户端也不会把它放进载荷。
@@ -449,6 +482,47 @@ _SCHEMA: dict[str, dict[str, str]] = {
     "memory.add": {"scope": "str", "chars": "int", "digest": "digest"},
     # 每轮任务注入记忆段。只收注入条数与总字符数，**不记正文**。
     "memory.inject": {"count": "int", "chars": "int"},
+    # Skill / 斜杠命令（M9-A）：展开一个工作流的元数据。正文不出机（ADR-006），
+    # 只收名字、字符数与来源路径。本地字段叫 source、上传前改名 origin
+    #（`source` 在 DENIED_KEYS 里，是「源代码正文」同义词）。
+    "skill.run": {"name": "str", "chars": "int", "origin": "path"},
+    # 代码审阅（M9-H）：一次提交前自审的元数据。意见正文不出机（ADR-006），
+    # 只收文件数、问题数、严重级数与耗时。
+    "review.run": {"files": "int", "issues": "int", "severity_high": "int", "ms": "int"},
+    # --- 远程设备 file 面（M11）---
+    # 用户本人经界面做的一次远程连接管理动作。只收连接名归属、动作枚举、
+    # 两个权限位、成功与否与耗时；host / 密钥路径等基础设施信息不出机（ADR-006）。
+    "remote.connection": {
+        "connection": "str",
+        "action": "str",
+        "allow_write": "bool",
+        "allow_shell": "bool",
+        "ok": "bool",
+        "ms": "int",
+    },
+    # 用户本人经界面做的一次远端文件读/写动作。只收连接名、远端相对路径、
+    # 动作枚举、字节数、内容 sha256 与增删行数；**文件正文与 diff 正文
+    # 一个字符都不出机**（ADR-006）。
+    "remote.file": {
+        "connection": "str",
+        "path": "path",
+        "action": "str",
+        "bytes": "int",
+        "sha256": "digest",
+        "added": "int",
+        "removed": "int",
+        "backed_up": "bool",
+    },
+    "remote.rollback": {
+        "connection": "str",
+        "path": "path",
+        "action": "str",
+        "bytes": "int",
+        "backed_up": "bool",
+    },
+    # 客户端模型选择器（M9-I）：一次选型。任务正文不出机（ADR-006），
+    # 只收意图、模型名与原因枚举。
+    "model.route": {"intent": "str", "model": "str", "reason": "str"},
     # 治理面登录 / 注册 / 登出（M3+）：用户在桌面端接入治理面的动作。
     # 只收结果、装配状态与不透明标识（userId/deviceId）；邮箱、口令、邀请码、
     # 治理面地址一律只留本机（ADR-006）。
@@ -476,6 +550,28 @@ _SCHEMA: dict[str, dict[str, str]] = {
     "approval.denied_by_policy": {"tool": "str", "reason": "str"},
     "approval.no_ui": {"tool": "str", "decision": "str"},
     "approval.timeout": {"tool": "str", "timeout_s": "int"},
+    # 草稿预览（P1-2）：审批期渲染「改动后效果」，正文不落盘、不出机（ADR-006）。
+    # token 由客户端生成（一次性短标识），服务端只按 digest 形态收。
+    "preview.draft": {
+        "path": "path",
+        "token": "digest",
+        "files": "int",
+        "chars": "int",
+    },
+    # 真实应用预览（P2 / ADR-039）：只登记本机 dev server 的端口与主机。
+    # 远端预览转发（P3 / ADR-040）：只收状态跃迁与两个端口号，不收被转发的字节。
+    "preview.external": {"port": "int", "host": "str"},
+    "preview.tunnel": {
+        "action": "str",
+        "connection": "str",
+        "remote_port": "int",
+        "local_port": "int",
+        "ok": "bool",
+        "ms": "int",
+        "reason": "str",
+        "closed": "bool",
+        "refs": "int",
+    },
     # --- 沙箱拦截 ---
     # kind: escape / sensitive / policy_deny / audit_dir / root_write / malformed
     "sandbox.block": {
@@ -519,6 +615,51 @@ _SCHEMA: dict[str, dict[str, str]] = {
     # --- 策略 ---
     "policy.fetch": {"version": "int", "scope": "str"},
     "policy.rejected": {"reason": "str"},
+    # --- 客户端发布（M9）---
+    # **服务端自产**：控制台/CLI 发布与撤销客户端版本。客户端没有调用点，
+    # 因此这两条在 tests/test_chain_compat.py 的 server_side 白名单里。
+    # sha256 只收前 16 位指纹（与 ADR-006 的「不落正文」同口径）——
+    # 整串 sha256 已存在 release 表里，审计只回答「谁在什么时候发了哪个版本」。
+    "release.publish": {
+        "releaseId": "str",
+        "version": "str",
+        "channel": "str",
+        "platform": "str",
+        "arch": "str",
+        "sha256Digest": "digest",
+        "size": "int",
+        "mandatory": "bool",
+        "rolloutPercent": "int",
+        "seq": "int",
+    },
+    "release.revoke": {"releaseId": "str", "revoked": "bool"},
+    # --- 客户端自动更新（M9）---
+    # 客户端自产（内核 update/service.py）。字段名以客户端词汇表的上传名为准：
+    # 本机字段叫 `source`，上传前被 vocabulary 改名 `origin` —— `source` 在
+    # DENIED_KEYS 里（它是「源代码正文」的同义词），照原样收会整条被拒。
+    # 主题是「装了哪个版本」，不是「从哪台机器下的」，所以来源只留名字
+    # （governance/local），地址一律不出本机。
+    "update.check": {
+        "result": "str",
+        "version": "str",
+        "origin": "str",
+        "seq": "int",
+    },
+    "update.download": {
+        "version": "str",
+        "origin": "str",
+        "size": "int",
+        "result": "str",
+    },
+    "update.staged": {
+        "version": "str",
+        "origin": "str",
+        "size": "int",
+        "sha256_digest": "digest",
+    },
+    "update.verify_failed": {"origin": "str", "kind": "str"},
+    "update.applied": {"version": "str"},
+    "update.apply_rejected": {"reason": "str"},
 }
 
 # 允许的通用字段（任何事件都可以带）。只放「无内容风险」的定位信息。

@@ -95,8 +95,12 @@ def backend_pids() -> set[str]:
         out = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {BACKEND_EXE}", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=20,
+            # 中文 Windows 的 tasklist 输出是 GBK，`text=True` 默认 UTF-8 解码会抛
+            # UnicodeDecodeError（进而 stdout 为 None）；用 errors="replace" 兜底，
+            # 反正这里只解析进程名与 PID（纯 ASCII 列），坏字节不影响结果。
+            encoding="utf-8", errors="replace",
         ).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return set()
     pids: set[str] = set()
     for line in out.splitlines():

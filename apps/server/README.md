@@ -135,15 +135,17 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 | GET | `/api/v1/auth/oidc/begin` | 公开 | 开始 OIDC 流程；未配 OIDC 时 **404** |
 | POST | `/api/v1/auth/oidc/callback` | 公开 | OIDC 回调换会话（入参 `state` / `code`） |
 
-### 静态页（登录页，Q 阶段）
+### 静态页（登录页 + 治理面控制台，Q / M8 阶段）
 
-服务端**唯一**的 HTML 出口。之前账号 API 早已就绪，但界面用户没有登录入口
-（登录只能靠 CLI），这里补一个极简登录页把闭环接上。
+服务端**唯一**的 HTML 出口。登录页把「账号 API 就绪但界面用户没有登录入口」的闭环接上；
+控制台（M8）把治理面从「有 API」推进到「可被非工程角色（管理员 / 审计员 / 老板）使用」。
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/login` | 公开 | 登录页（邮箱/密码 → `POST /api/v1/auth/login`；OIDC 场景给「用 SSO 登录」） |
 | GET | `/assets/{name}` | 公开 | 登录页同目录静态资源（如 `/assets/login.js`） |
+| GET | `/console` | 公开 | 治理面 Web 控制台外壳（M8）：无内联脚本，按 `/auth/me` 的 `permissions` 建导航 |
+| GET | `/console/assets/{name}` | 公开 | 控制台静态资源（`console.css` / `api.js` / `app.js` / `panels.js`） |
 
 要点：
 
@@ -152,11 +154,21 @@ python -m vibe_server doctor --probe http://127.0.0.1:8787
 - **安全头**：页面自带收紧的 CSP（`default-src 'self'` / `connect-src 'self'` /
   `form-action 'none'` / `frame-ancestors 'none'`）；`Referrer-Policy: no-referrer`
   由 `httpd._send()` 对**每个**响应统一附加（放统一出口比放每个 handler 可靠）。
-- **路径穿越防护**：`/assets/{name}` 只允许单个路径段，编码过的 `%2e%2e%2f` 会被
-  Router 解码后拒掉（`tests/test_static.py` 钉住）。
+- **路径穿越防护**：`/assets/{name}` 与 `/console/assets/{name}` 共用 `_serve_asset()`，
+  只允许单个路径段，编码过的 `%2e%2e%2f` 会被 Router 解码后拒掉
+  （`tests/test_static.py` / `tests/test_console.py` 钉住）。
+- **控制台（M8）**：零构建（vanilla HTML/CSS/JS、无框架/无 CDN/无构建），
+  资源分放 `api/static/console/` 子目录走单段路由；外壳**无内联脚本 / 无内联事件**
+  （CSP 锁死，监听一律 `addEventListener`），会话复用 `sessionStorage` 键
+  `vibe.accessToken`/`vibe.refreshToken`（与 `login.js` 同键），401 走公开的
+  `POST /api/v1/auth/refresh` 单飞刷新重试一次、失败跳 `/login`。**前端隐藏面板只是体验，
+  真正的权限闸门始终是路由上的 `permissions=(...)`**；九个面板（概览 / 成员与邀请码 /
+  团队 / 设备 / 策略 / 配额 / 审计 / 用量 / 密钥台账）只调用既有接口 + 三条新读口
+  （`GET /teams`、`GET /teams/{id}/members`、`GET /enrollments`），密钥台账沿用
+  「永不回值」口径。
 - **薄壳纪律**：桌面端只在治理面「已配置但未登录/降级」时给「去登录」入口，
   指向 `<serverUrl>/login`；登录逻辑全在服务端，Electron 壳里不实现任何认证。
-- 不改变「服务端不存代码」的红线（ADR-006）：这里服务的是应用自带的登录页文件，
+- 不改变「服务端不存代码」的红线（ADR-006）：这里服务的是应用自带的页面文件，
   目录固定、只读，与用户代码 / prompt / 模型输出无关。
 
 ### 对接公司 IdP（OIDC）
@@ -213,11 +225,21 @@ VIBE_SRV_OIDC_REDIRECT_URI=https://vibe.corp.example/api/v1/auth/oidc/callback
 | 方法 | 路径 | 权限 |
 |---|---|---|
 | GET | `/api/v1/users` | `user:read` |
+| GET | `/api/v1/teams` | `team:read` |
 | POST | `/api/v1/teams` | `team:write` |
+| GET | `/api/v1/teams/{teamId}/members` | `team:read` |
 | POST | `/api/v1/teams/{teamId}/members` | `team:write` |
+| DELETE | `/api/v1/teams/{teamId}/members/{userId}` | `team:write` |
+| GET | `/api/v1/enrollments` | `enrollment:write` |
 | POST | `/api/v1/enrollments` | `enrollment:write` |
 | GET | `/api/v1/devices` | `device:read` |
 | POST | `/api/v1/devices/{deviceId}/revoke` | `device:revoke` |
+
+> **M8 新增的 `GET /teams`、`GET /teams/{teamId}/members`、`GET /enrollments` 是只读口，
+> 专为控制台补齐**（此前只有 CLI / 手写请求可用）。三条都带路由级权限 + 作用域校验：
+> `GET /teams` 非组织级只回本团队；`GET /teams/{id}/members` 跨团队由 `scope_team` 拦下（403）；
+> `GET /enrollments` 需 `enrollment:write`，非组织级只回自己有签发权的团队，且响应
+> **永不含 `token_hash`**（存储层查询就不 SELECT 它）。
 
 ### 策略 / 配额
 
@@ -482,7 +504,7 @@ cd apps/server
 python -m unittest discover -s tests -t .
 ```
 
-420 个用例，分二十组（其中 25 条 skip —— 2 条按平台跳过（Windows 上没有可用的 `echo`），
+444 个用例，分二十一组（其中 25 条 skip —— 2 条按平台跳过（Windows 上没有可用的 `echo`），
 23 条为 **PG 契约用例**：仅在设了 `VIBE_SRV_TEST_PG_DSN` 指向真实可清空的 PG 时才跑，
 否则按「环境相关 skip」处理，默认 hermetic 不受影响）：
 
@@ -503,6 +525,7 @@ python -m unittest discover -s tests -t .
 | `test_feature_flags.py` | 30 | 开关求值、规范化、发布合并、与策略服务接线 |
 | `test_secrets.py` | 19 | 密钥托管：`file`（惰性解析、权限过宽即失败、明文不进 repr/台账、`reload` 轮换）、`env`、`vault` 只验配置闸门、`doctor` 集成 |
 | `test_static.py` | 10 | 登录页（Q）：`/login` 200 + `text/html` + `Referrer-Policy: no-referrer`、CSP 头、未认证可访问、`/assets/*` 路径穿越（含 `%2e%2e%2f`）被拒、与 `/api/v1/auth/*` 无路由冲突、`login.js` 接口路径与 `routes.API` 防漂移 |
+| `test_console.py` | 24 | **治理面控制台（M8）**：三条新读口的权限边界（`GET /teams` 无 token→401 / `team:read`→200；`GET /teams/{id}/members` 跨团队→403；`GET /enrollments` 以 developer→403、owner→200 且响应**不含 `tokenHash`**；非组织级 `GET /teams` 只回本团队；team_admin 只看得见自己有签发权的团队）+ 控制台出口契约（`/console` 200 + CSP、`/console/assets/app.js` 200 + `javascript`、`/console/assets/*` 穿越→403 / 缺资源→404、公开可访问、与 `/login` 无路由冲突、`console.html` **无内联脚本与内联事件**、脚本内接口路径与 `routes.API` 防漂移、`api.js` 的 401 单飞刷新与 `vibe.accessToken` 会话键） |
 | `test_pgproto.py` | 16 | **假 PG server**（stdlib `socket`，照搬 `test_oidc.py` 假 IdP 范式）逐消息钉协议：startup + SCRAM-SHA-256 全流程、MD5 路径、**拒绝明文口令**、`ErrorResponse`→`StoreError`、**参数注入只作 `$1` 绑定值出现**、`sslmode=require` 且服务端无 TLS 时明确失败不降级、`split_statements` 与 DSN 解析 |
 | `test_store_contract.py` | 23（+23 PG skip） | **Store 契约双后端对拍**：同一批断言在 SQLite 全量跑、PG（`VIBE_SRV_TEST_PG_DSN`）**同批跑**。覆盖用户 / 团队 / 成员 / bootstrap 单语句原子、项目授权、设备刷新令牌、注册令牌占用、**配额原子预留（含 24 线程并发不超发）** / 结算 / 释放、固定窗口限流、配额与预算策略、审计幂等 + 链头/会话尾/批次顺序、吊销清理、密钥台账、认证事件 |
 | `test_config_multi_instance.py` | 13 | 多实例意图判定（共享 URL / 开关）、**默认单机逐字节不变**（仍自动落 `jwt.key`）、三门槛校验（缺 `JWT_SECRET` / 过短、拒 SQLite、必须 `REQUIRE_TLS`、必须 `TRUST_FORWARDED_FOR`）、`open_store` 分派（**PG 不静默退回 SQLite**、未知 scheme 报错）、`doctor` 单机无「多实例」行 / 多实例就绪时输出就绪行 |

@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from ..errors import AgentError, SandboxViolation, ToolError
 from ..sandbox import PathGuard
@@ -51,6 +52,14 @@ MAX_REF_ITEMS = 50
 # 引用类型。`image`（N / P1-10）与其它三种的**产物形态不同**：它不产出文本块，
 # 而是产出一个 OpenAI 兼容的 image part，随消息 content 的 parts 列表一起发。
 _TYPES = ("file", "folder", "symbol", "image")
+
+# 远端命名空间前缀（与 `remote/roots.py::PREFIX` 同口径）。这里刻意只写字面量：
+# 引用解析属于核心链路，VIBE_REMOTE 关着时不应该为此 import 整个远端子系统。
+_REMOTE_PREFIX = "@remote/"
+
+#: 远端引用的解析器：`(type, ns_path) -> (label, body)`。
+#: 由宿主按当前会话的路由器注入；未启用远端功能时为 None。
+RemoteResolver = Callable[[str, str], "tuple[str, str]"]
 
 
 @dataclass(frozen=True)
@@ -295,15 +304,35 @@ def resolve_refs(
     max_chars: int = MAX_REF_CHARS,
     allow_images: bool = False,
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+    remote_resolver: RemoteResolver | None = None,
 ) -> RefResolution:
     """把引用意图列表解析成上下文正文（与图片 parts）。永不抛异常。
 
     `allow_images`（N / P1-10）默认 **False**：图片是会外发的能力，未显式开启
     （`vision_mode=off`）时 `image` 引用逐条降级为提示，绝不进 parts。
+
+    `remote_resolver`（M11/M12）处理 `@remote/<连接>/<路径>` 形式的引用：
+    未注入时（VIBE_REMOTE 关）这类引用**降级为提示**，绝不把它们当本地路径读 ——
+    否则最坏情况是把同名的本机文件当成远端内容塞进上下文。
     """
     result = RefResolution()
     remaining = max(0, int(max_chars))
     seen: set[tuple[str, str]] = set()
+
+    def accept(rtype: str, value: str, label: str, body: str) -> None:
+        """按剩余预算收下一条引用（超限截断并置 truncated）。"""
+        nonlocal remaining
+        truncated = False
+        if len(body) > remaining:
+            body = body[:remaining]
+            truncated = True
+            result.truncated = True
+        remaining -= len(body)
+        result.refs.append(
+            ResolvedRef(
+                type=rtype, value=value, label=label, body=body, truncated=truncated
+            )
+        )
 
     for raw in refs or []:
         item = raw if isinstance(raw, dict) else {}
@@ -352,6 +381,34 @@ def resolve_refs(
             )
             continue
 
+        if value.startswith(_REMOTE_PREFIX):
+            # 远端引用：交给宿主注入的路由解析器（M12 同一条路由）。
+            if remote_resolver is None:
+                result.errors.append(
+                    f"{rtype}:{value} 已跳过 —— 远端引用需要开启远端功能（VIBE_REMOTE）"
+                )
+                continue
+            if rtype not in ("file", "folder"):
+                result.errors.append(
+                    f"{rtype}:{value} 已跳过 —— 远端引用只支持 file / folder"
+                )
+                continue
+            try:
+                label, body = remote_resolver(rtype, value)
+            except SandboxViolation as exc:
+                result.errors.append(f"{rtype}:{value} 被拒绝 —— {exc}")
+                continue
+            except AgentError as exc:
+                result.errors.append(f"{rtype}:{value} 解析失败 —— {exc}")
+                continue
+            except Exception as exc:  # noqa: BLE001 —— 单条引用出错绝不能弄死整条任务
+                result.errors.append(
+                    f"{rtype}:{value} 解析失败 —— {type(exc).__name__}: {exc}"
+                )
+                continue
+            accept(rtype, value, label, body)
+            continue
+
         try:
             label, body = _render_ref(paths, rtype, value)
         except SandboxViolation as exc:
@@ -366,15 +423,7 @@ def resolve_refs(
             )
             continue
 
-        truncated = False
-        if len(body) > remaining:
-            body = body[:remaining]
-            truncated = True
-            result.truncated = True
-        remaining -= len(body)
-        result.refs.append(
-            ResolvedRef(type=rtype, value=value, label=label, body=body, truncated=truncated)
-        )
+        accept(rtype, value, label, body)
 
     return result
 
@@ -418,6 +467,7 @@ def build_refs_prompt(
     *,
     allow_images: bool = False,
     max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+    remote_resolver: RemoteResolver | None = None,
 ) -> tuple[str, RefResolution]:
     """把用户正文与引用块拼成真正提交给 Agent 的 prompt。
 
@@ -427,7 +477,11 @@ def build_refs_prompt(
     prompt 里不会多出任何注入块。
     """
     resolution = resolve_refs(
-        paths, refs, allow_images=allow_images, max_image_bytes=max_image_bytes
+        paths,
+        refs,
+        allow_images=allow_images,
+        max_image_bytes=max_image_bytes,
+        remote_resolver=remote_resolver,
     )
     block = format_refs_block(resolution)
     if not block:

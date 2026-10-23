@@ -13,6 +13,10 @@ Win32，**不引第三方**（如 `pywinpty` / `winpty`）—— 核心链路零
 
 - 只在 ConPTY 可用时启用；老系统自动降级（见 manager 的探测）。
 - 不做鼠标事件 / 焦点事件上报（交互式终端够用即可，见计划「明确不做」）。
+- 桌面壳把内核的 stdio 重定向成管道：创建伪控制台子进程时**必须**显式清空标准
+  句柄（`STARTF_USESTDHANDLES` + 三个 NULL），并且**不能**带 `CREATE_NO_WINDOW`。
+  少任一条，shell 都会把提示符/回显写回内核管道（或干脆没有控制台），伪控制台
+  只收到开屏序列，随后的有界自检会判「哑终端」并降级 —— 实测踩过。
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from ctypes import wintypes
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
+STARTF_USESTDHANDLES = 0x00000100
 STILL_ACTIVE = 259
 READ_CHUNK = 65536
 
@@ -295,10 +300,26 @@ class WindowsConPtySession:
         si = STARTUPINFOEXW()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
         si.lpAttributeList = ctypes.cast(attr, ctypes.c_void_p)
+        # **必须显式声明「不给标准句柄」**。桌面壳（apps/desktop/src/backend.js）用
+        # `stdio: ['ignore','pipe','pipe']` 拉起内核，内核自己的 stdin/stdout/stderr
+        # 全是被重定向的管道；不声明这一条时，CreateProcess 会把这三个句柄原样
+        # 带给 shell —— PowerShell 于是把提示符和命令回显写进**内核的管道**，
+        # 伪控制台只收到开屏那 89 字节（清屏/标题/显示光标），随后 manager 的
+        # 有界自检判定「哑终端」并降级为管道模式（实测的 mode=pipe）。
+        # 置为 NULL 后，控制台子系统才会把 std 句柄接到伪控制台上。
+        si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES
+        si.StartupInfo.hStdInput = None
+        si.StartupInfo.hStdOutput = None
+        si.StartupInfo.hStdError = None
 
         cmdline = subprocess.list2cmdline(self.argv)
         env_block = _env_block(env)
         pi = PROCESS_INFORMATION()
+        # 这里**不能**再带 `CREATE_NO_WINDOW`：它与伪控制台属性冲突 —— 实测带上它
+        # 之后 CreateProcess 照样成功，但子进程拿不到任何控制台，伪控制台一个字节
+        # 都收不到（连开屏序列都没有），manager 只能降级。伪控制台子进程本来就没有
+        # 窗口，属性绑定正确时也不会新开窗口；绑定失败由 UpdateProcThreadAttribute
+        # 的返回值提前拦住，不靠这个标志兜底。
         flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
         ok = k.CreateProcessW(
             None,
@@ -350,13 +371,18 @@ class WindowsConPtySession:
         buf = ctypes.create_string_buffer(size.value)
         if not k.InitializeProcThreadAttributeList(buf, 1, 0, ctypes.byref(size)):
             raise TerminalUnsupported("InitializeProcThreadAttributeList 失败")
-        hpc_ref = ctypes.c_void_p(hpc.value)
+        # PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 的 lpValue 就是 **HPCON 值本身**，
+        # 不是「指向 HPCON 的指针」—— 与其它属性（如 HANDLE_LIST）的约定不同。
+        # 传 `&hpc` 时 UpdateProcThreadAttribute 照样返回成功，但 CreateProcess 会把
+        # 伪控制台当成没绑上：子进程被 Windows 当成普通控制台程序，**新开一个原生
+        # 终端窗口**（现象：点「开启终端」弹出一个 PowerShell 窗口），同时输出全写进
+        # 那个真控制台、我们的输出管道一个字节都收不到（随后被判「哑终端」降级）。
         ctypes.set_last_error(0)
         if not k.UpdateProcThreadAttribute(
             buf,
             0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            ctypes.cast(ctypes.byref(hpc_ref), ctypes.c_void_p),
+            ctypes.c_void_p(hpc.value),
             ctypes.sizeof(wintypes.HANDLE),
             None,
             None,

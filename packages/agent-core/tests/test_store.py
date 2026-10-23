@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_core.config import Config  # noqa: E402
-from agent_core.host.server import HostServer  # noqa: E402
+from agent_core.host.server import HostServer, restore_latest_session  # noqa: E402
 from agent_core.host.session import Session  # noqa: E402
 from agent_core.host.store import SessionStore, validate_message_group  # noqa: E402
 from tests.test_stream import FakeStreamClient  # noqa: E402
@@ -118,6 +118,36 @@ class StoreTests(unittest.TestCase):
         self.store.delete_session("s1")
         self.assertIsNone(self.store.get_session("s1"))
         self.assertEqual(self.store.get_messages("s1"), [])
+
+    def test_with_seq_and_truncate_from(self) -> None:
+        """逐条回退的存储底座：seq 只给 UI，截断按 seq 删尾且 seq 可复用。"""
+        self._append("s1", "user", "1")
+        self._append("s1", "assistant", "2")
+        self._append("s1", "user", "3")
+        self._append("s1", "assistant", "4")
+
+        # 默认形态（恢复 / 发给模型）绝不多出 seq 字段
+        self.assertNotIn("seq", self.store.get_messages("s1")[0])
+        self.assertEqual(
+            [m["seq"] for m in self.store.get_messages("s1", with_seq=True)],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(self.store.max_seq("s1"), 4)
+        self.assertEqual(self.store.last_user_seq("s1"), 3)
+
+        self.assertEqual(self.store.truncate_from("s1", 3), 2)
+        self.assertEqual(
+            [m["content"] for m in self.store.get_messages("s1")], ["1", "2"]
+        )
+        self.assertEqual(self.store.max_seq("s1"), 2)
+        # 删尾之后再追加落到同一个 seq —— 「同一条提问可以再次回退」
+        self._append("s1", "user", "3b")
+        self.assertEqual(
+            self.store.get_messages("s1", with_seq=True)[-1]["seq"], 3
+        )
+        # 非法 / 空截断不动库
+        self.assertEqual(self.store.truncate_from("s1", 0), 0)
+        self.assertEqual(len(self.store.get_messages("s1")), 3)
 
     def test_corrupt_db_is_quarantined_and_rebuilt(self) -> None:
         self._append("s1", "user", "旧数据")
@@ -447,6 +477,58 @@ class SessionApiTests(unittest.TestCase):
         # 恢复后状态里的 sessionId 应切到被恢复的会话
         _, state = self._get("/api/state")
         self.assertEqual(state["sessionId"], sid)
+
+
+class RestoreLatestSessionTests(unittest.TestCase):
+    """重启续接（D）的纯函数：选中最近会话 / 无历史返回 None / 坏序列拒绝。
+
+    它是「关掉软件再打开能接着聊」的内核侧入口 —— host 启动时拿它挑一个可恢复
+    的会话；这里锁住三条：工作区过滤、最近优先、残缺组不恢复（宁可从新会话开始，
+    也不把一条会被服务端 400 拒绝的序列塞进 Agent）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = str(Path(self._tmp.name).resolve())
+        self.store = SessionStore(Path(self._tmp.name) / "sessions.db")
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmp.cleanup()
+
+    def _append(self, sid: str, workspace: str, role: str, content: str = "", meta: str | None = None):
+        self.store.append_message(
+            sid, workspace=workspace, model="m", role=role, content=content, tool_meta=meta
+        )
+
+    def test_picks_most_recent_session_of_workspace(self) -> None:
+        self._append("s1", self.ws, "user", "旧会话")
+        # updated_at 精度为「秒」，同秒内两条会并列 —— 隔开一秒让「最近」确定
+        time.sleep(1.1)
+        self._append("s2", self.ws, "user", "新会话")
+        self._append("s3", "w:\\other", "user", "别的工作区")
+
+        picked = restore_latest_session(self.store, self.ws)
+        self.assertIsNotNone(picked)
+        assert picked is not None
+        sid, messages = picked
+        self.assertEqual(sid, "s2", "应挑中本工作区最近活跃的会话")
+        self.assertEqual(messages[0]["content"], "新会话")
+
+    def test_none_when_no_history(self) -> None:
+        self.assertIsNone(restore_latest_session(self.store, self.ws))
+        # 别的会话存在但工作区不匹配，也等同于无历史
+        self._append("s1", "w:\\other", "user", "别家")
+        self.assertIsNone(restore_latest_session(self.store, self.ws))
+
+    def test_none_when_latest_group_is_broken(self) -> None:
+        """最近一条是孤立 tool 消息（残缺组）时必须拒绝恢复，降级为新会话。"""
+        self._append("s1", self.ws, "user", "hi")
+        self._append(
+            "s1", self.ws, "tool", "孤儿结果",
+            meta=json.dumps({"tool_call_id": "call_x"}),
+        )
+        self.assertIsNone(restore_latest_session(self.store, self.ws))
 
 
 if __name__ == "__main__":

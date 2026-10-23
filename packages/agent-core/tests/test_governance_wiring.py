@@ -229,6 +229,30 @@ class WireStatusTests(unittest.TestCase):
         self.assertIsNotNone(runtime.client)
         self.assertTrue(runtime.constraints.allow_cloud)
 
+    def test_gateway_routed_only_when_policy_allows_cloud(self) -> None:
+        """`gateway_routed` 决定界面能不能改模型，必须跟着「是否真的走网关」走。
+
+        策略禁云时请求全部落到本地客户端，本机 settings.json 就是权威；
+        此时若仍标记「已接管」，界面就会挡住一次本来有效的保存。
+        """
+        self._login()
+        _FakeGovernanceClient.behavior = {"policy_response": _policy_response(**CLOUD_ON)}
+        cloud = gov_runtime.wire(self._config(SERVER), store=self.store)
+        self.assertTrue(cloud.gateway_routed)
+        self.assertTrue(cloud.locks_local_config)
+
+        _FakeGovernanceClient.behavior = {
+            "policy_response": _policy_response(
+                allowCloud=False, routing={"allowCloud": False}
+            )
+        }
+        local = gov_runtime.wire(self._config(SERVER), store=self.store)
+        self.assertFalse(local.gateway_routed)
+        self.assertFalse(local.locks_local_config)
+        # 闸门函数与属性同一判据：两个入口（settings / MCP）都只认这一个。
+        self.assertFalse(gov_runtime.is_config_locked(local))
+        self.assertTrue(gov_runtime.is_config_locked(object()))  # 未知形态 fail-closed
+
     def test_uploader_absent_when_schema_unavailable(self) -> None:
         """契约拉不到就不上传（fail-closed）：宁可不传，也不传不合契约的事件。"""
         self._login()

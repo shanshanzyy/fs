@@ -12,8 +12,9 @@ from __future__ import annotations
 
 from ..edit import MAX_EDIT_FILES, EditTransaction, TransactionError, TransactionReport
 from ..errors import AgentError, SandboxViolation, ToolError
+from ..preview_media import is_draftable
 from ..sandbox import Risk
-from .base import ToolContext, ToolPreview, ToolResult, ToolSpec
+from .base import DraftFile, ToolContext, ToolPreview, ToolResult, ToolSpec
 
 _NEVER_READ_HINT = (
     "\n（提示：其中部分文件本次会话还没读过。search 片段必须与文件当前内容"
@@ -181,6 +182,25 @@ def _assess_edit_files(ctx: ToolContext, args: dict) -> tuple[Risk, str]:
     return Risk.REVIEW, f"一次修改 {count} 个文件（原子事务）"
 
 
+def _draft_edit_files(ctx: ToolContext, args: dict) -> list[DraftFile]:
+    """草稿：一次事务里各文件落盘后的正文（只算不写）。
+
+    先按扩展名筛掉「不需要草稿」的项再建事务：`EditTransaction` 会把每项都真正
+    计算一遍（含读盘与定位），为一份 `.py` 白算没有意义。
+    筛完为空就直接返回 —— 这时连事务都不必建。
+    """
+    ops = [op for op in _normalize(args.get("edits")) if is_draftable(op["path"])]
+    if not ops:
+        return []
+
+    txn = _build(ctx, ops, snapshot=None)
+    return [
+        DraftFile(path=plan.rel_path, text=plan.new_text, created=plan.is_create)
+        for plan in txn.plans
+        if plan.changed or plan.is_create
+    ]
+
+
 def _preview_edit_files(ctx: ToolContext, args: dict) -> ToolPreview:
     """审批预演：汇总各文件的 unified diff，一次审批看全部（不落盘）。"""
     if not ctx.config.allow_write:
@@ -263,6 +283,7 @@ EDIT_FILES_SPEC = ToolSpec(
     risk=Risk.REVIEW,
     assessor=_assess_edit_files,
     previewer=_preview_edit_files,
+    drafter=_draft_edit_files,
 )
 
 

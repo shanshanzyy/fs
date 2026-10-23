@@ -819,5 +819,71 @@ class AuthService:
     def store_teams_of(self, user_id: str) -> list[str]:
         return [str(m["team_id"]) for m in self.store.list_memberships(user_id)]
 
+    # ============================================================== 控制台读口（M8）
+    def list_teams(self, *, actor: rbac.Actor) -> list[dict]:
+        """列出可见团队。
+
+        非组织级只回自己所属的团队 —— 与 `visible_team_ids` 同口径，
+        避免把「组织里有哪些团队」泄漏给任何登录用户。
+        """
+        rbac.require_permission(actor, rbac.PERM_TEAM_READ)
+        rows = self.store.list_teams()
+        if not actor.is_org_wide:
+            mine = set(actor.team_ids)
+            rows = [r for r in rows if str(r["id"]) in mine]
+        return [
+            {
+                "id": str(r["id"]),
+                "slug": str(r.get("slug") or ""),
+                "name": str(r.get("name") or ""),
+                "createdAt": int(r.get("created_at") or 0),
+                "memberCount": len(self.store.list_team_members(str(r["id"]))),
+            }
+            for r in rows
+        ]
+
+    def list_team_members(self, *, actor: rbac.Actor, team_id: str) -> list[dict]:
+        """列出某团队成员。跨团队访问由 `scope_team` 拦下（水平越权入口）。"""
+        rbac.require_permission(actor, rbac.PERM_TEAM_READ)
+        actor.scope_team(team_id, rbac.PERM_TEAM_READ)
+        return [
+            {
+                "userId": str(m["user_id"]),
+                "email": str(m.get("email") or ""),
+                "displayName": str(m.get("display_name") or ""),
+                "role": str(m.get("role") or ""),
+                "status": str(m.get("status") or ""),
+                "createdAt": int(m.get("created_at") or 0),
+            }
+            for m in self.store.list_team_members(team_id)
+        ]
+
+    def list_enrollments(self, *, actor: rbac.Actor, team_id: str = "") -> list[dict]:
+        """列出邀请码台账。响应**不含 token_hash**（存储层已不 SELECT 它）。
+
+        非组织级只能看自己有 `enrollment:write` 的团队 —— 邀请码是可签发
+        新账号的凭据，不能跨团队可见。
+        """
+        rbac.require_permission(actor, rbac.PERM_ENROLLMENT_WRITE)
+        visible = actor.visible_team_ids(rbac.PERM_ENROLLMENT_WRITE)
+        rows = self.store.list_enrollments(team_id=team_id)
+        if visible is not None:
+            allowed = set(visible)
+            rows = [r for r in rows if str(r.get("team_id") or "") in allowed]
+        return [
+            {
+                "id": str(r["id"]),
+                "teamId": str(r.get("team_id") or ""),
+                "role": str(r.get("role") or ""),
+                "createdBy": str(r.get("created_by") or ""),
+                "createdAt": int(r.get("created_at") or 0),
+                "expiresAt": int(r.get("expires_at") or 0),
+                "maxUses": int(r.get("max_uses") or 0),
+                "uses": int(r.get("uses") or 0),
+                "revoked": bool(r.get("revoked_at")),
+            }
+            for r in rows
+        ]
+
 
 __all__ = ["AuthService"]

@@ -30,6 +30,8 @@ from .gateway.secrets import open_secret_store, rotation_report
 from .httpd import AppContext
 from .ids import new_id
 from .policy import PolicyService
+from .release_keys import default_key_path
+from .releases import ReleaseService
 from .store import open_store
 
 log = logging.getLogger("vibe.governance")
@@ -126,6 +128,19 @@ def build_app(
     app.secret_rotation_report = lambda rows: rotation_report(
         rows, max_age_days=config.secret_max_age_days, now=clock.now()
     )
+
+    # --- 客户端发布（M9）---
+    # 私钥**按需加载**（见 ReleaseService.key）：构建 app 不会触发 2048 位 keygen，
+    # 只有真正 publish / public_key 时才读或生成。文件缺失时这里先给一条提示。
+    release_key_path = default_key_path(config.data_dir)
+    app.releases = ReleaseService(store=store, clock=clock, key_path=release_key_path)
+    if not release_key_path.exists():
+        log.warning(
+            "尚未发现发布签名密钥（%s）。首次发布客户端版本时会自动生成一份 —— "
+            "请确认它就是客户端内置公钥对应的那把，否则客户端会因验签失败而拒绝更新；"
+            "内网自签场景可用 VIBE_UPDATE_PUBKEY 指向自己的公钥。",
+            release_key_path,
+        )
 
     if config.jwt_secret_generated:
         log.warning(

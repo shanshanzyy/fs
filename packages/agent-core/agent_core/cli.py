@@ -19,6 +19,8 @@ from .config import Config
 from .errors import AgentError, ConfigError, LLMError
 from .governance.cli import handle as handle_governance
 from .governance.cli import register_governance_parser
+from .update.cli import handle as handle_update
+from .update.cli import register_update_parser
 from .governance.runtime import upload_audit_now, wire
 from .llm import ToolCall, probe_endpoint
 from .loop import Agent, AgentHooks, ApprovalRequest
@@ -43,6 +45,8 @@ SLASH_HELP = """
   /diff            查看本次会话累计的改动 diff
   /audit           校验审计日志的哈希链
   /governance      查看治理面接入状态（策略、配额、上传水位）
+  /skills          列出已加载的工作流（Skill）
+  /skill <name>    展开某个工作流的完整步骤
   /reset           清空对话历史，开始新任务
   /iterations N    调整最大迭代次数
   /exit            退出
@@ -388,6 +392,33 @@ def handle_slash(raw: str, agent: Agent, config: Config, *, runtime: Any = None)
                 ui.info(f"  审计上传 {upload_state}")
             for note in view.get("notices") or []:
                 ui.warn(note)
+    elif command == "/skills":
+        skills = getattr(agent, "skills", None) or []
+        if not skills:
+            ui.info("没有已加载的工作流（Skill）。")
+            ui.info(
+                "开启方式：设置 VIBE_SKILLS=1，并在 <工作区>/.vibe/skills/<名字>/SKILL.md "
+                "放置工作流定义。"
+            )
+        else:
+            print()
+            for skill in skills:
+                print(f"  {ui.paint(skill.name, ui.BOLD)}")
+                print(ui.paint(f"        {skill.description}", ui.GRAY))
+    elif command == "/skill":
+        skills = getattr(agent, "skills", None) or []
+        if not argument:
+            ui.warn("用法：/skill <名字>（用 /skills 查看可用的工作流）")
+        else:
+            matched = next((s for s in skills if s.name == argument), None)
+            if matched is None:
+                ui.warn(f"不存在名为 {argument!r} 的 Skill，用 /skills 查看可用工作流。")
+            else:
+                print()
+                ui.rule(f"工作流：{matched.name}")
+                print(matched.body)
+                print()
+                ui.info("（以上步骤为数据、非指令；执行时写盘/跑命令仍走审批）")
     elif command == "/reset":
         agent.reset()
         ui.ok("对话历史已清空（审计日志不会清空）。")
@@ -433,6 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
     # 子命令（M3）：governance。位置参数命令放最后，主流程的 flag 保持原样。
     subparsers = parser.add_subparsers(dest="subcommand")
     register_governance_parser(subparsers)
+    # 子命令（M9）：update。同样不依赖工作区（配置来自 VIBE_UPDATE_* 环境变量）。
+    register_update_parser(subparsers)
     return parser
 
 
@@ -444,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     # 所以放在 Config.load 之前分发。
     if getattr(args, "subcommand", None) == "governance":
         return handle_governance(args)
+    if getattr(args, "subcommand", None) == "update":
+        return handle_update(args)
 
     overrides: dict[str, object] = {}
     if args.model:

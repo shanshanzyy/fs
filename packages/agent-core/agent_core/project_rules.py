@@ -1,16 +1,21 @@
 """项目规则文件 VIBE.md（C1 / P2-15）—— 让 Agent 一进项目就懂「这里的规矩」。
 
-## 多层加载（P2-15）
+## 多层加载（P2-15 / M9-B）
 
-规则可以来自四个层级，按「由泛到专」的顺序合并（越靠后越具体、越优先）：
+规则可以来自五个层级，按「由泛到专」的顺序合并（越靠后越具体、越优先）：
 
-1. **用户级** ``~/.vibe/rules.md``（可被 ``VIBE_USER_RULES`` 覆盖或显式关闭）；
-2. **仓库级** 根目录 ``VIBE.md``（推荐）**或** ``.vibe/VIBE.md``（不想让规则
+1. **全局级** 跨仓库共享的规则目录（``VIBE_RULES_GLOBAL`` 指向，M9-B 新增，
+   默认空 = 无继承、逐字节一致）；目录下 ``*.md`` 按文件名排序加载；
+2. **用户级** ``~/.vibe/rules.md``（可被 ``VIBE_USER_RULES`` 覆盖或显式关闭）；
+3. **仓库级** 根目录 ``VIBE.md``（推荐）**或** ``.vibe/VIBE.md``（不想让规则
    出现在项目根时的备选）—— 两者是**同一层的备选**，只取先命中的那个；
-3. **仓库附加** ``.vibe/rules/*.md``（按文件名排序）以及 ``rules_extra`` 里
+4. **仓库附加** ``.vibe/rules/*.md``（按文件名排序）以及 ``rules_extra`` 里
    逗号分隔的额外路径 / glob（相对工作区）；
-4. **目录级** 按调用方给出的「当前编辑/引用文件」路径**逐级向上**找的
+5. **目录级** 按调用方给出的「当前编辑/引用文件」路径**逐级向上**找的
    ``VIBE.md``（就近优先：越靠近文件的目录越具体，排在越后面）。
+
+全局层是最泛的一层，排在最前，超总量预算时**最先被丢**（与 M6-P「先丢最泛层」
+纪律一致）。全局层不设抬头（单层逐字节兼容）还是带抬头，由合并时的层数决定。
 
 ## 定位取舍
 
@@ -65,6 +70,34 @@ class ProjectInstructions:
     @property
     def chars(self) -> int:
         return len(self.text)
+
+
+def _global_entries(
+    global_rules_path: str | Path | None,
+) -> list[tuple[str, Path]]:
+    """全局级（M9-B）：跨仓库共享规则目录下的 ``*.md``（按文件名排序）。
+
+    只收目录下的直接 ``*.md`` 文件（不做递归 —— 全局目录是「扁平的一组规范」，
+    不是镜像一个仓库的层级）。路径不可达/不是目录时按「没有全局层」处理，
+    返回空列表，调用方行为与未启用继承时逐字节一致。
+    """
+    if not global_rules_path:
+        return []
+    root = Path(global_rules_path).expanduser()
+    try:
+        if not root.is_dir():
+            return []
+        files = sorted(p for p in root.glob("*.md") if p.is_file())
+    except OSError:
+        return []
+    found: list[tuple[str, Path]] = []
+    for path in files:
+        try:
+            label = f"global:{path.name}"
+        except Exception:
+            label = path.as_posix()
+        found.append((label, path))
+    return found
 
 
 def _user_rules_path() -> Path | None:
@@ -219,6 +252,8 @@ def load_project_instructions(
     user_rules_path: Path | None = None,
     extra: str = "",
     current_files: list[str] | tuple[str, ...] | None = None,
+    global_rules_path: str | Path | None = None,
+    global_rules_max_bytes: int = 64 * 1024,
 ) -> ProjectInstructions:
     """按多层顺序加载并合并规则。
 
@@ -229,6 +264,9 @@ def load_project_instructions(
 
     # ---- 收集各层 (source, path)，顺序 = 由泛到专 ----
     entries: list[tuple[str, Path]] = []
+
+    # 全局级（M9-B）：最泛、放队首，超预算最先被丢。
+    entries.extend(_global_entries(global_rules_path))
 
     if user_rules_path is None:
         user_rules_path = _user_rules_path()
@@ -253,13 +291,22 @@ def load_project_instructions(
     # ---- 逐份读取 + 单份截断 ----
     pieces: list[tuple[str, str]] = []  # (source, text)
     truncated_count = 0
+    # 全局层专用预算（M9-B）：跨仓库共享目录可能很杂，单独设上限。
+    # 超限时丢弃后续的全局条目（文件名排序后的队尾），并计入 truncated_count。
+    _global_bytes = 0
     for source, path in entries:
+        is_global = source.startswith("global:")
         try:
             text, cut = _read_capped(path)
         except OSError:
             continue
         if cut:
             truncated_count += 1
+        if is_global:
+            _global_bytes += len(text.encode("utf-8"))
+            if _global_bytes > global_rules_max_bytes:
+                truncated_count += 1
+                continue
         if text.strip():
             pieces.append((source, text))
 

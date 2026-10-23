@@ -49,7 +49,9 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "VibeAgent"
+      "shortcutName": "VibeAgent",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
     }
   }
 }

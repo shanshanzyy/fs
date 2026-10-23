@@ -5,8 +5,9 @@ from __future__ import annotations
 from ..audit import digest
 from ..edit import commit_plan, plan_patch
 from ..errors import AgentError, SandboxViolation
+from ..preview_media import is_draftable
 from ..sandbox import Risk
-from .base import ToolContext, ToolPreview, ToolResult, ToolSpec
+from .base import DraftFile, ToolContext, ToolPreview, ToolResult, ToolSpec
 
 _NEVER_READ_HINT = (
     "\n（提示：本次会话还没有读过这个文件。edit_file 的 search 片段必须与文件当前内容"
@@ -107,6 +108,34 @@ def _preview_edit(ctx: ToolContext, args: dict) -> ToolPreview:
     return ToolPreview(kind="diff", body=plan.diff, summary=summary)
 
 
+def _draft_edit(ctx: ToolContext, args: dict) -> list[DraftFile]:
+    """草稿：把这次补丁应用到原文件后的**全文**（只算不写）。
+
+    早退的理由不是省事：`.py` 之类的文件走的是「看 diff」，草稿正文既不能渲染、
+    也让额外一份模型产出的内容在审批期被复制一遍。只有浏览器能渲染的文本资源
+    才值得。注意这只是优化 —— 真正的过滤在 `ToolSpec.draft` 里再做一次。
+    """
+    raw = str(args.get("path") or "")
+    if not is_draftable(raw):
+        return []
+
+    path = ctx.paths.check_read(raw)
+    rel = ctx.paths.relative(path)
+    if not path.is_file() or not is_draftable(rel):
+        return []
+
+    plan = plan_patch(
+        path,
+        args.get("search") or "",
+        args.get("replace") or "",
+        rel_path=rel,
+        replace_all=bool(args.get("replace_all")),
+    )
+    if not plan.changed:
+        return []
+    return [DraftFile(path=rel, text=plan.new_text, created=False)]
+
+
 def _assess_edit(ctx: ToolContext, args: dict) -> tuple[Risk, str]:
     """写操作一律 REVIEW；命中敏感文件时提前拦下。"""
     if not ctx.config.allow_write:
@@ -143,4 +172,5 @@ EDIT_FILE_SPEC = ToolSpec(
     risk=Risk.REVIEW,
     assessor=_assess_edit,
     previewer=_preview_edit,
+    drafter=_draft_edit,
 )

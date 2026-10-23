@@ -21,8 +21,11 @@
 
 ## 生命周期
 
-- 上限 `max_sessions`（默认 3），超了明确拒绝而不是无限起进程；
-- 空闲 `idle_seconds` 回收（默认 30 分钟）；
+- 上限 `max_sessions`（**默认 0 = 不限**）。可以开任意多个终端：每个终端是用户自己
+  要的一个独立会话，按条数卡人只会逼出「关一个开一个」这种没有意义的操作。
+  想回到有界模式就设 `VIBE_TERM_MAX=<正整数>`，超了仍然明确拒绝；
+- 空闲 `idle_seconds` 回收（默认 30 分钟）—— 不设上限之后这才是真正的资源兜底：
+  没人用的终端会被自动收掉，而不需要用户记得去关；
 - 每个会话一个读线程把后端输出推给回调；
 - `atexit` 兜底 kill —— 界面上绝不能留一串孤儿（Windows 走 `taskkill /T /F`）。
 """
@@ -40,7 +43,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-DEFAULT_MAX_SESSIONS = 3
+# 默认不设上限（0 = 不限）。终端条数由用户自己决定；资源兜底交给空闲回收。
+DEFAULT_MAX_SESSIONS = 0
 DEFAULT_IDLE_SECONDS = 1800
 READ_TIMEOUT = 0.2
 # 单条事件里承载的终端输出上限（防一个狂刷输出的程序把总线撑爆）；超出的分片，
@@ -48,6 +52,21 @@ READ_TIMEOUT = 0.2
 READ_CHUNK = 65536
 # 伪终端自检宽限期：起得来之后多久收不到任何输出就判定「哑终端」并降级（见 _create）。
 PTY_PROBE_SECONDS = 2.5
+
+
+def shell_label(argv: list[str]) -> str:
+    """从 argv 取一个给人看的名字（给标签页用）。
+
+    只取 `argv[0]` 的 basename —— argv 后续参数可能带用户路径甚至密钥，
+    没有理由把它们送上界面/日志（ADR-006 的同一条纪律）。
+    """
+    if not argv:
+        return "shell"
+    raw = str(argv[0]).replace("\\", "/")
+    name = raw.rsplit("/", 1)[-1].strip()
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    return name or "shell"
 
 
 class TerminalError(RuntimeError):
@@ -233,6 +252,11 @@ class TerminalSession:
     opened_at: float
     last_used: float
     closed: bool = False
+    # 远程终端（M13 工作区）：argv 是 ssh 而不是本地 shell，标签用连接名，
+    # 界面据此区分「本地 / 远程」而不是把 `ssh` 当成 shell 名显示。
+    label: str = ""
+    kind: str = "local"
+    connection: str = ""
     backend: Any = None
     reader: threading.Thread | None = field(default=None, repr=False)
 
@@ -244,6 +268,9 @@ class TerminalSession:
         return {
             "termId": self.id,
             "mode": self.mode,
+            "shell": self.label or shell_label(self.argv),
+            "kind": self.kind,
+            "connection": self.connection,
             "cols": int(self.cols),
             "rows": int(self.rows),
             "pid": int(self.pid),
@@ -263,7 +290,7 @@ class TerminalManager:
         clock: Callable[[], float] = time.monotonic,
         spawn: Callable[..., Any] | None = None,
     ) -> None:
-        self._max = max(1, int(max_sessions))
+        self._max = max(0, int(max_sessions))
         self._idle = max(0, int(idle_seconds))
         self._clock = clock
         self._spawn = spawn or _default_spawn()
@@ -277,8 +304,13 @@ class TerminalManager:
 
     # ------------------------------------------------------------------ 配置
     def set_max_sessions(self, value: Any) -> None:
+        """0（或负数 / 非法值）= 不限。
+
+        非法的**显式**配置不报错而是按「不限」处理：这是终端的入口，
+        为了一个环境变量的手误把用户挡在门外（连一个终端都开不了）不划算。
+        """
         try:
-            self._max = max(1, int(value))
+            self._max = max(0, int(value))
         except (TypeError, ValueError):
             pass
 
@@ -293,6 +325,10 @@ class TerminalManager:
         rows: int = 24,
         on_data: Callable[[str, bytes], None] | None = None,
         on_exit: Callable[[str, int | None], None] | None = None,
+        label: str = "",
+        kind: str = "local",
+        connection: str = "",
+        probe_seconds: float | None = None,
     ) -> TerminalSession:
         argv = [str(item) for item in argv if str(item) != ""]
         if not argv:
@@ -304,10 +340,13 @@ class TerminalManager:
             if self._closed:
                 raise TerminalError("终端管理器已关闭")
             self._reap()
-            if len(self._sessions) >= self._max:
-                raise TerminalError(f"终端数量已达上限（{self._max} 个）")
+            # `_max <= 0` = 不限（默认）。只有显式配了正整数才拦。
+            if self._max > 0 and len(self._sessions) >= self._max:
+                raise TerminalError(f"终端数量已达上限（{self._max} 个，见 VIBE_TERM_MAX）")
 
-        backend, mode, warm = self._create(argv, cwd, env, cols, rows)
+        backend, mode, warm = self._create(
+            argv, cwd, env, cols, rows, probe_seconds=probe_seconds
+        )
         now = self._clock()
         with self._lock:
             self._seq += 1
@@ -323,6 +362,9 @@ class TerminalManager:
             opened_at=now,
             last_used=now,
             backend=backend,
+            label=str(label or ""),
+            kind=str(kind or "local"),
+            connection=str(connection or ""),
         )
         with self._lock:
             self._sessions[term_id] = session
@@ -343,18 +385,28 @@ class TerminalManager:
         return session
 
     def _create(
-        self, argv: list[str], cwd: str, env: dict[str, str], cols: int, rows: int
+        self,
+        argv: list[str],
+        cwd: str,
+        env: dict[str, str],
+        cols: int,
+        rows: int,
+        *,
+        probe_seconds: float | None = None,
     ) -> tuple[Any, str, bytes]:
         """先试伪终端，失败则降级管道，并记下降级原因。
 
         返回 `(backend, mode, warm)`：`warm` 是自检期间已经读到的开头输出，
         **调用方必须把它交给 on_data**，否则界面会丢掉第一屏（提示符）。
+
+        `probe_seconds` 可以放宽自检宽限期：远程终端要等 ssh 握手 + 远端登录，
+        固定 2.5s 会把一条好好的伪终端误判成「哑终端」。
         """
         try:
             backend = self._spawn(argv, cwd, env, cols=cols, rows=rows)
         except Exception as exc:  # noqa: BLE001 — 任何起不来都降级，而不是把界面搞崩
             return self._pipe(argv, cwd, env, cols, rows, f"{type(exc).__name__}: {exc}")
-        warm, usable = self._warmup(backend)
+        warm, usable = self._warmup(backend, timeout=probe_seconds or PTY_PROBE_SECONDS)
         if usable:
             self.last_mode = str(getattr(backend, "mode", "pty"))
             self.fallback_reason = ""
@@ -548,4 +600,5 @@ __all__ = [
     "default_shell_argv",
     "get_manager",
     "set_manager",
+    "shell_label",
 ]

@@ -97,6 +97,13 @@ jobs:
           for f in src/*.js; do
             node --check "$f"
           done
+      # 壳侧纯函数（更新路径白名单 / pending 记账）用 Node 内置 node:test 覆盖，
+      # 零第三方依赖 —— 与「运行期依赖为零」这条承诺保持一致。
+      # 注意：`node --test <目录>` 会把目录当文件去 require（至少 Node 22.2 如此）；
+      # 无参形式才是「从当前目录递归发现测试文件」，跨 Node 20/22 都稳。
+      - name: 纯函数测试（node:test）
+        working-directory: apps/desktop
+        run: node --test
       - name: 语法检查（host UI，ESM）
         run: |
           mkdir -p /tmp/esmcheck

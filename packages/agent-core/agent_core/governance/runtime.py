@@ -61,6 +61,10 @@ class GovernanceRuntime:
     notices: list[str] = field(default_factory=list)
     #: off / unauthenticated / degraded / governed
     status: str = "off"
+    #: 模型请求是否**真的**经云端网关发出（策略允许上云且策略未过期）。
+    #: False 时请求全部落到本地客户端，本机 settings.json 的 base_url/model
+    #: 仍是权威 —— host 据此决定界面能不能改模型与 MCP 目录（见 `locks_local_config`）。
+    gateway_routed: bool = False
     #: 降级原因（仅 degraded / unauthenticated 时有值）
     degraded_reason: str = ""
     #: 服务端配额视图（只有 governed 且拉取成功才有）。**None 表示「这份信息没有」**，
@@ -69,6 +73,20 @@ class GovernanceRuntime:
     quota: dict[str, Any] | None = None
     #: 配额拉取失败的原因。**失败不降级、不进 notices** —— 看不到配额不影响干活。
     quota_error: str = ""
+
+    @property
+    def locks_local_config(self) -> bool:
+        """治理面是否接管了本机运行时配置 —— 即界面能否修改模型与工具面。
+
+        只有 `gateway_routed` 为真时，本机 settings.json 里的 base_url/model
+        才不再是权威（请求由网关决定去向）；此时允许界面保存会留下
+        「提示保存成功、实际仍走网关」的错位，必须拒绝。
+
+        反之（策略禁云、策略过期、降级、未登录），请求全部落到本地
+        `OpenAICompatClient`，本机配置就是权威 —— 界面应当可以正常修改。
+        MCP server 配置同理：治理面从不托管 MCP 目录，本机文件恒为唯一真源。
+        """
+        return self.gateway_routed
 
     def describe(self) -> dict[str, Any]:
         """`governance status` 与桌面端状态徽标共用的视图。不含任何令牌。"""
@@ -92,6 +110,19 @@ class GovernanceRuntime:
         if self.uploader is not None:
             view["uploadState"] = self.uploader.local_chain_status()
         return view
+
+
+def is_config_locked(runtime: Any) -> bool:
+    """治理面是否**真的**接管了本机运行时配置（模型接入 / MCP 工具面）。
+
+    不能只看「接入了治理面」：策略禁云 / 策略过期 / 降级时，请求全部落到本地
+    `OpenAICompatClient`，本机 settings.json 与 MCP 目录就是权威 —— 此时再拒绝
+    界面保存只会让用户「明明能改却不给改」。
+
+    未知形态（默认 `True`）按「已接管」处理 —— 宁可拒绝保存，也不留下
+    「文件改了、请求仍走网关」的错位。
+    """
+    return bool(getattr(runtime, "locks_local_config", True))
 
 
 def wire(config: Any, *, store: CredentialStore | None = None, now: int | None = None) -> GovernanceRuntime:
@@ -216,6 +247,9 @@ def _assemble(
         fallback_client=fallback,
         allow_gateway=allow_gateway,
     )
+    # 与 `open_governed_client` 的判定严格一致：只有「策略允许上云」且
+    # 「真的拿到了网关地址」时，模型请求才会离开本机。
+    gateway_routed = bool(allow_gateway and gateway_url)
     if not allow_gateway:
         notes_extra = (
             "策略禁用云端，模型请求全部走本地。"
@@ -239,6 +273,7 @@ def _assemble(
         uploader=uploader,
         notices=notices,
         status="governed",
+        gateway_routed=gateway_routed,
         quota=quota,
         quota_error=quota_error,
     )

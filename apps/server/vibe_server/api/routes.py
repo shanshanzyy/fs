@@ -30,6 +30,7 @@ from ..httpd import (
     Router,
 )
 from ..metrics import render_prometheus
+from ..releases import packages_dir, safe_package_name
 from .static import register_static
 
 API = "/api/v1"
@@ -299,6 +300,33 @@ def register_admin(router: Router) -> None:
     def revoke_device(request: Request, deviceId: str) -> Response:
         return Response.json(
             request.app.auth_service.revoke_device(actor=request.actor, device_id=deviceId)
+        )
+
+    # ---------------------------------------------------------- 控制台只读口（M8）
+    # 仅补读口：控制台（/console）要列团队、列成员、列邀请码台账，
+    # 这三样此前只有 CLI / 手写请求可用。写口已存在（POST /teams 等）。
+    @router.get(API + "/teams", permissions=(rbac.PERM_TEAM_READ,))
+    def list_teams(request: Request) -> Response:
+        return Response.json({"teams": request.app.auth_service.list_teams(actor=request.actor)})
+
+    @router.get(API + "/teams/{teamId}/members", permissions=(rbac.PERM_TEAM_READ,))
+    def list_team_members(request: Request, teamId: str) -> Response:
+        return Response.json(
+            {
+                "members": request.app.auth_service.list_team_members(
+                    actor=request.actor, team_id=teamId
+                )
+            }
+        )
+
+    @router.get(API + "/enrollments", permissions=(rbac.PERM_ENROLLMENT_WRITE,))
+    def list_enrollments(request: Request) -> Response:
+        return Response.json(
+            {
+                "enrollments": request.app.auth_service.list_enrollments(
+                    actor=request.actor, team_id=request.q("teamId")
+                )
+            }
         )
 
 
@@ -694,6 +722,138 @@ def register_secrets(router: Router) -> None:
         )
 
 
+# --------------------------------------------------------------------------- 客户端发布（M9）
+def register_releases(router: Router) -> None:
+    """客户端发布与更新检查。
+
+    权限：读全角色（`release:read`），写仅 owner（`release:write`）。
+    `release` 是**全局资源**（一份清单下发到所有客户端），因此不做团队隔离，
+    handler 里也没有 `scope_team` —— 这条要显式写出来，避免后来者以为漏了。
+    """
+
+    @router.get(API + "/client/releases", permissions=(rbac.PERM_RELEASE_READ,))
+    def list_releases(request: Request) -> Response:
+        return Response.json(
+            {
+                # 公钥随列表一起给，方便控制台与运维核对「客户端内置的是哪一把」。
+                # 公钥只能验签、不能签名，公开无妨。
+                "pubkey": request.app.releases.public_key(),
+                "releases": request.app.releases.list(
+                    channel=request.q("channel"),
+                    platform=request.q("platform"),
+                    arch=request.q("arch"),
+                    include_revoked=request.q("includeRevoked") in ("1", "true"),
+                    limit=request.q_int("limit", 100),
+                ),
+            }
+        )
+
+    @router.get(API + "/client/updates/check", auth=AUTH_OPTIONAL)
+    def check_update(request: Request) -> Response:
+        """客户端检查更新。**公开可访问**：未接入治理面的客户端也要能查。
+
+        设备稳定标识优先取已认证主体的 `device_id`（与 M4 灰度同一批 key），
+        未认证时退回 `?device=` —— 客户端在接入前会用 `sha256(hostname+machineId)`
+        算一个稳定值传上来。两者都没有则不参与灰度分桶（宁可不动）。
+        """
+        actor = request.actor
+        device_key = (str(getattr(actor, "device_id", "") or "") or request.q("device")).strip()
+        result = request.app.releases.check(
+            channel=request.q("channel", "stable"),
+            platform=request.q("platform", "windows"),
+            arch=request.q("arch", "x64"),
+            current=request.q("current", "0"),
+            device_key=device_key,
+        )
+        # kid 取自命中 release 自己记录的签名者公钥指纹（没有 release 就是空）——
+        # 刻意不读服务端私钥：这一条是**公开**端点，不该为它触发一次密钥加载/生成。
+        result["pubkeyKid"] = str((result.get("release") or {}).get("pubkeyKid") or "")
+        return Response.json(result)
+
+    @router.post(API + "/client/releases", permissions=(rbac.PERM_RELEASE_WRITE,))
+    def create_release(request: Request) -> Response:
+        """发布一个版本。**签名在服务端完成**（私钥不出进程、不进请求体）。"""
+        body = _obj(request)
+        created = request.app.releases.publish(
+            version=_str_field(body, "version"),
+            channel=_str_field(body, "channel", "stable"),
+            sha256=_str_field(body, "sha256"),
+            size=_int_field(body, "size"),
+            platform=_str_field(body, "platform", "windows"),
+            arch=_str_field(body, "arch", "x64"),
+            url=_str_field(body, "url"),
+            notes=_str_field(body, "notes"),
+            mandatory=_bool_field(body, "mandatory"),
+            min_version=_str_field(body, "minVersion"),
+            rollout_percent=_int_field(body, "rolloutPercent", 100),
+            created_by=str(getattr(request.actor, "user_id", "") or ""),
+        )
+        request.app.audit_recorder(
+            actor=request.actor,
+            device_id=str(getattr(request.actor, "device_id", "") or ""),
+            event_type="release.publish",
+            payload={
+                "releaseId": created["id"],
+                "version": created["version"],
+                "channel": created["channel"],
+                "platform": created["platform"],
+                "arch": created["arch"],
+                # 只记指纹，不记整串 sha256（与 ADR-006 的「不落正文」同口径）
+                "sha256Digest": created["sha256"][:16],
+                "size": created["size"],
+                "mandatory": created["mandatory"],
+                "rolloutPercent": created["rolloutPercent"],
+                "seq": created["seq"],
+            },
+        )
+        return Response.json(created, status=HTTPStatus.CREATED)
+
+    @router.post(API + "/client/releases/revoke", permissions=(rbac.PERM_RELEASE_WRITE,))
+    def revoke_release(request: Request) -> Response:
+        """撤销一个发布 —— 客户端下次 check 起不再看到它。
+
+        刻意用 `POST /releases/revoke` + body 带 id，而不是 `{id}/revoke`：
+        Router 只匹配**定长单段** `{name}`，两段模板匹配不上。
+        """
+        body = _obj(request)
+        release_id = _str_field(body, "id").strip()
+        if not release_id:
+            raise BadRequest("缺少 id")
+        request.app.releases.get(release_id)  # 不存在先 404，别把 404 说成「已撤销」
+        if not request.app.releases.revoke(release_id):
+            raise NotFound("该发布记录已撤销")
+        request.app.audit_recorder(
+            actor=request.actor,
+            device_id=str(getattr(request.actor, "device_id", "") or ""),
+            event_type="release.revoke",
+            payload={"releaseId": release_id, "revoked": True},
+        )
+        return Response.json({"id": release_id, "revoked": True})
+
+    @router.get(API + "/client/packages/{name}", auth=AUTH_OPTIONAL)
+    def serve_package(request: Request, name: str) -> Response:
+        """治理面自托管的安装器二进制（默认开，内网单机部署最省事）。
+
+        转发的是**安装器二进制**（不是源码/Prompt/模型输出），不触碰 ADR-006。
+        穿越防护三道照 `static._serve_asset` 的口径：名字白名单 + resolve 后仍在
+        包目录内 + 必须是文件。
+        """
+        safe = safe_package_name(name)
+        base = packages_dir(request.app.config.data_dir)
+        target = (base / safe).resolve()
+        root = base.resolve()
+        if target != root and root not in target.parents:
+            raise Forbidden("非法包路径")
+        if not target.is_file():
+            raise NotFound("安装包不存在")
+        return Response(
+            status=200,
+            raw=target.read_bytes(),
+            content_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{safe}"'},
+        )
+
+
 # --------------------------------------------------------------------------- 装配
 def build_router() -> Router:
     router = Router()
@@ -708,6 +868,7 @@ def build_router() -> Router:
     register_gateway(router)
     register_audit(router)
     register_secrets(router)
+    register_releases(router)
     return router
 
 
@@ -716,6 +877,7 @@ __all__ = [
     "build_router",
     "register_audit",
     "register_health",
+    "register_releases",
     "register_secrets",
     "register_static",
 ]

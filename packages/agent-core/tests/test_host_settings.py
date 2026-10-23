@@ -37,6 +37,24 @@ from agent_core.host.settings import (  # noqa: E402
 from tests.test_agent_loop import FakeClient  # noqa: E402
 
 
+class _FakeGovernanceRuntime:
+    """`wire()` 的最小替身：只暴露 host 判断「能否改模型」需要的那两项。
+
+    `locks_local_config` 对应「治理面是否真的接管运行时」——
+    这正是「接入了治理面」与「本机配置被接管」的分界线。
+    """
+
+    def __init__(self, *, locked: bool) -> None:
+        self.locks_local_config = locked
+        self.client = None
+        # 更新服务读 `runtime.governance`（治理面 API 客户端），这里不参与更新。
+        self.governance = None
+
+    def describe(self) -> dict:
+        """`session.describe()` 会调用它 —— 替身也得给一份最小视图。"""
+        return {"status": "governed", "notices": [], "client": None}
+
+
 class SettingsPathTests(unittest.TestCase):
     def test_default_is_home_vibe_settings(self) -> None:
         import os
@@ -379,6 +397,51 @@ class SettingsEndpointTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._request("/api/settings", method="POST", body={})
         self.assertEqual(ctx.exception.code, 400)
+
+    # ------------------------------------------------- 治理面接管与模型保存
+    def test_get_settings_reports_model_locked_separately(self) -> None:
+        """「接入治理面」与「模型配置被接管」是两件事，界面据后者决定提示。"""
+        with self._request("/api/settings") as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertFalse(data["governance"])
+        self.assertFalse(data["modelLocked"])
+
+        # 接入了治理面但策略禁云：请求仍走本地，界面可改
+        self.host.session.governance = _FakeGovernanceRuntime(locked=False)
+        with self._request("/api/settings") as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(data["governance"])
+        self.assertFalse(data["modelLocked"])
+
+        # 模型真的经网关发出：本机配置不再是权威，界面必须锁住
+        self.host.session.governance = _FakeGovernanceRuntime(locked=True)
+        with self._request("/api/settings") as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(data["modelLocked"])
+
+    def test_post_settings_allowed_when_governance_does_not_route_cloud(self) -> None:
+        """治理面禁云时界面必须能改模型 —— 否则「文件是权威却禁止改」自相矛盾。"""
+        self.host.session.governance = _FakeGovernanceRuntime(locked=False)
+        with self._request(
+            "/api/settings",
+            method="POST",
+            body={"model": "deepseek-v4-flash", "baseUrl": "http://10.0.1.50:8002/v1"},
+        ) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(data["ok"])
+        stored = load_settings(self.settings_file)
+        self.assertEqual(stored["model"], "deepseek-v4-flash")
+        self.assertEqual(stored["base_url"], "http://10.0.1.50:8002/v1")
+        # 治理面的客户端引用也要跟着换，不能还留着旧实例
+        self.assertIs(self.host.session.governance.client, self.host.session._client)
+
+    def test_post_settings_rejected_when_governance_routes_cloud(self) -> None:
+        """模型请求真的走网关时保存必须 400 —— 不能留下「改了但没生效」的错位。"""
+        self.host.session.governance = _FakeGovernanceRuntime(locked=True)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._request("/api/settings", method="POST", body={"model": "x"})
+        self.assertEqual(ctx.exception.code, 400)
+        self.assertNotIn("model", load_settings(self.settings_file))
 
     def test_post_settings_persists_completion_fields(self) -> None:
         with self._request(

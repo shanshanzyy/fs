@@ -23,6 +23,9 @@
   </div>
   <div class="tb-center" id="tb-chips">
     <span class="chip" id="chip-vibe" hidden title="已加载项目规则文件 VIBE.md，Agent 会遵守其中的团队约定">VIBE</span>
+    <!-- Skill 提示（M9-A）：VIBE_SKILLS=1 时显示「N 个工作流」，关闭时恒 hidden -->
+    <span class="chip chip-clickable" id="chip-skill" role="button" tabindex="0"
+          hidden title="已加载 N 个工作流（运行 Skill 见命令面板）">工作流</span>
   </div>
   <div class="tb-right">
     <span class="chip chip-clickable" id="chip-model" role="button" tabindex="0" title="点击配置模型">—</span>
@@ -30,6 +33,11 @@
          但登录弹窗必须有一个总在的入口，否则同事机器上第一次没法填地址登录。 -->
     <button class="tbtn" id="btn-gov" title="治理面：登录 / 邀请码注册 / 退出（多人共用入口）">治理面</button>
     <span class="chip chip-gov" id="chip-gov" hidden title="治理面状态">治理面</span>
+    <!-- 客户端更新（M9）：默认隐藏 —— 没有待办动作时（idle / 刚更新完）不占标题栏，
+         常驻一个「已是最新」只会盖掉真正要看的信号。chip 只是提示 + 入口：
+         启动自动检查是静默的，绝不自动弹窗盖住用户正在做的事。 -->
+    <span class="chip chip-clickable chip-update" id="chip-update" role="button" tabindex="0"
+          hidden title="客户端更新状态">更新</span>
     <span class="chip chip-state" id="chip-state" data-state="idle">空闲</span>
     <!-- 命令面板入口（P2-13）：让鼠标用户也能发现 Ctrl/Cmd+Shift+P -->
     <button class="tbtn" id="btn-palette" title="命令面板（Ctrl/Cmd+Shift+P）">⌘K</button>
@@ -73,6 +81,21 @@
     </button>
     <button class="act" data-panel="mcp" title="MCP 服务器（Ctrl+9）">
       <svg viewBox="0 0 16 16"><path d="M5 1.5h1.5V4H5V1.5zm4.5 0H11V4H9.5V1.5zM4 4h8v3.5a4 4 0 0 1-3.25 3.92V13h1.75v1.5h-5V13H7.25v-1.58A4 4 0 0 1 4 7.5V4zm1.5 1.5v2A2.5 2.5 0 0 0 8 10a2.5 2.5 0 0 0 2.5-2.5v-2h-5z" fill="currentColor"/></svg>
+    </button>
+    <!-- 后台任务（M9-D）：VIBE_ASYNC_AGENT=0 时整键隐藏（applySession 里切） -->
+    <button class="act" data-panel="tasks" title="后台任务（VIBE_ASYNC_AGENT=1）">
+      <svg viewBox="0 0 16 16"><path d="M3 2.5h10a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H8l-3 2v-2H3a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm1 2v5h8v-5H4z" fill="currentColor"/></svg>
+      <em class="act-badge" id="act-badge-tasks" hidden>0</em>
+    </button>
+    <!-- 定时任务（M10）：VIBE_SCHEDULER=0 时整键隐藏（applySession 里切） -->
+    <button class="act" data-panel="schedules" title="定时任务（VIBE_SCHEDULER=1）">
+      <svg viewBox="0 0 16 16"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.5a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm.6 2v3.2l2.6 1.5-.6 1.1-3.2-1.9V5h1.2z" fill="currentColor"/></svg>
+      <em class="act-badge" id="act-badge-schedules" hidden>0</em>
+    </button>
+    <!-- 远程设备文件工作面（M11-E）：VIBE_REMOTE=0 时整键隐藏（applySession 里切） -->
+    <button class="act" data-panel="remote" title="远程设备（VIBE_REMOTE=1）">
+      <svg viewBox="0 0 16 16"><path d="M2 2.5h12v7H2v-7zm1 1v5h10v-5H3zM7 9.5h2v1H7v-1zM4 11h8v1H4v-1z" fill="currentColor"/></svg>
+      <em class="act-badge" id="act-badge-remote" hidden>0</em>
     </button>
     <span class="act-spring"></span>
     <button class="act" data-panel="welcome" title="开始（欢迎页）">
@@ -193,12 +216,56 @@
       </div>
       <div id="mcp-list"><div class="empty">加载中…</div></div>
     </section>
+
+    <!-- 后台任务（M9-D）：用户本人发起的后台 Agent 任务。列表只回摘要（不含正文），
+         状态随 task.state 事件实时更新；可请求取消。VIBE_ASYNC_AGENT=0 时整页签隐藏。 -->
+    <section class="sb-body" data-body="tasks" hidden>
+      <div class="sb-caption">后台任务 <span class="badge" id="badge-tasks">0</span></div>
+      <div class="tasks-actions">
+        <textarea id="task-input" class="mem-input" rows="2"
+                  placeholder="发起一个后台任务（与当前对话并行，结果异步回传）…"></textarea>
+        <div class="mem-add-row">
+          <button class="btn btn-small" id="btn-task-submit" title="提交后台任务">发起任务</button>
+          <button class="btn btn-small" id="btn-task-refresh" title="刷新任务列表">刷新</button>
+        </div>
+      </div>
+      <div id="task-list"><div class="empty">暂无后台任务。</div></div>
+    </section>
+
+    <!-- 定时任务（M10）：用户本人排的班 —— 到点投一个**只读后台任务**（复用 M9-D 池）。
+         列表只回元数据（不含 prompt 正文，ADR-006）；VIBE_SCHEDULER=0 时整页签隐藏。 -->
+    <section class="sb-body" data-body="schedules" hidden>
+      <div class="sb-caption">定时任务 <span class="badge" id="badge-schedules">0</span></div>
+      <div class="tasks-actions">
+        <input id="job-name" class="mem-input" type="text"
+               placeholder="任务名，如「每晚跑一次测试」">
+        <input id="job-schedule" class="mem-input" type="text"
+               placeholder="排期：0 9 * * 1-5 或 @every 30m 或 @at 2026-10-17T09:00:00">
+        <textarea id="job-prompt" class="mem-input" rows="2"
+                  placeholder="交给后台任务的内容（只读工具面，不会改盘）…"></textarea>
+        <div class="mem-add-row">
+          <button class="btn btn-small" id="btn-job-submit" title="新建定时任务">新建</button>
+          <button class="btn btn-small" id="btn-job-refresh" title="刷新任务列表">刷新</button>
+        </div>
+      </div>
+      <div id="job-list"><div class="empty">暂无定时任务。</div></div>
+    </section>
   </aside>
 
   <div class="sb-resizer" id="sb-resizer" title="拖动调整宽度"></div>
 
   <!-- ═══════════════════ 编辑器区 ═══════════════════ -->
-  <main class="editor-stack" id="editor-stack">
+  <main class="editor-stack" id="editor-stack" data-stage="editor">
+    <!-- 中间区三视图（浏览器 / 终端 / 编辑器）：同一时刻只显示一个主视图。
+         终端视图**复用**下面的底部面板并展开到全高，不复制第二份终端 DOM。 -->
+    <div class="stage-tabs" id="stage-tabs" role="tablist" aria-label="中间区视图">
+      <button type="button" class="stage-tab" data-stage="browser" role="tab" aria-selected="false"
+              title="浏览器：打开本机跑起来的界面（http://127.0.0.1:&lt;端口&gt;）">浏览器</button>
+      <button type="button" class="stage-tab" data-stage="terminal" role="tab" aria-selected="false"
+              title="终端：把交互式终端展开到整个中间区">终端</button>
+      <button type="button" class="stage-tab is-active" data-stage="editor" role="tab" aria-selected="true"
+              title="编辑器：查看 / 编辑文件">编辑器</button>
+    </div>
     <div class="edtabs" id="edtabs"></div>
     <div class="edtoolbar" id="edtoolbar" hidden>
       <span class="ed-path" id="ed-path"></span>
@@ -247,6 +314,122 @@
           <p class="foot" id="welcome-foot"></p>
         </div>
       </div>
+      <!-- 远程设备文件工作面（M11-E / 交互增强三）：与普通文件页签同权的编辑器页签，
+           可开可关；头部一行放连接与状态，连接管理收进按需抽屉。
+           所有动作都是用户本人发起（无审批浮层）；远端编辑产生的 diff 只在界面审阅。 -->
+      <div class="editor remote-wrap" id="remote-view" data-ed="remote">
+        <div class="remote-head">
+          <span class="remote-title">远程设备</span>
+          <span class="remote-dot" id="remote-state-dot"></span>
+          <select class="remote-conn-select" id="remote-conn-select" title="切换当前连接（切换后路径回到该连接根）">
+            <option value="">选择连接</option>
+          </select>
+          <span class="chip" id="remote-active" hidden></span>
+          <span class="badge" id="badge-remote">0</span>
+          <span class="spacer"></span>
+          <button class="btn btn-small" id="remote-open-conn-drawer" title="打开连接管理（新增 / 编辑 / 权限 / 删除）">＋ 新建连接</button>
+          <button class="btn btn-small" id="remote-refresh" title="重新拉取连接与状态">刷新</button>
+          <button class="icon-btn" id="remote-close" title="关闭远程设备页签（Esc）">✕</button>
+        </div>
+        <!-- 浏览路径面包屑：长路径不再被省略号吃掉中间层级，点任一段可跳回 -->
+        <div class="remote-path-crumb" id="remote-path-crumb"></div>
+        <div class="remote-status-row">
+          <button class="btn btn-small remote-dir-toggle" id="remote-dir-toggle" title="展开 / 收起目录">目录</button>
+          <span class="chip" id="remote-running" hidden>执行中 · 保存与改连接已禁用</span>
+          <button class="btn btn-small remote-degraded-toggle" id="remote-degraded-toggle" hidden>能力：0 项降级 ▾</button>
+          <span class="chip" id="remote-change-count" hidden>改动 0</span>
+        </div>
+        <div class="remote-degraded" id="remote-degraded" hidden></div>
+        <div class="remote-cols">
+          <section class="remote-col remote-left" id="remote-left">
+            <div class="remote-path-bar">
+              <button class="btn btn-small" id="remote-up" title="回到根目录">⌂ 根</button>
+              <button class="btn btn-small" id="remote-add-root"
+                      title="把当前连接的根目录加入工作区（之后可用 @remote/&lt;连接&gt; 路径经本地同名工具操作）">加入工作区</button>
+            </div>
+            <div class="tree" id="remote-tree"><div class="empty">先在上方选择一个连接。</div></div>
+          </section>
+          <div class="remote-resizer" id="remote-resizer" title="拖动调整目录宽度"></div>
+          <section class="remote-col remote-right-col">
+            <div class="remote-file-bar">
+              <span class="remote-file-path" id="remote-file-path">未打开文件</span>
+              <span class="spacer"></span>
+              <span class="chip is-warning" id="remote-file-flag" hidden>远端已改</span>
+            </div>
+            <div class="remote-tabs" id="remote-tabs">
+              <button class="bp-tab is-active" data-rtab="view" type="button">查看</button>
+              <button class="bp-tab" data-rtab="review" type="button">审查</button>
+              <button class="bp-tab" data-rtab="edit" type="button">编辑</button>
+            </div>
+            <div class="remote-pane" id="remote-pane-view">
+              <div class="remote-meta" id="remote-view-meta"></div>
+              <div class="remote-body" id="remote-view-body"><div class="empty">从左侧选一个文件查看。</div></div>
+            </div>
+            <div class="remote-pane is-off" id="remote-pane-review">
+              <div class="remote-review-head">
+                <span class="sb-caption">本会话远端改动 <span class="badge" id="badge-remote-changes">0</span></span>
+                <span class="spacer"></span>
+                <button class="btn btn-small" id="remote-changes-refresh" title="重新拉取改动列表">刷新</button>
+              </div>
+              <div class="remote-changes" id="remote-changes"><div class="empty">暂无远端改动。</div></div>
+              <div class="remote-diff-host" id="remote-diff"><div class="empty">点某条改动查看 diff。</div></div>
+            </div>
+            <div class="remote-pane is-off" id="remote-pane-edit">
+              <div class="remote-edit-head">
+                <span class="sb-caption">就地编辑（保存前会先给出将产生的 diff）</span>
+                <span class="spacer"></span>
+                <button class="btn btn-small" id="remote-reload" title="丢弃本地改动，重新从远端读一次">重新加载</button>
+                <button class="btn btn-small btn-primary" id="remote-save" title="保存到远端（乐观锁：远端被改过会拒绝）">保存到远端</button>
+              </div>
+              <textarea class="remote-edit-text" id="remote-edit-text" spellcheck="false"
+                        placeholder="选中文件后，在这里改内容…"></textarea>
+              <div class="remote-edit-hint" id="remote-edit-hint"></div>
+              <div class="remote-diff-host" id="remote-edit-diff"></div>
+            </div>
+          </section>
+        </div>
+        <!-- 连接管理抽屉（低频动作，不常驻占宽）：字段原样复用 rf-* 九个 -->
+        <div class="remote-drawer-backdrop" id="remote-drawer-backdrop" hidden></div>
+        <aside class="remote-drawer" id="remote-conn-drawer" hidden>
+          <div class="remote-drawer-head">
+            <span class="remote-title">连接管理</span>
+            <span class="spacer"></span>
+            <span class="chip" id="remote-config-path"></span>
+            <button class="icon-btn" id="remote-drawer-close" title="关闭（Esc）">✕</button>
+          </div>
+          <div class="remote-drawer-body">
+            <div class="sb-caption">已有连接 <span class="badge" id="badge-remote-drawer">0</span></div>
+            <div id="remote-conn-list"><div class="empty">加载中…</div></div>
+            <div class="sb-caption">新增 / 编辑连接</div>
+            <div class="remote-form" id="remote-add-form">
+              <input class="ws-input" id="rf-name" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="名称（唯一，编辑时不可改）">
+              <input class="ws-input" id="rf-host" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="主机 host，如 build-box 或 10.0.0.5">
+              <div class="remote-form-row">
+                <input class="ws-input" id="rf-user" type="text" spellcheck="false" autocomplete="off" placeholder="用户 user">
+                <input class="ws-input" id="rf-port" type="text" spellcheck="false" autocomplete="off" placeholder="端口 port">
+              </div>
+              <input class="ws-input" id="rf-root" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="根目录 root（相对指到这台机器上的哪棵子树）">
+              <input class="ws-input" id="rf-identity" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="私钥 identity_file（留空用 ssh 默认）">
+              <input class="ws-input" id="rf-proxy" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="跳板 proxy_jump（可留空）">
+              <input class="ws-input" id="rf-policy" type="text" spellcheck="false" autocomplete="off"
+                     placeholder="host_key_policy（如 accept-new / strict）">
+              <label class="ws-label remote-check"><input type="checkbox" id="rf-allow-write"> 允许写（allow_write）</label>
+              <label class="ws-label remote-check"><input type="checkbox" id="rf-allow-shell"> 允许执行命令（allow_shell）</label>
+              <input class="ws-input" id="rf-note" type="text" spellcheck="false" autocomplete="off" placeholder="备注 note（可留空）">
+              <div class="remote-form-actions">
+                <button class="btn btn-small btn-primary" id="remote-conn-submit" title="新增或保存这条连接">保存连接</button>
+                <button class="btn btn-small" id="remote-conn-cancel" title="清空表单，回到「新增」">取消编辑</button>
+              </div>
+              <div class="remote-form-hint" id="remote-form-hint"></div>
+            </div>
+          </div>
+        </aside>
+      </div>
       <!-- 动态编辑器标签由 app.js 插入 -->
     </div>
 
@@ -292,6 +475,25 @@
       </div>
     </div>
 
+    <!-- 浏览器视图：内嵌本机跑起来的应用（与「本机应用」预览共用同一条门控与
+         跨源隔离；地址校验在服务端 /api/preview/external，界面不自己拼"能开什么"）。 -->
+    <section class="browser-pane" id="browser-pane" aria-label="浏览器">
+      <div class="browser-bar">
+        <input class="browser-input" id="browser-url" type="text" spellcheck="false"
+               autocomplete="off" placeholder="http://127.0.0.1:5173/">
+        <button class="tbtn" id="btn-browser-open" title="在中间区打开这个本机地址">打开</button>
+        <button class="tbtn" id="btn-browser-reload" title="重新加载当前页面" disabled>刷新</button>
+        <button class="tbtn" id="btn-browser-popout" title="在系统浏览器新窗口打开" disabled>新窗口</button>
+        <button class="tbtn" id="btn-browser-detected" hidden
+                title="打开终端里跑起来的本机服务"></button>
+        <span class="spacer"></span>
+        <span class="chip" id="browser-chip" hidden></span>
+      </div>
+      <div class="browser-stage" id="browser-stage">
+        <div class="empty" id="browser-empty">在终端里跑起带界面的程序后，把地址填到上面（如 http://127.0.0.1:5173/）。</div>
+      </div>
+    </section>
+
     <!-- 底部面板：终端 / 输出 -->
     <div class="bottom-panel" id="bottom-panel">
       <div class="panel-resizer" id="bottom-resizer" title="拖动调整面板高度"></div>
@@ -304,14 +506,18 @@
       </div>
       <div class="bp-body bp-body-term" data-bp="terminal" hidden>
         <div class="term-bar">
-          <button class="tbtn" id="btn-term-open">开启终端</button>
+          <button class="tbtn" id="btn-term-open" title="新建一个终端（可以开任意多个）">+ 新建终端</button>
           <span class="term-chip" id="term-mode" hidden></span>
           <span class="spacer"></span>
-          <span class="term-note" id="term-note">点击下方空白处即可开始输入</span>
-          <button class="icon-btn" id="btn-term-close" title="关闭终端" hidden>⏻</button>
+          <span class="term-note" id="term-note">点「新建终端」开始；可同时开多个，各自独立</span>
+          <button class="icon-btn" id="btn-term-close" title="关闭当前终端" hidden>⏻</button>
         </div>
-        <!-- 交互式终端（P1-7）：用户自己敲命令的 PTY，与 Agent 通道隔离 -->
-        <div class="term term-interactive" id="term" tabindex="0"></div>
+        <!-- 多终端标签条：每个终端一个标签（带 ✕），标签数 < 2 时整体隐藏 -->
+        <div class="term-tabs" id="term-tabs" hidden></div>
+        <!-- 每个终端一个 .term-interactive（见 attachTermEl），同屏只显示激活的那个 -->
+        <div class="term-stage" id="term-stage">
+          <div class="term-empty" id="term-empty">还没有终端。点上面的「+ 新建终端」开始，想开几个都行。</div>
+        </div>
       </div>
       <div class="bp-body" data-bp="output" hidden>
         <div class="term" id="output"><div class="term-line is-dim">系统通知与运行日志会显示在这里。</div></div>
@@ -362,12 +568,22 @@
           <div class="mention-head" id="mention-head"></div>
           <div class="mention-list" id="mention-list"></div>
         </div>
+        <!-- `/` Skill 候选浮层（M9-A）：行首敲 `/` 列出已加载工作流；VIBE_SKILLS=0 时恒 hidden -->
+        <div class="mention-pop skill-pop" id="skill-pop" hidden>
+          <div class="mention-head" id="skill-pop-head"></div>
+          <div class="mention-list" id="skill-pop-list"></div>
+        </div>
         <textarea id="input" rows="1" placeholder="描述你想让 Agent 做的事…（Enter 发送，@ 引用文件/符号/目录）"></textarea>
         <!-- 多模态输入（P1-10）：仅在 VIBE_VISION 非 off 时显示；也可直接粘贴图片 -->
         <button class="btn btn-small" id="btn-image" type="button" hidden
                 title="选一张图片（需 VIBE_VISION 开启；也可直接粘贴图片）">选图</button>
         <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
         <button class="btn btn-primary" id="btn-send" disabled>发送</button>
+        <!-- 暂停（交互增强一）：与发送同一位置常驻，执行中随时可截止当前任务。
+             它与顶部「■ 中断」共用同一个 /api/interrupt，不另开通道；
+             常驻而不只在执行时出现 —— 空闲时看不见的能力等于不存在。 -->
+        <button class="btn btn-pause" id="btn-pause" type="button" disabled
+                aria-label="暂停" title="暂停当前任务（在当前步骤结束后停止）">⏸</button>
       </div>
       <!-- 上下文预算条（P2-17）：只在配了 VIBE_CONTEXT_BUDGET_TOKENS 时出现。
            未配该变量的部署（budgetTokens=0）始终 hidden —— 那时裁剪仍按字符口径，
@@ -414,6 +630,7 @@
         <span><kbd>Esc</kbd> 拒绝（默认动作，最安全）</span>
       </div>
       <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-draft-preview" hidden title="用「批准后会写入的内容」渲染页面（草稿只在内存里，没有落盘）">预览效果</button>
         <button class="btn btn-ghost" id="btn-minimize" title="先看看代码再决定（Agent 会一直等你）">先看看</button>
         <button class="btn btn-danger" id="btn-deny-all" title="拒绝本次，并在本会话内禁止再次调用该工具">拒绝并禁用</button>
         <button class="btn" id="btn-deny">拒绝</button>
@@ -447,22 +664,55 @@
   </div>
 </div>
 
+<!-- 逐条回退（P3）：把文件与会话一起拉回「这条用户提问之前」 -->
+<div class="modal-backdrop" id="rb-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="rb-title">
+    <div class="modal-head">
+      <span class="risk-badge" data-r="REVIEW">ROLLBACK</span>
+      <h2 id="rb-title">回退到这条提问之前？</h2>
+      <span class="modal-tool">逐条回退</span>
+    </div>
+    <div class="modal-reason" id="rb-target">—</div>
+    <div class="rb-files" id="rb-files"></div>
+    <ul class="rb-notes">
+      <li>这条提问及之后的对话会被删除，<b>不可恢复</b>。</li>
+      <li>后续轮次对同一文件的改动会一并撤销。</li>
+      <li>文件回滚可撤销（会自动生成反向检查点）。</li>
+    </ul>
+    <div class="modal-foot">
+      <div class="modal-hint"><span><kbd>Esc</kbd> 取消</span></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-rb-cancel">取消</button>
+        <button class="btn btn-primary" id="btn-rb-confirm">确认回退</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- 切换工作区（W1）：真正干活的是后端的工作区接口（重建整套上下文）。
-     目录选择有两条路：桌面壳里可以用系统目录对话框（走 preload 的 vibeShell.pickFolder，
-     那个按钮只在壳内显示）；浏览器里没有这个能力，改用下面的「浏览目录」——
-     它由 host 的只读列目录接口 /api/fs/dirs 驱动，同样能逐级点进任意本地目录。 -->
+     目录选择有三条路：
+     1. 本机：桌面壳里用系统目录对话框（preload 的 vibeShell.pickFolder，仅壳内显示那个键）；
+     2. 本机（浏览器）：没有那个桥，改用「浏览目录」，由只读接口 /api/fs/dirs 驱动；
+     3. 远程（M13 / ADR-042）：选一条已配置的远程连接，浏览它的目录树，
+        把选中的**远端目录**当成工作区。此时本机只留下一个「锚点目录」放 .vibe 资产。 -->
 <div class="modal-backdrop" id="ws-modal" hidden>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ws-title">
     <div class="modal-head">
       <span class="risk-badge" data-r="REVIEW">WORKSPACE</span>
       <h2 id="ws-title">切换工作区</h2>
-      <span class="modal-tool">本机目录</span>
+      <span class="modal-tool" id="ws-mode-label">本机目录</span>
     </div>
     <div class="modal-reason" id="ws-warning">
-      切换会<b>重启后端上下文</b>：新建会话、审计链改指向新工作区的 .vibe/ 目录，
+      切换会<b>重启后端上下文</b>：新建会话、审计链改指向新工作区的 .vibe 目录，
       当前对话与改动视图会清空。工作区里的文件不受影响，回滚点也不会被删。
     </div>
-    <div class="ws-body">
+    <div class="ws-tabs" role="tablist" aria-label="工作区来源">
+      <button type="button" class="ws-tab is-on" id="ws-tab-local"
+              role="tab" aria-selected="true">本机目录</button>
+      <button type="button" class="ws-tab" id="ws-tab-remote"
+              role="tab" aria-selected="false">远程目录</button>
+    </div>
+    <div class="ws-body" id="ws-local-body">
       <div class="sb-caption">最近打开</div>
       <div class="ws-list" id="ws-list"><div class="empty">加载中…</div></div>
       <div class="ws-path-row">
@@ -481,8 +731,39 @@
         </div>
         <div class="ws-dirs" id="ws-dirs"><div class="empty">…</div></div>
       </div>
-      <div class="ws-error" id="ws-error" hidden></div>
     </div>
+
+    <div class="ws-body" id="ws-remote-body" hidden>
+      <div class="ws-path-row">
+        <label class="ws-label" for="ws-conn">远程连接</label>
+        <span class="ws-cwd" id="ws-remote-note"></span>
+      </div>
+      <select class="ws-input ws-select" id="ws-conn">
+        <option value="">（加载中…）</option>
+      </select>
+      <div class="ws-browse">
+        <div class="ws-browse-head">
+          <span class="sb-caption">远端目录 / 文件</span>
+          <span class="ws-cwd" id="ws-remote-cwd"></span>
+          <button type="button" class="ws-up" id="btn-ws-remote-up" disabled
+                  title="回到上一级；已在连接根目录时禁用">↑ 上级</button>
+        </div>
+        <div class="ws-dirs" id="ws-remote-dirs">
+          <div class="empty">选一条连接以浏览它的目录树</div>
+        </div>
+      </div>
+      <div class="sb-caption">最近用过的远程工作区</div>
+      <div class="ws-list" id="ws-remote-list"><div class="empty">—</div></div>
+      <div class="ws-reason" id="ws-remote-reason">
+        远端目录**就是**工作区本体 —— 代码在那台机器上，模型写的相对路径也落在那里；
+        本机只新建一个<b>锚点目录</b>放审计链与回滚留底
+        （<code>~/.vibe/workspaces/remote/</code>），不放任何代码。
+        代价提前讲清：切过去之后<b>本机 Git 面板与语言服务诊断不可用</b>，
+        远端上的 git / 命令请走「远端会话」。
+      </div>
+    </div>
+
+    <div class="ws-error" id="ws-error" hidden></div>
     <div class="modal-foot">
       <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span><span><kbd>Enter</kbd> 切换</span></div>
       <div class="modal-actions">
@@ -516,6 +797,22 @@
         <button type="button" class="set-preset" data-preset="openai">OpenAI</button>
         <button type="button" class="set-preset" data-preset="deepseek">DeepSeek</button>
         <button type="button" class="set-preset" data-preset="custom">自定义</button>
+      </div>
+
+      <!-- 模型选择器（M9-I）：按任务难度在已授权端点间选型。配置来自环境变量
+           VIBE_MODEL_ROUTER*，界面只读展示；VIBE_MODEL_ROUTER=0 时整段隐藏。 -->
+      <div id="set-router" hidden>
+        <div class="sb-caption">模型选择器（按任务难度自动选型）</div>
+        <label class="ws-label" for="set-router-policy">选型策略</label>
+        <select class="ws-input" id="set-router-policy" disabled>
+          <option value="none">none —— 不选型（固定用上方模型）</option>
+          <option value="static">static —— 固定映射（简单→小模型，复杂→大模型）</option>
+          <option value="size">size —— 按模型尺寸启发式</option>
+        </select>
+        <label class="ws-label" for="set-router-default">选型失败时的默认模型</label>
+        <input class="ws-input" id="set-router-default" type="text" spellcheck="false"
+               autocomplete="off" disabled placeholder="留空 = 用上方模型名">
+        <div class="set-note">选型结果恒落在治理面授权的模型集合内，越界自动回退默认模型（fail-closed）。配置请用环境变量 VIBE_MODEL_ROUTER / VIBE_MODEL_ROUTER_POLICY / VIBE_MODEL_ROUTER_DEFAULT。</div>
       </div>
 
       <label class="ws-label" for="set-model">模型名</label>
@@ -726,6 +1023,46 @@
       <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span></div>
       <div class="modal-actions">
         <button class="btn btn-ghost" id="btn-gov-close">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 客户端自动更新（M9）：内核负责双通道检查 + 逐源 RSA 验签 + sha256 + 原子落盘 + 反降级 seq，
+     界面只做三件事 —— 把结论画成 chip、把待安装包交给桌面壳、把下载进度如实显示。
+     安装会重启进程、中断当前工作，所以**绝不自动安装**：下载完只把 stagingPath 交出去，
+     等用户点「安装」。浏览器直开 host 时没有 vibeShell 桥，「安装」按钮隐藏，只提示去桌面端装。
+     所有监听器都在 app.js 里用 addEventListener 挂 —— 这里没有内联脚本或内联事件处理器。 -->
+<div class="modal-backdrop" id="update-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="update-title">
+    <div class="modal-head">
+      <span class="risk-badge" data-r="SAFE">UPDATE</span>
+      <h2 id="update-title">客户端更新</h2>
+      <span class="modal-tool" id="update-status">—</span>
+    </div>
+    <div class="modal-reason">
+      安装包在下载时会逐源做 RSA 验签 + sha256 校验、校验通过才原子落盘；校验不过一律不装。
+      安装包只来自治理面或本地镜像，绝不从任意地址取。
+    </div>
+    <div class="ws-body">
+      <div class="sb-caption">版本</div>
+      <div class="set-note">当前 <span id="update-current">—</span> · 通道 <span id="update-channel">—</span> · 目标 <span id="update-target">—</span></div>
+      <div class="set-note">包大小 <span id="update-size">—</span><span id="update-mandatory" hidden> · 强制更新</span></div>
+      <div class="sb-caption">发布说明</div>
+      <div class="modal-reason" id="update-notes">—</div>
+      <div class="ctx-bar" id="update-progress" hidden>
+        <div class="ctx-track"><span class="ctx-seg is-system" id="update-progress-fill"></span></div>
+        <span class="ctx-label" id="update-progress-label"></span>
+      </div>
+      <div class="set-note" id="update-staged" hidden></div>
+      <div class="ws-error" id="update-error" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <div class="modal-hint"><span><kbd>Esc</kbd> 关闭</span></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-update-later">稍后</button>
+        <button class="btn" id="btn-update-download">下载</button>
+        <button class="btn btn-primary" id="btn-update-apply" hidden>安装</button>
       </div>
     </div>
   </div>

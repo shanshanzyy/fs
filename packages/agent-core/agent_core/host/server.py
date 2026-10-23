@@ -38,9 +38,22 @@ from ..context import (
     iter_workspace_files,
     iter_workspace_symbols,
 )
-from ..errors import ConfigError, LLMError, SandboxViolation
+from ..errors import AgentError, ConfigError, LLMError, SandboxViolation
 from ..governance.client import GovernanceError
+from ..governance.runtime import is_config_locked
 from ..llm.openai_compat import OpenAICompatClient, probe_endpoint
+from ..preview_media import (
+    PREVIEW_MAX_BYTES,
+    PREVIEW_MIME,
+    mime_for,
+    validate_external_preview_url,
+)
+# 只导入异常类型（不导入 remote 其它模块）：`remote.errors` 不依赖任何项目内模块，
+# 不会把 host → remote → tools 的链路拉成环。P3 的转发端点靠 `kind` 映射状态码。
+# M13 的远程工作区同理 —— 用到的 `remote.anchor` / `remote.store` / `remote.workspace`
+# 都在**函数内**延迟导入，理由同上（host ↔ remote 双向可达）。
+from ..remote.errors import RemoteError
+from ..remote.roots import PREFIX, normalize_sub
 from ..tools import ToolRegistry
 from ..tools.symbols import KIND_TYPE
 from .bus import EventBus
@@ -86,6 +99,65 @@ def _require_int_range(value: Any, field: str, low: int, high: int) -> int:
     return value
 
 
+def _body_flag(body: dict[str, Any], *names: str) -> bool | None:
+    """从请求体里取一个布尔字段（`names` 里任一命中即取）。
+
+    界面用 camelCase（`allowWrite`），而连接对象用 snake_case（`allow_write`）——
+    两种写法都收，是因为这个端点两边都会被调：面板提交用前者，脚本/CLI 用后者。
+    **没给就回 None**（=「这一项不改」），而不是回 False —— 否则「只想打开可写」
+    会被静默地读成「同时把可执行关掉」。
+    """
+    for name in names:
+        if name in body:
+            value = body[name]
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} 必须是 true 或 false")
+            return value
+    return None
+
+
+def _update_error_kind(exc: BaseException) -> str:
+    """把更新链路的异常归类成前端可判别的 `kind`（见 errors.UpdateError）。
+
+    非 UpdateError 的 AgentError 一律归 `network`：能走到这里的多半是传输层
+    或权限层问题，归错类只会让界面显示错文案，不会改变「没装上」这个事实。
+    """
+    kind = str(getattr(exc, "kind", "") or "")
+    return kind or "network"
+
+
+def _update_error_status(exc: BaseException) -> HTTPStatus:
+    """更新链路的异常 → HTTP 状态码。
+
+    `state`（禁用、已有任务在跑）是「现在不行」→ 409；`no_release`/`shape`
+    （没有可下版本、来源给的东西不成形）是请求侧问题 → 400；`signature`/
+    `sha256`/`size`/`network` 是**上游给的东西不可信**→ 502（不是 500：
+    本机没坏，坏的是来源）。
+    """
+    kind = _update_error_kind(exc)
+    if kind == "state":
+        return HTTPStatus.CONFLICT
+    if kind in ("no_release", "shape"):
+        return HTTPStatus.BAD_REQUEST
+    return HTTPStatus.BAD_GATEWAY
+
+
+def _remote_error_status(exc: BaseException) -> HTTPStatus:
+    """远程链路异常 → HTTP 状态码（照 `_update_error_status` 的范式）。
+
+    `notfound`（远端没这个文件）→ 404；`unreachable` / `transport`（链路不通、
+    超时、执行超时）→ 502（本机没坏，坏的是链路那一段）；`auth` / `hostkey` /
+    `config` / `remote` / `integrity` 归 400 —— 归类只影响界面文案与提示方式，
+    不改变「这次没成功」这个事实。
+    """
+    kind = str(getattr(exc, "kind", "") or "")
+    if kind == "notfound":
+        return HTTPStatus.NOT_FOUND
+    if kind in ("unreachable", "transport"):
+        return HTTPStatus.BAD_GATEWAY
+    return HTTPStatus.BAD_REQUEST
+
+
 # 界面的内容安全策略。
 # 界面里会渲染 Agent 读到的代码、模型输出 —— 这些内容本质上不可信，
 # 因此把能加载的资源锁死在同源：即便某个环节被注入，
@@ -122,6 +194,39 @@ PREVIEW_CSP = (
     "frame-ancestors 'self'"
 )
 
+
+# ---------------------------------------------------------------------------
+# 真实应用预览（P2 / ADR-039）：把**本机 dev server** 嵌进预览面板
+#
+# 隔离来自**跨源**，不是来自 CSP：预览帧是 `http://127.0.0.1:<另一端口>`，
+# 与界面不同源 → 它读不到 `/api/*`（同源策略拦跨源读取），也读不到父页 DOM。
+# 所以这里放宽的只有一条：**能不能把环回地址放进 iframe**。
+#
+# 三个"只"字必须同时成立，缺一条这功能就该退回静态预览：
+#   1. 只放宽 `frame-src` —— 其它指令一律从 `CSP` **派生**，不手抄第二份。
+#      两份手写的 CSP 必然漂移，而漂移的方向通常是"不知不觉少了一条限制"。
+#   2. 只放宽到 `127.0.0.1`（不含 `localhost`、`[::1]`、`*`）。
+#      地址校验（validate_external_preview_url）也**只收**这一种形态：
+#      校验放行的集合 ⊆ CSP 放行的集合，不给"填得进、渲染不出来"的白屏留口子。
+#   3. 只在 `preview_external` 打开时生效 —— 默认关时 `_serve_static` 发的仍是
+#      原封不动的 `CSP`，逐字节一致。
+# ---------------------------------------------------------------------------
+_EXTERNAL_PREVIEW_FRAME_SRC = "frame-src 'self' http://127.0.0.1:*;"
+
+
+def csp_with_external_preview() -> str:
+    """父页 CSP + 「允许内嵌环回地址」（P2）。关着门控时**不要**调这个函数。
+
+    从 `CSP` 派生而非另写一份常量：将来 `CSP` 增减指令，这里自动跟随。
+    万一定位不到 `frame-src`（`CSP` 被改过），**fail closed** —— 原样返回未放宽
+    的 CSP。宁可这个功能不起作用，也不能悄悄放行一段没人审过的策略。
+    """
+    marker = "frame-src 'self';"
+    if marker not in CSP:
+        return CSP
+    return CSP.replace(marker, _EXTERNAL_PREVIEW_FRAME_SRC)
+
+
 _MIME = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -134,35 +239,14 @@ _MIME = {
 
 # 预览（O1）允许的 MIME 白名单 —— 只放**文本/web 资源**。
 # 刻意不含 .exe/.dll/.zip 等可执行或打包格式：预览是「读渲染」，不是分发二进制。
-_PREVIEW_MIME = {
-    ".html": "text/html; charset=utf-8",
-    ".htm": "text/html; charset=utf-8",
-    ".xhtml": "application/xhtml+xml; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8",
-    ".mjs": "text/javascript; charset=utf-8",
-    ".cjs": "text/javascript; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
-    ".map": "application/json; charset=utf-8",
-    ".xml": "application/xml; charset=utf-8",
-    ".svg": "image/svg+xml",
-    ".txt": "text/plain; charset=utf-8",
-    ".md": "text/markdown; charset=utf-8",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".ico": "image/x-icon",
-    ".woff": "font/woff",
-    ".woff2": "font/woff2",
-    ".ttf": "font/ttf",
-    ".otf": "font/otf",
-    ".wasm": "application/wasm",
-}
+#
+# 清单本体在 `preview_media.py`：`GET /preview-draft/…` 与工具层的草稿预演
+# 都要看同一份，两处各写一遍必然漂移（详见该模块头部）。
+_PREVIEW_MIME = PREVIEW_MIME
 
 # 单次预览响应的体积上限。静态资源超过这个量级多半是误点/误配，直接回 413。
-_PREVIEW_MAX_BYTES = 8 << 20  # 8 MiB
+# 草稿与静态预览共用同一上限：两者走同一个 iframe。
+_PREVIEW_MAX_BYTES = PREVIEW_MAX_BYTES
 
 # `/api/visual/check` 的请求体上限：base64 截图会比原始字节大 4/3，
 # 再留一点 JSON 外壳余量（与上传图片同一口径）。
@@ -314,10 +398,35 @@ class ServerContext:
                 items.append(
                     {"path": path, "current": False, "updatedAt": row.get("updatedAt") or ""}
                 )
-        return {"current": current, "workspaces": items[:12]}
+        return {
+            "current": current,
+            "workspaces": items[:12],
+            # 远程工作区（M13 / ADR-042）：与本机列表并列返回，界面据此决定要不要
+            # 渲染「远程目录」页签。这是**只读列表**，门控关时它照样存在（为空），
+            # 真正受 `VIBE_REMOTE` 管的是「能不能切过去」。
+            "remoteEnabled": bool(getattr(self.session.config, "remote_enabled", False)),
+            "remoteWorkspaces": self._anchors(),
+        }
 
-    def switch_workspace(self, path: str) -> dict[str, Any]:
+    def _anchors(self) -> list[dict[str, Any]]:
+        """本机已用过的远程工作区锚点。**列表失败一律当空** —— 少几条候选不该
+        让「切换工作区」整个弹窗挂掉（真正的原因用户也不关心）。"""
+        try:
+            from ..remote.anchor import list_anchors
+
+            return list_anchors()
+        except Exception:  # noqa: BLE001 — 同上
+            return []
+
+    def switch_workspace(self, path: str, *, remote: dict[str, Any] | None = None) -> dict[str, Any]:
         """切到另一个工作区：优雅重启一套上下文（新会话、新审计链、新 jail）。
+
+        两个互斥的目标，**不能同时给**：
+
+        - `path` —— 本机目录（W1 既有行为，一字未改）；
+        - `remote` —— 远程工作区（M13 / ADR-042）：`{connection, sub}`，见
+          `_switch_remote_workspace`。切换后 `Config.workspace` 指向内核生成的
+          **本机锚点目录**，而模型的文件操作全部落在远端。
 
         为什么不能原地改 `Config.workspace`：它在启动时就绑定了 PathGuard、
         检查点目录与审计哈希链（`<workspace>/.vibe/audit.jsonl`）。原地改一个
@@ -327,6 +436,10 @@ class ServerContext:
         总线刻意复用：已经连着的 SSE（浏览器标签页、桌面窗口）不掉线，
         切换完成后由一条 `session.ready` 把新全貌推给所有订阅者。
         """
+        if remote is not None:
+            if str(path or "").strip():
+                raise ValueError("path 与 remote 互斥：一次只能切到一个目标")
+            return self._switch_remote_workspace(remote)
         raw = str(path or "").strip()
         if not raw:
             raise ValueError("工作区路径为空")
@@ -356,8 +469,16 @@ class ServerContext:
 
             # Config 是 frozen dataclass，只能 replace 出新实例；会话 ID 一并换掉 ——
             # 新工作区是一段新对话，不该续写旧会话的落盘行。
+            #
+            # `remote_workspace` 必须**显式清空**：从远程工作区切回本机目录时不清，
+            # 模型的文件操作会继续打到远端，而 jail 已经换成本机目录 —— 那是「看起来
+            # 一切正常、实则改错地方」的最坏情形。`remote_config` 反而不清：它此刻
+            # 指向用户真正在用的那份连接清单（见决策 13），同一份清单两边都该看到。
             new_config = replace(
-                current.config, workspace=target, session_id=uuid.uuid4().hex[:12]
+                current.config,
+                workspace=target,
+                session_id=uuid.uuid4().hex[:12],
+                remote_workspace="",
             )
             session = Session(
                 new_config,
@@ -374,6 +495,108 @@ class ServerContext:
             "switched": True,
             "workspace": str(target),
             "sessionId": new_config.session_id,
+        }
+
+    def _switch_remote_workspace(self, spec: object) -> dict[str, Any]:
+        """切到**远程工作区**（M13 / ADR-042）：把远端某个目录当成工作区。
+
+        **「先连后切」**：顺序刻意是
+        ① 目标真能用（连得上 + 能力探测过 + 目标子目录 ls 得出来）
+        ② 建本机锚点
+        ③ 才优雅重启会话。
+        任何一步失败，**旧会话原封不动** —— 绝不进入「工作区切过去了、但一条
+        远端命令都打不出去」的半成品状态。
+
+        ① 走的是进程级 `open_workspace` 而不是会话级 `RemoteSessions`：后者 `_swap()`
+        会**先把活动连接关掉**再去握手，于是「验证失败」会顺手断掉用户正在用的
+        那条连接 —— 那是验证流程不该有的副作用。代价是这里若不成功，那条 ssh
+        传输会留在缓存里一小会儿（ControlPersist 到期自动退），可以接受。
+        """
+        if not isinstance(spec, dict):
+            raise ValueError("remote 需为 JSON 对象（connection / sub）")
+        cfg = self.session.config
+        if not getattr(cfg, "remote_enabled", False):
+            raise ValueError("远程工作面未启用（VIBE_REMOTE=0），无法切到远程目录")
+
+        from ..remote.anchor import ensure_anchor
+        from ..remote.store import RemoteStore, store_path_for
+        from ..remote.workspace import open_workspace
+
+        name = str(spec.get("connection") or "").strip()
+        if not name:
+            raise ValueError("远程目录缺少连接名（connection）")
+        try:
+            sub = normalize_sub(str(spec.get("sub") or "").strip())
+        except AgentError as exc:
+            raise ValueError(str(exc)) from exc
+
+        store = RemoteStore.load(store_path_for(cfg))
+        conn = store.get(name)
+        if conn is None:
+            available = "、".join(store.names()) or "（无）"
+            raise ValueError(f"未找到名为 {name!r} 的远程连接。可用连接：{available}")
+        # 本机侧校验要先做（私钥在不在、写法合不合法）—— 这时候还没连网。
+        try:
+            conn.validate()
+        except AgentError as exc:
+            raise ValueError(f"连接 {name} 配置有问题：{exc}") from exc
+
+        try:
+            workspace = open_workspace(conn)
+            # 目标子目录要**真的存在**：一次远端 ls 同时验证了「连得上」与「目录在」。
+            # 这里刻意**不关**传输 —— 紧接着新会话 open 同名连接会命中同一条缓存，
+            # 于是验证的那次握手被复用掉了。
+            workspace.list_dir(sub)
+        except AgentError as exc:
+            raise ValueError(f"无法使用 {name} 上的目录 {sub or '/（连接 root 本身）'}：{exc}") from exc
+
+        ns_root = f"{PREFIX}{name}" + (f"/{sub}" if sub else "")
+        anchor = Path(ensure_anchor(name, sub, ns_path=ns_root)).resolve()
+
+        with self._switch_lock:
+            current = self.session
+            if current.state != P.STATE_IDLE:
+                raise BusyError("任务执行中，无法切换工作区，请先中断或等任务结束")
+            already = str(getattr(current.config, "remote_workspace", "") or "")
+            if already == ns_root and str(anchor) == str(current.config.workspace):
+                return {
+                    "ok": True,
+                    "switched": False,
+                    "workspace": str(anchor),
+                    "sessionId": current.config.session_id,
+                    "remoteWorkspace": ns_root,
+                    "reason": "已经是当前远程工作区，未做切换",
+                }
+
+            current.end_session("workspace_switch")
+            current.close()
+            new_config = replace(
+                current.config,
+                workspace=anchor,
+                session_id=uuid.uuid4().hex[:12],
+                remote_workspace=ns_root,
+                # 连接清单必须**钉在原处**（ADR-042 决策 13）：默认位置是
+                # `<workspace>/.vibe/remote.json`，而 workspace 此刻换成了锚点 ——
+                # 不钉住的话，用户先前配好的所有连接会「凭空消失」。
+                remote_config=str(store_path_for(current.config)),
+            )
+            session = Session(
+                new_config,
+                bus=current.bus,
+                registry=self.registry,
+                store=self.store,
+                client=self.client,
+            )
+            self.session = session
+
+        self.bus.publish(P.event(P.SESSION_READY, **session.describe()))
+        return {
+            "ok": True,
+            "switched": True,
+            "workspace": str(anchor),
+            "sessionId": new_config.session_id,
+            "remoteWorkspace": ns_root,
+            "remote": {"connection": name, "sub": sub},
         }
 
     def apply_settings(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -463,7 +686,7 @@ class ServerContext:
             current = self.session
             if current.state != P.STATE_IDLE:
                 raise BusyError("任务执行中，无法修改模型设置，请先中断或等任务结束")
-            if current.governance is not None:
+            if current.governance is not None and is_config_locked(current.governance):
                 raise ValueError("治理面已接管模型接入，界面不支持修改模型配置")
             # MCP 开关真的变了才重建实例：不变时保持进程原样，避免无谓重启。
             mcp_changed = (
@@ -491,6 +714,12 @@ class ServerContext:
                 current.config = new_config
                 current.agent.config = new_config
                 current._client = client
+                # 治理面没接管云端时，本地客户端就是权威 —— 同步过去，
+                # 免得 `governance describe()` 还展示着旧客户端。
+                if current.governance is not None and not is_config_locked(
+                    current.governance
+                ):
+                    current.governance.client = client
                 # 补全缓存里存的是「按旧配置算出的结果」，配置一变即失效。
                 current.invalidate_completion_cache()
             # MCP 开关切换：清掉全部实例并按新配置重建 `mcp__*` 工具清单
@@ -574,6 +803,37 @@ class VibeHandler(BaseHTTPRequestHandler):
         super().log_error(fmt, *args)
 
     # ------------------------------------------------------------------ 分发
+    # 远程工作区（M13）下「本机专属、在该模式不可用」的端点前缀 → 降级清单里的键。
+    # 放在类级别而不是散进各分支：清单与判定都只能有一个真源（ADR-042 决策 9）。
+    _REMOTE_DEGRADED: tuple[tuple[str, str], ...] = (
+        ("/api/git", "git"),
+        ("/api/lsp", "lsp"),
+        ("/api/index/status", "index_watch"),
+    )
+
+    def _degraded_response(
+        self, ctx: Any, path: str
+    ) -> tuple[dict[str, Any], HTTPStatus] | None:
+        """远程工作区模式下不可用的本机端点 → 一条**带原因**的响应。未降级返回 None。
+
+        为什么不 404 / 403：这些端点不是「没有」也不是「禁止」，而是**这一项在当前
+        模式下不成立**。回 200 + `{ok:false, reason}` 让界面能直接把原因显示出来 ——
+        静默返回空结果会让用户以为「仓库干净」，那是最难排查的一类假阴性。
+        """
+        getter = getattr(ctx.session, "remote_degraded", None)
+        if getter is None:
+            return None
+        reasons = getter()
+        if not reasons:
+            return None  # 本机模式：与现状逐字节一致
+        for prefix, key in self._REMOTE_DEGRADED:
+            if path == prefix or path.startswith(prefix + "/"):
+                reason = str(reasons.get(key, "") or "")
+                if not reason:
+                    return None
+                return ({"ok": False, "available": False, "reason": reason}, HTTPStatus.OK)
+        return None
+
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch("GET")
 
@@ -616,9 +876,19 @@ class VibeHandler(BaseHTTPRequestHandler):
             self._send_empty(HTTPStatus.NO_CONTENT, extra_headers={"Allow": "GET, POST"})
             return
 
+        # ---- 远程工作区：本机专属端点统一降级（M13 / ADR-042 决策 9）-------
+        # 拦截点刻意放在这个高度而不是散进每个分支：**判定只有一处**，
+        # 于是不会出现「这个端点了、那个端点忘了」。
+        degraded = self._degraded_response(ctx, path)
+        if degraded is not None:
+            self._send_json(degraded[0], status=degraded[1])
+            return
+
         try:
             if path.startswith("/api/"):
                 self._handle_api(method, path, query)
+            elif method == "GET" and path.startswith("/preview-draft/"):
+                self._serve_preview_draft(path)
             elif method == "GET" and (path == "/preview" or path.startswith("/preview/")):
                 self._serve_preview(path)
             elif method == "GET":
@@ -753,11 +1023,59 @@ class VibeHandler(BaseHTTPRequestHandler):
             self._send_json(session.audit_report())
             return
 
+        # ---- 后台 / 并行 Agent（M9-D）：用户本人发起、异步执行、结果回传 ----
+        # `VIBE_ASYNC_AGENT=0`（默认）时 session.tasks 为 None：POST 明确 400、
+        # GET 回空列表 —— 与未实现前逐字节一致（无端点暴露）。任务只读工具面、
+        # 审计链共用（见 session.task_submit / async_agent.pool）。
+        if path == "/api/tasks" or path.startswith("/api/tasks/"):
+            self._handle_tasks(method, path)
+            return
+
+        # ---- 定时任务调度（M10）：用户本人排的班，到点投只读后台任务 --------
+        # `VIBE_SCHEDULER=0`（默认）时 session.scheduler 为 None：POST 明确 400、
+        # GET 回空列表 —— 与未实现前逐字节一致（无端点暴露）。调度器只把 prompt
+        # 投给 M9-D 的后台池，只读工具面与审批纪律原样继承（见 scheduler.runner）。
+        if path == "/api/schedules" or path.startswith("/api/schedules/"):
+            self._handle_schedules(method, path)
+            return
+
+        # ---- 远程设备文件工作面（M11）：用户本人经界面做远程文件读/审/改/存 ----
+        # `VIBE_REMOTE=0`（默认）时门面一律 fail-closed（400），且界面**不渲染面板**
+        # —— 与未实现前逐字节一致（无端点暴露）。这是**用户本人动作**（ADR-011），
+        # 不走审批漏斗；但所有远端写入仍必须满足留底 + 乐观锁 + 受控覆盖。
+        if path == "/api/remote" or path.startswith("/api/remote/"):
+            self._handle_remote(method, path, query)
+            return
+
+        # ---- 客户端自动更新（M9）：只读的检查与状态 -----------------------
+        # 检查不下载、不落包：编排（双通道 + 逐源独立验签）在内核 update/service.py。
+        # `auto=1` 是壳在启动时发的「静默检查」；`update_check_on_start=false` 时
+        # 直接 idle 且零网络请求（尊重用户「别自动联网」的选择）。
+        if path == "/api/update/check" and method == "GET":
+            raw_auto = (query.get("auto") or ["1"])[0].strip().lower()
+            try:
+                self._send_json(session.update_check(auto=raw_auto not in ("0", "false", "no")))
+            except AgentError as exc:
+                self._send_json(
+                    {"error": str(exc), "kind": _update_error_kind(exc)},
+                    status=_update_error_status(exc),
+                )
+            return
+
+        if path == "/api/update/status" and method == "GET":
+            self._send_json(session.update_status())
+            return
+
         # ---- 语言服务器（E）：只读的状态 / 诊断 / 定义 ---------------------
         # 不可用时一律返回 {available:false, reason} 而不是报错 ——
         # 「本机没装语言服务器」是正常状态，不是服务端故障。
         if path == "/api/lsp/status" and method == "GET":
             self._send_json(session.lsp_status())
+            return
+
+        # 终端列表（多标签）：界面刷新后据此恢复标签页。只回元数据，不含输出。
+        if path == "/api/term" and method == "GET":
+            self._send_json(session.term_list())
             return
 
         if path == "/api/lsp/diagnostics" and method == "GET":
@@ -828,8 +1146,40 @@ class VibeHandler(BaseHTTPRequestHandler):
             self._handle_checkpoints(method, path)
             return
 
+        # ---- 真实应用预览的能力探测（P2 / ADR-039）------------------------
+        # 只回 `enabled`：界面据此决定「本机应用」入口亮不亮。
+        # 刻意**不**在 /api/state 或 /api/index/status 里加字段 —— 那两个响应体
+        # 早就有既有消费方，往里塞字段等于顺手改了别人的契约。
+        if path == "/api/preview/external" and method == "GET":
+            self._send_json(
+                {"enabled": bool(getattr(session.config, "preview_external", False))}
+            )
+            return
+
+        # ---- 远端预览转发：探测 + 当前名单（P3 / ADR-040）------------------
+        # 与 P2 同口径：只回「开没开」和元数据，绝不在这里顺手建转发。
+        # 门控关着时回 `enabled:false` 而不是 403 —— 界面首帧就要知道入口该不该出现。
+        if path == "/api/preview/tunnel" and method == "GET":
+            self._send_json(session.preview_tunnels())
+            return
+
         if method != "POST":
             self._send_json({"error": "该接口需要 POST"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+
+        # ---- 逐条回退（P3）：回退到某条用户提问之前 -------------------------
+        # 文件 + 对话一起回退：userSeq 是消息表的 seq（界面从 /messages 拿到）。
+        # 执行中 409、会话已切换或 userSeq 不存在 400 —— 校验全在任何写入之前。
+        if path == "/api/rollback":
+            body = self._read_json()
+            try:
+                result = session.rollback(body.get("userSeq"))
+            except BusyError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json(result)
             return
 
         if path == "/api/run":
@@ -857,18 +1207,153 @@ class VibeHandler(BaseHTTPRequestHandler):
                 self._send_json({"delivered": delivered})
             return
 
+        # ---- 审批期草稿预览（P1-2）-----------------------------------------
+        # 换一个**一次性窗口**的 token，凭它读「批准后会落盘的内容」。
+        # 为什么不一并回正文：正文与 token 分开，才让「谁读到了什么」这件事
+        # 在服务端留痕（审计记 token 指纹 + 路径），而不是随一次列表调用散出去。
+        if path == "/api/preview/draft":
+            body = self._read_json()
+            approval_id = str(body.get("approvalId") or "")
+            try:
+                info = session.preview_draft(approval_id)
+            except LookupError as exc:
+                # 审批已了结：不是参数错，是状态已经变了 → 409
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                url = "/preview-draft/{}/{}".format(
+                    info["token"], urllib.parse.quote(info["primary"])
+                )
+                self._send_json({**info, "url": url})
+            return
+
+        # ---- 真实应用预览（P2 / ADR-039）------------------------------------
+        # 让预览面板指向**用户自己起的** dev server，从而看到真跑起来的应用。
+        # host 在这里只做两件事：校验地址、留一条审计 —— 不起进程、不转发字节。
+        # 所以这个功能**零新增执行面**：dev server 什么时候跑、跑什么命令，
+        # 完全在用户手里（要 Agent 起服务仍得走 run_command 的审批闸门）。
+        #
+        # GET 见上方的能力探测分支（在 `method != POST` 那道门之前），
+        # 这里只剩下 POST：校验并登记一次预览；门控关着直接 403，不留"半开"的形态。
+        if path == "/api/preview/external":
+            if not getattr(session.config, "preview_external", False):
+                self._read_json()
+                self._send_json(
+                    {
+                        "error": (
+                            "真实应用预览已被配置关闭（VIBE_PREVIEW_EXTERNAL=0）；"
+                            "开启后界面才允许内嵌本机 dev server"
+                        )
+                    },
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return
+            body = self._read_json()
+            try:
+                url, port = validate_external_preview_url(
+                    body.get("url"), host_port=int(ctx.guard.port)
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                # 审计只记端口：这次预览指向哪个本机服务是需要留痕的，
+                # 页面里有什么内容不需要（那份内容在用户的 dev server 里，从不经过我们）。
+                session.agent.audit.record("preview.external", port=port, host="127.0.0.1")
+                self._send_json({"ok": True, "url": url, "port": port})
+            return
+
+        # ---- 远端预览转发（P3 / ADR-040）----------------------------------
+        # `ssh -L 127.0.0.1:<本机随机端口>:127.0.0.1:<远端端口>`：把远端设备上的
+        # 环回服务搬到本机环回，再交给 P2 的跨源帧渲染。两端的 host 由
+        # `transport.forward_argv()` 拼死，用户能给的只有两个整数端口。
+        #
+        # 门控是**双开**：`VIBE_PREVIEW_REMOTE`（这一档功能）+ `VIBE_REMOTE`
+        # （连接清单与 SSH 加固）。只管后者不管前者的实例不该能开转发。
+        if path in ("/api/preview/tunnel", "/api/preview/tunnel/close"):
+            if not getattr(session.config, "preview_remote", False):
+                self._read_json()
+                self._send_json(
+                    {
+                        "error": (
+                            "远端预览已被配置关闭（VIBE_PREVIEW_REMOTE=0）；"
+                            "开启后界面才能把远端回环端口转发到本机"
+                        )
+                    },
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return
+            body = self._read_json()
+            try:
+                if path.endswith("/close"):
+                    self._send_json(session.preview_tunnel_close(str(body.get("id") or "")))
+                    return
+                created = session.preview_tunnel_open(
+                    str(body.get("connection") or ""), body.get("remotePort")
+                )
+            except (AgentError, RemoteError) as exc:
+                self._send_json(
+                    {"error": str(exc)}, status=_remote_error_status(exc)
+                )
+                return
+            # 交出去的地址必须过**与 CSP 同一道**校验：两边放行的集合若不同，
+            # 用户看到的就是「开得成、却是一片白」。真出现说明内部不变量坏了，
+            # 因此连回滚一起做，而不是把一个坏地址塞给界面。
+            try:
+                url, port = validate_external_preview_url(
+                    created.get("url"), host_port=int(ctx.guard.port)
+                )
+            except ValueError as exc:
+                session.preview_tunnel_close(str(created.get("id") or ""))
+                self._send_json(
+                    {"error": f"内部地址校验失败，已回收该转发：{exc}"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            self._send_json({**created, "url": url, "port": port})
+            return
+
         if path == "/api/interrupt":
             self._read_json()  # HTTP/1.1 keep-alive：必须排空请求体，否则残留字节污染下一请求
             self._send_json({"interrupted": session.interrupt()})
             return
 
+        # ---- 客户端自动更新（M9）：下载安装包到 staging ---------------------
+        # 下载是「用户确认过的动作」（界面点了「下载更新」），不走审批浮层，
+        # 但**有任务在跑就 409**（与写盘路径同一纪律）。验完 sha256 原子落盘后
+        # 发 `update.staged`；安装永远由桌面壳自己做 —— 内核不执行安装器。
+        if path == "/api/update/download":
+            body = self._read_json()
+            try:
+                result = session.update_download(str(body.get("version") or ""))
+            except BusyError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except AgentError as exc:
+                self._send_json(
+                    {"error": str(exc), "kind": _update_error_kind(exc)},
+                    status=_update_error_status(exc),
+                )
+            else:
+                self._send_json(result)
+            return
+
         # ---- 工作区（W1）：切换 = 优雅重启一套上下文 ------------------------
         if path == "/api/workspaces/open":
             body = self._read_json()
+            # 远程工作区（M13）：`remote:{connection, sub}` 与 `path` 互斥，
+            # 两者都空 / 两者都给一律 400 —— 不替用户猜他想去哪。
+            remote = body.get("remote") if isinstance(body, dict) else None
+            if remote is not None and not isinstance(remote, dict):
+                self._send_json({"error": "remote 需为对象（connection / sub）"}, status=HTTPStatus.BAD_REQUEST)
+                return
             try:
-                result = ctx.switch_workspace(str(body.get("path") or ""))
+                result = ctx.switch_workspace(str(body.get("path") or ""), remote=remote)
             except BusyError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except AgentError as exc:
+                # 远程切换的失败面比本机宽得多（连不上 / 目录不在 / 权限位），
+                # 但它们统统是**用户看得懂的原因**，一律按 400 回报，不升 500。
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             else:
@@ -1395,7 +1880,7 @@ class VibeHandler(BaseHTTPRequestHandler):
             if store.get_session(sid) is None:
                 self._send_json({"error": "会话不存在"}, status=HTTPStatus.NOT_FOUND)
                 return
-            self._send_json({"sessionId": sid, "messages": store.get_messages(sid)})
+            self._send_json({"sessionId": sid, "messages": store.get_messages(sid, with_seq=True)})
             return
 
         if method == "POST" and len(parts) == 4 and parts[3] == "resume":
@@ -1456,6 +1941,410 @@ class VibeHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "未知接口"}, status=HTTPStatus.NOT_FOUND)
 
     # ------------------------------------------------------------------ 模型设置
+    def _handle_tasks(self, method: str, path: str) -> None:
+        """后台任务端点（M9-D）：`/api/tasks` 与 `/api/tasks/{id}[/cancel]`。
+
+        `VIBE_ASYNC_AGENT=0`（默认）时 session.tasks 为 None：
+        POST 明确 400、GET 回空列表，与未实现前逐字节一致。
+        """
+        session = self.server.ctx.session  # type: ignore[attr-defined]
+        parts = [p for p in path.split("/") if p]  # ["api", "tasks", ...]
+
+        if len(parts) == 2:  # /api/tasks
+            if method == "POST":
+                body = self._read_json()
+                try:
+                    self._send_json(session.task_submit(str(body.get("prompt") or "")))
+                except AgentError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if method == "GET":
+                self._send_json({"tasks": session.task_list()})
+                return
+            self._send_json({"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+
+        if len(parts) >= 3 and parts[2]:  # /api/tasks/{id}[/cancel]
+            task_id = parts[2]
+            is_cancel = len(parts) == 4 and parts[3] == "cancel"
+            if is_cancel and method == "POST":
+                self._read_json()
+                cancelled = session.task_cancel(task_id)
+                self._send_json({"ok": True, "cancelled": cancelled})
+                return
+            if method == "GET" and not is_cancel:
+                result = session.task_status(task_id)
+                if result is None:
+                    self._send_json(
+                        {"error": "任务不存在或未完成"}, status=HTTPStatus.NOT_FOUND
+                    )
+                    return
+                self._send_json(result)
+                return
+
+        self._send_json({"error": "未知任务路径"}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_schedules(self, method: str, path: str) -> None:
+        """定时任务端点（M10）：`/api/schedules` 与 `/api/schedules/{id}[/delete|run]`。
+
+        `VIBE_SCHEDULER=0`（默认，或未开 `VIBE_ASYNC_AGENT`）时 `session.scheduler`
+        为 None：POST 明确 400、GET 回空列表 —— 与未实现前逐字节一致。触发的是
+        **只读后台任务**（复用 M9-D 池），建/改/删属「用户本人动作」（ADR-011）。
+        """
+        session = self.server.ctx.session  # type: ignore[attr-defined]
+        parts = [p for p in path.split("/") if p]  # ["api", "schedules", ...]
+
+        if len(parts) == 2:  # /api/schedules
+            if method == "POST":
+                body = self._read_json()
+                try:
+                    self._send_json(
+                        session.job_create(
+                            str(body.get("name") or ""),
+                            str(body.get("schedule") or ""),
+                            str(body.get("prompt") or ""),
+                            enabled=bool(body.get("enabled", True)),
+                        )
+                    )
+                except AgentError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if method == "GET":
+                self._send_json(
+                    {
+                        "jobs": session.job_list(),
+                        "status": session.schedule_status()
+                        or {"enabled": False, "jobCount": 0},
+                    }
+                )
+                return
+            self._send_json({"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+
+        if len(parts) >= 3 and parts[2]:  # /api/schedules/{id}[/delete|run]
+            job_id = parts[2]
+            action = parts[3] if len(parts) == 4 else ""
+            if method != "POST":
+                self._send_json({"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+                return
+            body = self._read_json()
+            try:
+                if action == "delete":
+                    self._send_json({"ok": True, "deleted": session.job_delete(job_id)})
+                    return
+                if action == "run":
+                    task_id = session.job_run_now(job_id)
+                    if task_id is None:
+                        self._send_json({"error": "任务不存在"}, status=HTTPStatus.NOT_FOUND)
+                        return
+                    self._send_json({"ok": True, "taskId": task_id})
+                    return
+                if action:
+                    self._send_json(
+                        {"error": "未知操作"}, status=HTTPStatus.NOT_FOUND
+                    )
+                    return
+                # 无 action = 更新。只有 `enabled` 一个字段时走专用开关通道，
+                # 审计动作区分为 `toggled`（开关）而不是 `updated`（改内容）。
+                if body and set(body) <= {"enabled"}:
+                    job = session.job_toggle(job_id, bool(body.get("enabled")))
+                else:
+                    payload: dict[str, Any] = {}
+                    if "name" in body:
+                        payload["name"] = str(body.get("name") or "")
+                    if "schedule" in body:
+                        payload["schedule"] = str(body.get("schedule") or "")
+                    if "prompt" in body:
+                        payload["prompt"] = str(body.get("prompt") or "")
+                    if "enabled" in body:
+                        payload["enabled"] = bool(body.get("enabled"))
+                    job = session.job_update(job_id, **payload)
+                if job is None:
+                    self._send_json({"error": "任务不存在"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"ok": True, "job": job})
+            except AgentError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        self._send_json({"error": "未知定时任务路径"}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_remote(self, method: str, path: str, query: dict[str, list[str]]) -> None:
+        """远程设备工作面端点（M11）：连接管理 + 远程文件面 + 远程审查面。
+
+        `VIBE_REMOTE=0`（默认）时门面 `_require_remote()` 一律 fail-closed（400），
+        界面也不渲染「远程」面板 —— 与未实现前逐字节一致（无端点暴露）。
+
+        这些端点是**用户本人动作**（ADR-011），不走审批漏斗 —— 但远端写入仍强制
+        留底 + 乐观锁 + 受控覆盖（见 `Session.remote_save`），审计只记元数据。
+        路径风格沿用既有约定：**没有 DELETE 分支**（删除类走 POST `.../delete`）。
+        """
+        session = self.server.ctx.session  # type: ignore[attr-defined]
+        parts = [p for p in path.split("/") if p]  # ["api", "remote", ...]
+        tail = parts[2] if len(parts) > 2 else ""
+        leaf = len(parts) == 3
+
+        try:
+            # ---- /api/remote/state ------------------------------------------
+            if tail == "state" and leaf:
+                if method != "GET":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                self._send_json(session.remote_state())
+                return
+
+            # ---- /api/remote/connections[/{name}[/action]] -------------------
+            if tail == "connections":
+                self._handle_remote_connections(session, method, parts)
+                return
+
+            # ---- /api/remote/open -------------------------------------------
+            if tail == "open" and leaf:
+                if method != "POST":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                body = self._read_json()
+                self._send_json(session.remote_open(str(body.get("connection") or "")))
+                return
+
+            # ---- /api/remote/roots ------------------------------------------
+            if tail == "roots":
+                if len(parts) == 3:
+                    if method == "GET":
+                        self._send_json(session.remote_roots())
+                        return
+                    if method == "POST":
+                        body = self._read_json()
+                        connection = str(body.get("connection") or "")
+                        if not connection.strip():
+                            self._send_json(
+                                {"error": "缺少 connection 参数"},
+                                status=HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                        self._send_json(
+                            session.remote_root_add(
+                                connection,
+                                str(body.get("sub") or ""),
+                                str(body.get("label") or ""),
+                            )
+                        )
+                        return
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                if len(parts) == 4 and parts[3] == "delete":
+                    if method != "POST":
+                        self._send_json(
+                            {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                        )
+                        return
+                    body = self._read_json()
+                    connection = str(body.get("connection") or "")
+                    if not connection.strip():
+                        self._send_json(
+                            {"error": "缺少 connection 参数"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    self._send_json(
+                        session.remote_root_remove(connection, str(body.get("sub") or ""))
+                    )
+                    return
+
+            # ---- /api/remote/tree -------------------------------------------
+            if tail == "tree" and leaf:
+                if method != "GET":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                self._send_json(
+                    session.remote_tree(
+                        (query.get("path") or [""])[0],
+                        (query.get("connection") or [""])[0],
+                    )
+                )
+                return
+
+            # ---- /api/remote/file -------------------------------------------
+            if tail == "file" and leaf:
+                if method != "GET":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                rel = (query.get("path") or [""])[0]
+                if not rel.strip():
+                    self._send_json({"error": "缺少 path 参数"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(session.remote_read_file(rel))
+                return
+
+            # ---- /api/remote/save -------------------------------------------
+            if tail == "save" and leaf:
+                if method != "POST":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                body = self._read_json()
+                rel = str(body.get("path") or "")
+                if not rel.strip():
+                    self._send_json({"error": "缺少 path 参数"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                content = body.get("content")
+                if not isinstance(content, str):
+                    self._send_json(
+                        {"error": "content 必须是字符串"}, status=HTTPStatus.BAD_REQUEST
+                    )
+                    return
+                self._send_json(
+                    session.remote_save(rel, content, str(body.get("expectedDigest") or ""))
+                )
+                return
+
+            # ---- /api/remote/patch ------------------------------------------
+            if tail == "patch" and leaf:
+                if method != "POST":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                body = self._read_json()
+                rel = str(body.get("path") or "")
+                if not rel.strip():
+                    self._send_json({"error": "缺少 path 参数"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                search = body.get("search")
+                replace = body.get("replace")
+                if not isinstance(search, str) or not isinstance(replace, str):
+                    self._send_json(
+                        {"error": "search / replace 必须是字符串"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                self._send_json(
+                    session.remote_patch(
+                        rel,
+                        search,
+                        replace,
+                        replace_all=bool(_body_flag(body, "replaceAll", "replace_all")),
+                    )
+                )
+                return
+
+            # ---- /api/remote/restore ----------------------------------------
+            if tail == "restore" and leaf:
+                if method != "POST":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                body = self._read_json()
+                checkpoint_id = str(body.get("checkpointId") or "")
+                if not checkpoint_id.strip():
+                    self._send_json(
+                        {"error": "缺少 checkpointId 参数"}, status=HTTPStatus.BAD_REQUEST
+                    )
+                    return
+                self._send_json(session.remote_restore(checkpoint_id))
+                return
+
+            # ---- /api/remote/changes ----------------------------------------
+            if tail == "changes" and leaf:
+                if method != "GET":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                self._send_json(session.remote_changes())
+                return
+
+            # ---- /api/remote/diff -------------------------------------------
+            if tail == "diff" and leaf:
+                if method != "GET":
+                    self._send_json(
+                        {"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                rel = (query.get("path") or [""])[0]
+                if not rel.strip():
+                    self._send_json({"error": "缺少 path 参数"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(
+                    session.remote_diff(rel, (query.get("connection") or [""])[0])
+                )
+                return
+
+            self._send_json({"error": "未知远程工作面路径"}, status=HTTPStatus.NOT_FOUND)
+        except BusyError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+        except StaleFileError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+        except SandboxViolation as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except AgentError as exc:
+            self._send_json({"error": str(exc)}, status=_remote_error_status(exc))
+
+    def _handle_remote_connections(self, session: Session, method: str, parts: list[str]) -> None:
+        """连接管理端点：清单 / 新增 / 更新 / 删除 / 设默认 / 权限位 / 测试。
+
+        `parts` = ["api", "remote", "connections", name?, action?]。
+        """
+        # /api/remote/connections
+        if len(parts) == 3:
+            if method == "GET":
+                self._send_json(session.remote_connections())
+                return
+            if method == "POST":
+                body = self._read_json()
+                spec = body.get("connection") if isinstance(body.get("connection"), dict) else body
+                if isinstance(spec, dict) and "default" in body:
+                    spec = {**spec, "default": bool(body.get("default"))}
+                self._send_json(session.remote_connection_add(spec))
+                return
+            self._send_json({"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+
+        # /api/remote/connections/{name}[/action]
+        name = parts[3]
+        action = parts[4] if len(parts) > 4 else ""
+        if method != "POST":
+            self._send_json({"error": "不支持的方法"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
+            return
+        body = self._read_json()
+        if action == "delete":
+            self._send_json(session.remote_connection_remove(name))
+            return
+        if action == "default":
+            self._send_json(session.remote_connection_default(name))
+            return
+        if action == "test":
+            self._send_json(session.remote_connection_test(name))
+            return
+        if action == "permissions":
+            self._send_json(
+                session.remote_connection_permissions(
+                    name,
+                    allow_write=_body_flag(body, "allowWrite", "allow_write"),
+                    allow_shell=_body_flag(body, "allowShell", "allow_shell"),
+                )
+            )
+            return
+        if action:
+            self._send_json({"error": "未知操作"}, status=HTTPStatus.NOT_FOUND)
+            return
+        # 无 action = 更新（与 /api/schedules/{id} 同款约定）。
+        self._send_json(session.remote_connection_update(name, body))
+
     def _handle_get_settings(self, session: Session) -> None:
         """当前生效的模型配置 + 环境变量锁定情况。
 
@@ -1493,8 +2382,16 @@ class VibeHandler(BaseHTTPRequestHandler):
                 "webTimeout": cfg.web_timeout,
                 "webMaxBytes": cfg.web_max_bytes,
                 "webSearchMaxResults": cfg.web_search_max_results,
+                # 模型选择器（M9-I）：面板回填用（只读展示，配置来自环境变量 VIBE_MODEL_ROUTER*）
+                "modelRouterEnabled": cfg.model_router_enabled,
+                "modelRouterPolicy": cfg.model_router_policy,
+                "modelRouterDefault": cfg.model_router_default,
                 "envLocked": env_locked_fields(),
+                # 「接入了治理面」与「模型配置被治理面接管」是两件事：
+                # 前者只影响状态徽标，后者才决定界面能否保存（见 is_config_locked）。
                 "governance": session.governance is not None,
+                "modelLocked": session.governance is not None
+                and is_config_locked(session.governance),
             }
         )
 
@@ -1811,6 +2708,15 @@ class VibeHandler(BaseHTTPRequestHandler):
 
         # 目录请求 → 回落该目录下的 index.html（仅在确实是目录时才回落）。
         if target.is_dir():
+            # 无尾斜杠时必须先 301 到带斜杠的地址：页内相对资源（`app.css`）是按
+            # **URL 层级**解析的，停在 `/preview/site` 会把它们解析成
+            # `/preview/app.css` → 404。目录请求本来就该带斜杠，重定向是标准做法。
+            if not path.endswith("/"):
+                self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+                self.send_header("Location", path + "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             target = paths.check_read(str(target / "index.html"))
 
         if not target.is_file():
@@ -1852,7 +2758,137 @@ class VibeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_preview_draft(self, path: str) -> None:
+        """`GET /preview-draft/<token>/<relpath>`：审批期草稿的只读服务面（P1-2）。
+
+        与原文件的 `/preview/` 同一套口径 —— 同一 MIME 白名单、同一体积上限、
+        同一 `PREVIEW_CSP`、同样 `no-store`。差别只在**内容来源**：
+
+        · 路径在草稿清单里 → 用内存里「补丁应用之后」的正文（**绝不落盘**）；
+        · 否则 → 从磁盘读当前文件（页面引用的图片、字体、未被改动的资源）。
+
+        为什么后者必要：`index.html` 与 `style.css` 常在同一批改动里。只喂改后的
+        HTML、CSS 却读旧文件，预览会呈现「新结构配旧样式」—— 那是**假的**效果，
+        比看不到预览更容易误导审批。草稿清单里同时存 CSS，这里就能自动对上。
+
+        URL 里带的是**完整工作区相对路径**（而非相对草稿目录），因此文档里的
+        `app.css` / `./img/x.png` 这类相对引用会自然落到同一棵树上的正确位置，
+        不需要额外的 base 重写。这也是为什么草稿 URL 不会是「一个裸 token」。
+        """
+        ctx = self.server.ctx  # type: ignore[attr-defined]
+        session = ctx.session
+        paths = session.agent.paths
+
+        raw = urllib.parse.unquote(path[len("/preview-draft/") :])
+        token, _, sub = raw.partition("/")
+        if not token:
+            self._send_json({"error": "缺少草稿凭据"}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        scope = session.draft_scope(token)
+        if not scope:
+            # 「没见过这个 token」与「审批已结束」对外一律同一个答复：
+            # 区分开来就等于给 token 提供一个存在性探针。
+            self._send_json(
+                {"error": "草稿已失效（审批已结束，或凭据无效）"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+
+        if not sub:
+            # 裸 token → 跳到主文档。与 `/preview/<dir>` 补尾斜杠同理：
+            # 停在上一层会让文档内的相对资源解析到错误层级。
+            location = "/preview-draft/{}/{}".format(
+                token, urllib.parse.quote(scope["primary"])
+            )
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if sub in scope["files"]:
+            body = scope["files"][sub].encode("utf-8")
+            content_type = mime_for(sub) or "text/html; charset=utf-8"
+        else:
+            try:
+                target = paths.check_read(sub)
+            except SandboxViolation as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+                return
+
+            rel = paths.relative(target)
+            if ".vibe" in rel.split("/"):
+                self._send_json(
+                    {"error": "拒绝预览 .vibe 内部目录（审计与检查点专用）"},
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return
+            if target.is_dir() or not target.is_file():
+                self._send_json({"error": "资源不存在"}, status=HTTPStatus.NOT_FOUND)
+                return
+
+            content_type = mime_for(rel)
+            if content_type is None:
+                self._send_json(
+                    {
+                        "error": (
+                            f"不支持预览该类型的资源（{target.suffix or '无后缀'}）；"
+                            "预览只服务文本 / 网页资源"
+                        )
+                    },
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return
+            try:
+                size = target.stat().st_size
+            except OSError as exc:
+                self._send_json({"error": f"读取失败：{exc}"}, status=HTTPStatus.NOT_FOUND)
+                return
+            if size > _PREVIEW_MAX_BYTES:
+                self._send_json(
+                    {"error": f"资源过大（{size} 字节），超出预览上限"},
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            body = target.read_bytes()
+
+        # 内存草稿同样过上限：一份 20 MiB 的 HTML 能把渲染线程卡住，
+        # 而「原文件不会这么大」这个假设对模型产出的内容并不成立。
+        if len(body) > _PREVIEW_MAX_BYTES:
+            self._send_json(
+                {"error": f"草稿过大（{len(body)} 字节），超出预览上限"},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", PREVIEW_CSP)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(body)
+
     # ------------------------------------------------------------------ 静态
+    def _page_csp(self) -> str:
+        """界面文档发的 CSP。
+
+        默认就是 `CSP` 原文；只有「真实应用预览」这一档打开时才换成放宽 `frame-src`
+        的那一版（见 `csp_with_external_preview`）。之所以做成方法而不是模块级常量：
+        门控是**运行时配置**（`VIBE_PREVIEW_EXTERNAL` / 设置页都能改），在导入期
+        烤成常量就再也跟不上切换工作区之后的新 config 了。
+
+        **P3 不新增放宽点**：远端预览的转发落地在本机 `127.0.0.1:<port>`，正好落在
+        ADR-039 已经放行的那一条 `frame-src` 里。所以这里的判断是「或」而不是
+        再拼一份 CSP —— 全项目放开帧的来源仍然只有一处，审计起来只需要看一个函数。
+        """
+        cfg = getattr(self.server.ctx.session, "config", None)  # type: ignore[attr-defined]
+        if getattr(cfg, "preview_external", False) or getattr(cfg, "preview_remote", False):
+            return csp_with_external_preview()
+        return CSP
+
     def _serve_static(self, path: str) -> None:
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
         candidate = (UI_DIR / rel).resolve()
@@ -1871,7 +2907,7 @@ class VibeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", self._page_csp())
         # 启动页 URL 带 ?token=…，禁止把 Referer 带到第三方，避免令牌外泄
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
@@ -2022,6 +3058,30 @@ class HostServer:
         return thread
 
 
+def restore_latest_session(
+    store: "SessionStore", workspace: str
+) -> tuple[str, list[dict[str, Any]]] | None:
+    """挑出本工作区**最近一条**会话供启动续接（重启接着聊）。
+
+    返回 ``(sessionId, messages)``；没有历史 / 消息为空 / 序列不合法（孤立 tool
+    消息会被上游直接拒掉）/ 读不出来时返回 ``None`` —— 调用方据此降级为新会话。
+    与 SessionStore 的「坏库自愈」同一纪律：历史丢了可以接受，服务起不来不行。
+    """
+    try:
+        rows = store.list_sessions(workspace=workspace, limit=1)
+        if not rows:
+            return None
+        sid = str(rows[0]["id"])
+        messages = store.get_messages(sid)
+        if not messages:
+            return None
+        if validate_message_group(messages):
+            return None
+        return sid, messages
+    except Exception:  # noqa: BLE001 — 读历史失败不该拦服务启动
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """`python -m agent_core.host` 的入口：起服务并打开界面。"""
     import argparse
@@ -2088,6 +3148,18 @@ def main(argv: list[str] | None = None) -> int:
             store = None
 
     host = HostServer(config, port=args.port, verbose=args.verbose, store=store)
+    # 重启续接（D）：自动恢复该工作区最近一次会话，让「关掉软件再打开」能接着聊。
+    # 无历史 / 成组校验不过（restore_latest_session 返回 None）或恢复时忙
+    # （BusyError，此处不可能）都降级为新会话，绝不拦服务启动。
+    if store is not None:
+        restored = restore_latest_session(store, str(config.workspace))
+        if restored is not None:
+            sid, messages = restored
+            try:
+                host.ctx.session.resume(messages, session_id=sid)
+                ui.info(f"已恢复上次会话 {sid}（{len(messages)} 条消息）。")
+            except Exception as exc:  # noqa: BLE001
+                ui.info(f"恢复上次会话失败（{type(exc).__name__}），从新会话开始。")
     ui.rule("Vibe Coding Agent · 桌面端")
     ui.info(f"工作区  {config.workspace}")
     ui.info(f"模型    {config.model} @ {config.base_url}")

@@ -373,6 +373,31 @@ class GovernanceClient:
     def gateway_models(self) -> dict[str, Any]:
         return self.request("GET", "/gateway/models", token=self.ensure_token()).body
 
+    # ============================================================== 客户端发布（M9）
+    def check_client_update(self, **query: str) -> dict[str, Any]:
+        """问治理面「这台机器该不该更新」。
+
+        返回 `{update, release, eligible, rollout, reason}`；`release` 里是
+        一份带 RS256 签名的清单 —— 拿到它**不等于可信**，客户端必须自己
+        用内置公钥验签（见 `update/manifest.py::Manifest.verify`）。
+        路径走 `_url()` 的 `/api/v1` 前缀。
+        """
+        return self.request(
+            "GET",
+            "/client/updates/check",
+            token=self.ensure_token(),
+            query=query or None,
+        ).body
+
+    def list_client_releases(self, **query: str) -> dict[str, Any]:
+        """列出可见的客户端发布（管理/排障用；需 `release:read` 权限）。"""
+        return self.request(
+            "GET",
+            "/client/releases",
+            token=self.ensure_token(),
+            query=query or None,
+        ).body
+
     # ============================================================== 上传
     def upload_audit(self, envelope: dict[str, Any]) -> dict[str, Any]:
         """上传一批审计事件。返回服务端的接收结果。

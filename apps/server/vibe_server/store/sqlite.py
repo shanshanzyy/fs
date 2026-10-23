@@ -544,6 +544,142 @@ class SQLiteStore(Store):
         )
         return changed > 0
 
+    def list_enrollments(self, *, team_id: str = "") -> list[Row]:
+        # 台账刻意**不 SELECT token_hash**：列表只需要「给哪个团队、何时过期、
+        # 用了几次」，哈希没有任何展示价值，回它就是多一个泄漏面。
+        cols = (
+            "id, team_id, role, created_by, created_at, expires_at, max_uses, uses, revoked_at"
+        )
+        if team_id:
+            return self._all(
+                "SELECT " + cols + " FROM enrollment_tokens WHERE team_id = :tid"
+                " ORDER BY created_at DESC",
+                {"tid": team_id},
+            )
+        return self._all("SELECT " + cols + " FROM enrollment_tokens ORDER BY created_at DESC")
+
+    # ============================================================== 客户端发布（M9）
+    _RELEASE_COLS = (
+        "id, channel, version, platform, arch, url, sha256, size, notes, mandatory,"
+        " min_version, rollout_percent, seq, signature, signature_alg, pubkey_kid,"
+        " published_at, revoked_at, created_by"
+    )
+
+    def insert_release(
+        self,
+        release_id: str,
+        *,
+        channel: str,
+        version: str,
+        platform: str,
+        arch: str,
+        url: str,
+        sha256: str,
+        size: int,
+        notes: str,
+        mandatory: bool,
+        min_version: str,
+        rollout_percent: int,
+        seq: int,
+        signature: str,
+        signature_alg: str,
+        pubkey_kid: str,
+        created_by: str,
+        now: int,
+    ) -> Row:
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO client_releases (id, channel, version, platform, arch, url,"
+                " sha256, size, notes, mandatory, min_version, rollout_percent, seq,"
+                " signature, signature_alg, pubkey_kid, published_at, created_by)"
+                " VALUES (:id,:ch,:ver,:plat,:arch,:url,:sha,:size,:notes,:mand,:minv,"
+                " :roll,:seq,:sig,:alg,:kid,:now,:by)",
+                {
+                    "id": release_id,
+                    "ch": channel,
+                    "ver": version,
+                    "plat": platform,
+                    "arch": arch,
+                    "url": url,
+                    "sha": sha256,
+                    "size": size,
+                    "notes": notes[:2000],
+                    "mand": 1 if mandatory else 0,
+                    "minv": min_version,
+                    "roll": rollout_percent,
+                    "seq": seq,
+                    "sig": signature,
+                    "alg": signature_alg,
+                    "kid": pubkey_kid,
+                    "now": now,
+                    "by": created_by,
+                },
+            )
+        return (
+            self._one(
+                "SELECT " + self._RELEASE_COLS + " FROM client_releases WHERE id = :id",
+                {"id": release_id},
+            )
+            or {}
+        )
+
+    def list_releases(
+        self,
+        *,
+        channel: str = "",
+        platform: str = "",
+        arch: str = "",
+        include_revoked: bool = False,
+        limit: int = 100,
+    ) -> list[Row]:
+        where: list[str] = []
+        params: dict[str, object] = {"limit": limit}
+        if channel:
+            where.append("channel = :ch")
+            params["ch"] = channel
+        if platform:
+            where.append("platform = :plat")
+            params["plat"] = platform
+        if arch:
+            where.append("arch = :arch")
+            params["arch"] = arch
+        if not include_revoked:
+            where.append("revoked_at IS NULL")
+        sql = "SELECT " + self._RELEASE_COLS + " FROM client_releases"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY seq DESC LIMIT :limit"
+        return self._all(sql, params)
+
+    def get_release(self, release_id: str) -> Row | None:
+        return self._one(
+            "SELECT " + self._RELEASE_COLS + " FROM client_releases WHERE id = :id",
+            {"id": release_id},
+        )
+
+    def latest_release(
+        self, *, channel: str, platform: str, arch: str, now: int
+    ) -> Row | None:
+        return self._one(
+            "SELECT " + self._RELEASE_COLS + " FROM client_releases"
+            " WHERE channel = :ch AND platform = :plat AND arch = :arch"
+            "   AND revoked_at IS NULL AND published_at <= :now"
+            " ORDER BY seq DESC LIMIT 1",
+            {"ch": channel, "plat": platform, "arch": arch, "now": now},
+        )
+
+    def next_release_seq(self) -> int:
+        row = self._one("SELECT COALESCE(MAX(seq), 0) AS m FROM client_releases")
+        return int((row or {}).get("m") or 0) + 1
+
+    def revoke_release(self, release_id: str, now: int) -> bool:
+        changed = self._run(
+            "UPDATE client_releases SET revoked_at = :now"
+            " WHERE id = :id AND revoked_at IS NULL",
+            {"now": now, "id": release_id},
+        )
+        return changed > 0
+
     def revoke_access_jti(self, jti: str, expires_at: int, now: int) -> None:
         with self.tx() as conn:
             conn.execute(

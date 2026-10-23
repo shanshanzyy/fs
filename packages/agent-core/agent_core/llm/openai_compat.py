@@ -37,6 +37,18 @@ from .base import (
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
+
+class StreamInterrupted(Exception):
+    """流式生成中途被用户中断。
+
+    刻意**不继承 `LLMError`**：用户按停止不是模型故障，不该触发重试、
+    降级或「任务失败」记录。上层把它收敛成一次正常的中断（`run.interrupted`），
+    对话历史仍以 assistant 收尾，用户可以立刻接着说话。
+    异常穿出 `with response:` 时 HTTP 连接随之关闭 —— 上游生成被真正掐断，
+    而不是「假装停止、后台继续烧 token」。
+    """
+
+
 # FIM（fill-in-the-middle）不可用的判据：这些状态码（或缺失的 /completions 路由）
 # 说明上游没有补全能力，而非一次偶发失败 —— 命中即把能力缓存置否，避免每次请求
 # 都白试一遍。超时 / 5xx / 连接失败**不**在此列：那是可恢复的，不能污染缓存。
@@ -69,6 +81,8 @@ class OpenAICompatClient:
         prompt_cache: str = "off",
         cache_key: str = "",
         vision_mode: str = "off",
+        router=None,
+        audit=None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -76,6 +90,13 @@ class OpenAICompatClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.supports_native_tools = supports_native_tools
+        # 模型选择器（M9-I）：None = 未启用，请求体与改造前逐字节一致。
+        # 选型结果在请求组装层（chat/chat_stream/complete）覆盖 `model` 字段，
+        # 只在 router.enabled=True 且策略合法时生效（fail-closed，见 router.py）。
+        self.router = router
+        # 审计（M9-I）：选型结果经 `audit.record("model.route", ...)` 记元数据
+        #（intent/model/reason，ADR-006）。None = 不记（直接构造本类的测试/脚本）。
+        self.audit = audit
         # FIM 能力探测缓存（D4）：None = 未探测；True/False = 已探明。
         # 补全每次都试 FIM 会让不支持的上游白吃一次失败 —— 因此第一次探明后就记住。
         self._fim_supported: bool | None = None
@@ -92,6 +113,31 @@ class OpenAICompatClient:
         self._vision_supported: bool | None = None
         self._vision_notice: str = ""
         self._opener = _build_opener(self.base_url)
+
+    # ------------------------------------------------------------------ 模型选择器（M9-I）
+    def _resolve_model(self, messages: list[dict[str, Any]]) -> str:
+        """请求组装层选型：返回本次请求真正要发的 `model`。
+
+        未启用（`self.router is None` 或 `enabled=False`）时返回 `self.model`，
+        请求体与改造前**逐字节一致**。启用时用 `infer_intent` 判断意图、
+        `router.resolve` 选型（越界/未匹配 fail-closed 回退默认），覆盖 `model` 字段。
+        选型只影响「发往哪个已配置端点」，不改「代码不出本机」（红线 1）。
+        """
+        if self.router is None:
+            return self.model
+        from .router import infer_intent
+
+        intent = infer_intent(messages)
+        chosen, reason = self.router.resolve(intent, requested_model=self.model)
+        # 审计只记 intent/model/reason 三元组（ADR-006）：任务正文不出机。
+        if self.audit is not None:
+            try:
+                self.audit.record(
+                    "model.route", intent=intent, model=chosen or self.model, reason=reason
+                )
+            except Exception:  # noqa: BLE001 — 审计失败不该中断请求
+                pass
+        return chosen or self.model
 
     # ------------------------------------------------------------------ 缓存（P2-17）
     @property
@@ -231,7 +277,7 @@ class OpenAICompatClient:
         temperature: float | None = None,
     ) -> ChatResponse:
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": self._resolve_model(messages),
             "messages": messages,
             "stream": False,
         }
@@ -262,6 +308,8 @@ class OpenAICompatClient:
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         on_delta: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> ChatResponse:
         """流式版 chat()：SSE 逐帧接收，聚合后返回与 chat() 完全一致的 ChatResponse。
 
@@ -274,7 +322,7 @@ class OpenAICompatClient:
           围栏开头就永久静默，绝不让半截 JSON 推给界面（见 A1.2 的边界约定）。
         """
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": self._resolve_model(messages),
             "messages": messages,
             "stream": True,
         }
@@ -324,7 +372,10 @@ class OpenAICompatClient:
 
             try:
                 content, tool_calls_raw, finish_reason, usage = consume_chat_sse(
-                    response, on_delta=on_delta
+                    response,
+                    on_delta=on_delta,
+                    on_reasoning=on_reasoning,
+                    should_stop=should_stop,
                 )
             except socket.timeout as exc:
                 raise LLMError(
@@ -685,12 +736,19 @@ def consume_chat_sse(
     response: Any,
     *,
     on_delta: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[str, list[dict[str, str]], str, dict[str, Any]]:
     """消费一条 OpenAI 兼容的 chat SSE 流（直连与经网关共用）。
 
     之前这段解析只在 OpenAICompatClient 里；M3 给网关客户端加流式时
     提成模块级函数 —— 两边各写一份必然漂移，漂移的表现会是
     「同一个模型直连正常、走网关就丢工具调用」这种最难查的问题。
+
+    `should_stop` 每收到一行就查一次（含心跳帧）：用户按下停止后，最多再等
+    一个 SSE 帧。命中即抛 `StreamInterrupted`，**不返回半截 tool_calls** ——
+    中断时的增量参数可能是不完整 JSON，当成正常响应会写出错误的工具调用。
+    异常穿出 `with response:` 会关闭连接，上游生成随之停止。
 
     返回 (content, tool_calls_raw, finish_reason, usage)。
     """
@@ -702,6 +760,8 @@ def consume_chat_sse(
 
     with response:
         for line in response:
+            if should_stop is not None and should_stop():
+                raise StreamInterrupted("用户中止了流式生成")
             text = line.decode("utf-8", errors="replace").strip()
             if not text or text.startswith(":"):
                 continue  # 空行 / SSE 注释（心跳）
@@ -729,6 +789,19 @@ def consume_chat_sse(
                 if piece:
                     content_parts.append(piece)
                     guard.feed(piece)
+                # 思考（reasoning）：DeepSeek-R1 系与部分自建网关把推理放在
+                # `reasoning_content`（少数用 `reasoning`）。它与正文是两条独立
+                # 通道 —— 不进 content_parts（不污染最终答案），只经 on_reasoning
+                # 实时外送。上游不返回思考时，这一段什么都不做。
+                reasoning = delta.get("reasoning_content")
+                if reasoning is None:
+                    reasoning = delta.get("reasoning")
+                if isinstance(reasoning, list):  # 少数服务返回分片数组
+                    reasoning = "".join(
+                        p.get("text", "") for p in reasoning if isinstance(p, dict)
+                    )
+                if isinstance(reasoning, str) and reasoning and on_reasoning is not None:
+                    on_reasoning(reasoning)
                 for item in delta.get("tool_calls") or []:
                     if not isinstance(item, dict):
                         continue

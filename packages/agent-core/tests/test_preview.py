@@ -12,6 +12,9 @@
 
 反向验证（§12 / O9）：临时让 `/preview/` 跳过 PathGuard，
 `test_traversal_rejected` 与 `test_vibe_dir_rejected` 必须变红。
+
+P0 增补：目录请求缺尾斜杠时必须 **301**（否则页内相对资源解析到错误层级），
+以及 `preview.changed` 事件的载荷契约（**只带路径、不含内容**，超限截断）。
 """
 
 from __future__ import annotations
@@ -214,6 +217,27 @@ class PreviewHttpTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertIn("首页", response.read().decode("utf-8"))
 
+    def test_directory_without_slash_redirects(self) -> None:
+        """无尾斜杠必须 301 到带斜杠 —— 否则页内相对资源会解析到错误层级。
+
+        上面那条用例用的是**会跟随重定向**的 opener，它只能证明「最终拿得到
+        首页」，证明不了 URL 层级是对的。这里用不跟随的 opener 直接看 301。
+        """
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+                return None
+
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            opener.open(
+                urllib.request.Request(self.base + "/preview/site"), timeout=10
+            )
+        self.assertEqual(ctx.exception.code, 301)
+        self.assertEqual(ctx.exception.headers["Location"], "/preview/site/")
+
     def test_directory_without_index_is_404(self) -> None:
         self.assertEqual(self.status_of("/preview/plain"), 404)
 
@@ -310,6 +334,102 @@ class PreviewHttpTests(unittest.TestCase):
         ) as response:
             data = json.loads(response.read().decode("utf-8"))
         self.assertTrue(data["baselineMissing"])   # 375 宽还没有基线
+
+
+class PreviewChangedEventTests(unittest.TestCase):
+    """`preview.changed` 的载荷契约（P0）。
+
+    这个事件会进 SSE 流（并带历史回放），所以「只带路径、不带内容」是硬约束：
+    一旦有人往 payload 里塞正文，ADR-006 就被绕过了，而且不会有人发现。
+    """
+
+    class _Bus:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def publish(self, event: dict) -> None:
+            self.events.append(event)
+
+    def _emit(self, paths: list[str]) -> list[dict]:
+        from agent_core.host.session import Session
+
+        holder = type("Holder", (), {"bus": self._Bus()})()
+        Session._on_files_changed(holder, paths)
+        return holder.bus.events
+
+    def test_paths_are_deduped_and_sorted(self) -> None:
+        events = self._emit(["b.css", "a.html", "a.html"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "preview.changed")
+        self.assertEqual(events[0]["paths"], ["a.html", "b.css"])
+        self.assertEqual(events[0]["count"], 2)
+        self.assertFalse(events[0]["truncated"])
+
+    def test_payload_carries_no_content(self) -> None:
+        """字段集合必须恰好是这几个 —— 多一个正文键就是红线失守。"""
+        events = self._emit(["secret.html"])
+        self.assertEqual(
+            set(events[0]), {"type", "ts", "paths", "count", "truncated"}
+        )
+
+    def test_empty_change_emits_nothing(self) -> None:
+        self.assertEqual(self._emit([]), [])
+
+    def test_truncates_and_flags(self) -> None:
+        """一次改动过多（切分支 / 批量生成）时截断路径，并让界面全刷。"""
+        events = self._emit([f"f{i:04d}.html" for i in range(250)])
+        self.assertEqual(len(events[0]["paths"]), 200)
+        self.assertEqual(events[0]["count"], 250)
+        self.assertTrue(events[0]["truncated"])
+
+
+class WatcherChangeHookTests(unittest.TestCase):
+    """`IndexWatcher.on_change`：只在真有变化时回调，且只给相对路径。
+
+    它与审计那条「不写链」的纪律并不冲突：回调只拿路径、只做广播。
+    回调里抛异常必须被吞掉 —— 后台轮询线程不能因为订阅方故障而死。
+    """
+
+    def setUp(self) -> None:
+        from agent_core.index import IndexWatcher
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "page.html").write_text("A", encoding="utf-8")
+        self.seen: list[list[str]] = []
+        self.watcher = IndexWatcher(
+            self.root, interval=1, max_files=50, on_change=self.seen.append
+        )
+        self.watcher._snapshot = self.watcher._scan()
+
+    def tearDown(self) -> None:
+        self.watcher.stop()
+        self._tmp.cleanup()
+
+    def test_no_change_does_not_notify(self) -> None:
+        self.assertIsNone(self.watcher.poll_once())
+        self.assertEqual(self.seen, [])
+
+    def test_change_notifies_relative_path(self) -> None:
+        # 改大小而不只改 mtime：mtime 的粒度取决于文件系统，靠 size 更稳。
+        (self.root / "page.html").write_text("ABCDEFG", encoding="utf-8")
+        self.watcher.poll_once()
+        self.assertEqual(len(self.seen), 1)
+        self.assertIn("page.html", self.seen[0])
+
+    def test_subscriber_failure_does_not_raise(self) -> None:
+        from agent_core.index import IndexWatcher
+
+        def boom(_paths: list[str]) -> None:
+            raise RuntimeError("订阅方炸了")
+
+        watcher = IndexWatcher(
+            self.root, interval=1, max_files=50, on_change=boom
+        )
+        watcher._snapshot = watcher._scan()
+        (self.root / "page.html").write_text("ZZZZZZZZZ", encoding="utf-8")
+        watcher.poll_once()      # 不得抛出
+        watcher.stop()
 
 
 if __name__ == "__main__":

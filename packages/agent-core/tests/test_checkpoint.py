@@ -64,6 +64,23 @@ class Harness(unittest.TestCase):
 
 
 class CheckpointCoreTests(Harness):
+    def test_user_seq_is_persisted_and_annotated(self) -> None:
+        """逐条回退的映射：userSeq 写进 manifest，重启后依然读得回来。"""
+        (self.ws / "a.txt").write_text("A0", encoding="utf-8", newline="")
+        manager = self._manager()
+        self._run_edit(manager, "a.txt", "A0", "A1")
+        cp = manager.list_checkpoints()[0]
+        self.assertEqual(cp.user_seq, 0)
+        self.assertIn("userSeq", cp.to_api())
+
+        self.assertTrue(manager.annotate(cp.id, 7))
+        # 换一个 Manager 实例（等价于重启）：只从 manifest 读
+        self.assertEqual(self._manager().list_checkpoints()[0].user_seq, 7)
+        # 幂等；非法值（0 / 不存在的 id）不写也不报错
+        self.assertTrue(manager.annotate(cp.id, 7))
+        self.assertFalse(manager.annotate(cp.id, 0))
+        self.assertFalse(manager.annotate("cp-not-exist", 3))
+
     def test_restore_to_each_checkpoint(self) -> None:
         (self.ws / "a.txt").write_text("A0", encoding="utf-8", newline="")
         manager = self._manager()

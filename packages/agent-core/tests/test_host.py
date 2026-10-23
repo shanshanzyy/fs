@@ -675,6 +675,320 @@ class HttpTests(unittest.TestCase):
             body = response.read().decode("utf-8")
         self.assertIn("Vibe Coding Agent", body)
 
+    def test_pause_button_contract(self) -> None:
+        """交互增强一：暂停按钮常驻在发送旁，且与顶部中断共用同一个动作。
+
+        锁住三处：DOM 位置（.composer-box 段内）、状态机（syncPauseButton 依据
+        S.interrupting 置灰 + 文案「停止中…」）、绑定到同一个 interrupt()。
+        少任何一处，用户在执行中都会找不到可点的停止入口。
+        """
+        with self.get("/", token=self.token) as response:
+            body = response.read().decode("utf-8")
+        start = body.index('class="composer-box"')
+        send_at = body.index('id="btn-send"', start)
+        segment = body[send_at:send_at + 900]  # 从发送按钮往后一段，覆盖按钮组
+        self.assertIn('id="btn-pause"', segment)
+        self.assertIn('aria-label="暂停"', segment)
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function syncPauseButton(", js)
+        self.assertIn("S.interrupting = true;", js)
+        self.assertIn("btn.textContent = S.interrupting ? '停止中…' : '⏸';", js)
+        self.assertIn("$('btn-pause').addEventListener('click', interrupt);", js)
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".btn-pause {", css)
+
+    def test_terminal_resize_reflow_contract(self) -> None:
+        """终端实测二：放大再缩小后内容显示不全。
+
+        根因是缩小时每行多出来的格子被 `termRow(... c < t.cols)` 直接裁掉，
+        以及行数变少后光标所在的底部行落到可视区之外。锁住四处修复：
+        ① 列宽变化前先 `termReflow`（软折行，缓冲与历史一起重排）—— 多终端后
+           它带会话参数（`t`），不再读模块级单例；
+        ② 行数变少时把顶部溢出的行推进 history 并同步光标；
+        ③ 隐藏 / 折叠（尺寸为 0）时不做重排 —— 按 0 宽折出来的行不可还原
+           （多终端后这一条同时保护「非激活标签」：量不到尺寸就不动）。
+        ④ 尺寸监听挂在 `#term-stage` 上（所有终端共用一个可视区），不是单个终端。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function termReflow(t, newCols)", js)
+        self.assertIn("if (size.cols !== t.cols) termReflow(t, size.cols);", js)
+        self.assertIn("if (host.clientWidth < 40 || host.clientHeight < 20) return null;", js)
+        self.assertIn("while (t.buf.length > t.rows) {", js)
+        self.assertIn("t.curRow = Math.max(0, t.curRow - 1);", js)
+        self.assertIn("new ResizeObserver(() => termResizeActive()).observe(termStage);", js)
+
+    def test_terminal_multi_session_contract(self) -> None:
+        """多终端（不设上限）：锁四处，缺一就会退回「单终端」或「资源失控」。
+
+        ① 后端默认不限（0 = 不限，显式配 VIBE_TERM_MAX 才拦）；
+        ② 前端是会话注册表而不是单例，事件按 termId 分发 —— 否则第二个终端
+           收不到任何输出；
+        ③ 切标签只换显示不重建 DOM（缓冲/滚动位置都在）；
+        ④ 刷新后跟后端对账（恢复活着的、撤掉已不在的）—— 否则要么丢标签、
+           要么留下点进去没反应的死标签。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        with self.get("/index.html", token=self.token) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn('id="term-tabs"', html)          # 标签条
+        self.assertIn('id="term-stage"', html)          # 所有终端共用的可视区
+        self.assertNotIn("id=\"term\"", html)           # 旧的单终端宿主已移除
+        self.assertIn("const TERMS = new Map();", js)
+        self.assertIn("'term.data': (ev) => {", js)     # 事件入口按 termId 分发
+        self.assertIn("function termResizeActive()", js)
+        self.assertIn("async function loadTermSessions()", js)
+        self.assertIn("now - t.createdAt < 3000", js)   # 对账保护窗口（防误删新建的）
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".term-tab {", css)
+        self.assertIn(".term-interactive[hidden] { display: none; }", css)
+
+    def test_terminal_follows_remote_workspace_contract(self) -> None:
+        """远程工作区里终端跑在远端 —— 三条缺一条就会「文件在远端、终端却在本机」。
+
+        ① `/api/term/open` 的远程判定与文件路由**同源**（`remote_workspace`），
+           否则会出现最危险的错配：改的是远端、敲的命令却在本机执行；
+        ② ssh 必须带 `-tt` 强制分配远端 TTY，否则 `vim`/`top` 直接退化；
+        ③ 界面按 `kind="remote"` 说明这是远程终端，而不是把 `ssh` 当 shell 名显示。
+        """
+        source = (
+            Path(__file__).resolve().parents[1] / "agent_core" / "host" / "session.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("remote_terminal_argv(", source)
+        self.assertIn('extra_options=["-tt"]', source)
+        self.assertIn(
+            'cfg.remote_enabled and str(getattr(cfg, "remote_workspace", "") or "")', source
+        )
+        # 远程终端的自检宽限期必须比本地宽（ssh 握手 + 远端登录 > 2.5s）。
+        self.assertIn("probe_seconds=REMOTE_TERM_PROBE_SECONDS if kind == \"remote\"", source)
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("res.kind === 'remote'", js)
+
+    def test_terminal_follows_manifest_remote_workspace(self) -> None:
+        """清单驱动的远端项目工作区（M11 §7）里，终端也必须落在设备上。
+
+        这类工作区是「远端项目的门牌号」：目录里只有 `.vibe/remote.json`，
+        代码全在设备上。只按 `remote_workspace`（M13 命名空间）判定远程会漏掉
+        它 —— 用户会看到终端提示符停在 `C:\\Users\\...\\VibeWorkspaces\\<连接>`
+        这种本机空目录里（用户实测反馈），敲下的命令全跑在本机。
+        所以：① 有独立的清单解析入口；② 它接在 `remote_workspace` 分支之后
+        作为 `elif`（两者不会互相覆盖）；③ 仍然复用同一套 ssh 加固 argv。
+        """
+        source = (
+            Path(__file__).resolve().parents[1] / "agent_core" / "host" / "session.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def manifest_terminal_argv(", source)
+        self.assertIn("manifest = manifest_terminal_argv(cfg)", source)
+        self.assertIn("elif cfg.remote_enabled:", source)
+        self.assertIn('extra_options=["-tt"]', source)
+
+    def test_terminal_context_menu_and_clipboard_contract(self) -> None:
+        """终端右键菜单 + Ctrl+C/X/V 剪贴板 —— 锁住二义性与降级链。
+
+        ① 右键菜单复用 `openTreeMenu`（不另造一套浮层），条目带快捷键提示；
+        ② `Ctrl+C` 有选区才复制、无选区交回原来的 `\\x03` 中断（终端里 Ctrl+C
+           的第一语义永远是「中断」，不能因为加了剪贴板就把中断弄丢）；
+        ③ 粘贴走「桌面壳窄桥 → navigator.clipboard → 隐藏 textarea」三级降级，
+           否则浏览器里会时灵时不灵；
+        ④ 数据进入 PTY 必须走 `termInsertText`（管道模式沿用本地行编辑）。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function openTermMenu(t, ev) {", js)
+        self.assertIn("openTreeMenu(ev.clientX, ev.clientY, [", js)
+        self.assertIn("function termSelectionText(t) {", js)
+        self.assertIn("function termClipboardKey(t, event) {", js)
+        self.assertIn("if (!termSelectionText(t)) return false;", js)
+        self.assertIn("function termClipboardWrite(text) {", js)
+        self.assertIn("window.vibeShell", js)
+        self.assertIn("shell.clipboardWrite", js)
+        self.assertIn("shell.clipboardRead", js)
+        self.assertIn("navigator.clipboard.writeText", js)
+        self.assertIn("document.execCommand('copy')", js)
+        self.assertIn("function termInsertText(t, text) {", js)
+        # 快捷键拦截必须排在「通用 ctrl 字符转换」之前，否则 Ctrl+V 会发 \x16。
+        key_index = js.index("if (termClipboardKey(t, event)) return;")
+        self.assertLess(key_index, js.index("event.ctrlKey", key_index))
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".tree-menu-hint {", css)
+        self.assertIn(".tree-menu-item:disabled {", css)
+
+    def test_terminal_ime_contract(self) -> None:
+        """终端中文输入 —— 锁住输入法组合链路。
+
+        普通 div 收不到 composition 事件，所以每个终端宿主里必须有一个隐藏
+        textarea 持有焦点；组合期间的按键让给 IME，组合结束后整段送 PTY。
+        缺任一处，中文都只能「打不进去」。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("const ime = el('textarea', 'term-ime');", js)
+        self.assertIn("function termFocus(t) {", js)
+        self.assertIn("function termImeCommit(t, text) {", js)
+        self.assertIn("addEventListener('compositionstart'", js)
+        self.assertIn("addEventListener('compositionend'", js)
+        # 组合期间的按键必须原样交给 IME，且要在管道/PTY 分支之前返回
+        guard = js.index("event.isComposing || event.keyCode === 229")
+        self.assertLess(guard, js.index("termPipeKey(t, event)", guard))
+        self.assertLess(guard, js.index("termInput(t, '\\r')", guard))
+        # 焦点落在 textarea 上时宿主仍要高亮
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".term-ime {", css)
+        self.assertIn(".term-interactive:focus-within {", css)
+
+    def test_chat_markdown_contract(self) -> None:
+        """对话区必须渲染 Markdown，而不是把 ** 之类的记号原样吐出来。
+
+        ① 助手正文走 markdown.js 的 render()（与编辑器预览同一套零依赖渲染器）；
+        ② 流式输出也渲染（节流重排），不能只在收口时才排版；
+        ③ 围栏代码要过 highlight() 产出 tok-* span，样式里必须有对应颜色。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn(
+            "import { render, isMarkdown, highlight, langForPath } from './markdown.js';", js
+        )
+        self.assertIn("function renderAnswerBody(node, text) {", js)
+        self.assertIn("node.replaceChildren(render(text || ''));", js)
+        self.assertIn("renderAnswerBody(entry.body, entry.text);", js)
+        self.assertIn("S.streaming = { node, body, text: '', timer: 0 };", js)
+
+        with self.get("/markdown.js", token=self.token) as response:
+            md = response.read().decode("utf-8")
+        self.assertIn("function highlight(codeEl, source, lang) {", md)
+        self.assertIn("highlight(c, body.join('\\n'), lang);", md)
+        self.assertIn("token('tok-kw'", md)
+
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".tok-str {", css)
+        self.assertIn(".block-answer .msg-md .md-preview {", css)
+        self.assertIn(".block-answer .msg-md .md-preview pre code {", css)
+
+    def test_code_view_highlight_contract(self) -> None:
+        """文件代码视图也要着色（像 IDE 一样），而不是一整片同色文本。
+
+        只读代码视图按后缀选语言，用与对话区同一套 highlighter 着色后再按行
+        切开（保留行号 gutter 与 LSP 诊断装饰）；超大文件跳过着色防止卡顿。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn(
+            "import { render, isMarkdown, highlight, langForPath } from './markdown.js';", js
+        )
+        self.assertIn("function highlightedRows(text, lang) {", js)
+        self.assertIn("highlight(code, text, lang);", js)
+        # 一行被切成多个 token span 后，Ctrl+Click 的列号仍须按整行偏移算
+        self.assertIn("span.setStartAfter(gutter);", js)
+        self.assertIn(
+            "return { line: Number(gutter.dataset.line), char: span.toString().length };", js
+        )
+        self.assertIn(
+            "text.length <= MAX_HIGHLIGHT_CHARS ? langForPath(data.path) : ''", js
+        )
+
+        with self.get("/markdown.js", token=self.token) as response:
+            md = response.read().decode("utf-8")
+        self.assertIn("export function highlight(codeEl, source, lang) {", md)
+        self.assertIn("export function langForPath(path) {", md)
+        self.assertIn("py: 'python'", md)
+
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        # 着色类名不挂在 .md-preview 下，文件代码视图才能共用
+        self.assertIn(".tok-kw {", css)
+
+    def test_remote_workbench_tab_contract(self) -> None:
+        """交互增强三：远程设备是可开可关的真页签，连接管理收进按需抽屉。
+
+        锁四处缺一就会退回「只能打开」的旧形态：
+        ① 页签名与关闭入口（#remote-close / 抽屉 / 面包屑）；
+        ② app.js 有 openRemotePanel / closeRemotePanel，且 switchPanel 里的
+           「已打开则关闭」「切其他面板则关闭」两条分支都在；
+        ③ 页签只在 openRemotePanel 里创建一次（门控关闭时页签不存在）；
+        ④ 样式类存在，否则新结构会挤成一团。
+        """
+        with self.get("/", token=self.token) as response:
+            body = response.read().decode("utf-8")
+        for token in (
+            'class="remote-head"',
+            'id="remote-close"',
+            'id="remote-conn-drawer"',
+            'id="remote-drawer-backdrop"',
+            'id="remote-path-crumb"',
+            'id="remote-left"',
+            'id="remote-resizer"',
+            'id="remote-degraded-toggle"',
+        ):
+            self.assertIn(token, body)
+        # 静态视图默认不激活：门控关闭时页签根本不存在，也不该抢先占住编辑器区
+        self.assertIn('class="editor remote-wrap" id="remote-view"', body)
+
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function openRemotePanel(", js)
+        self.assertIn("function closeRemotePanel(", js)
+        self.assertIn("S.editors.has('remote') && S.activeEditor === 'remote'", js)
+        self.assertIn("$('remote-close').addEventListener('click', closeRemotePanel);", js)
+        self.assertIn("$('remote-drawer-backdrop').addEventListener('click', closeRemoteDrawer);", js)
+        self.assertIn("bindResizer('remote-resizer'", js)
+        self.assertIn("function renderRemoteCrumb(", js)
+        self.assertIn("openRemoteDrawer(", js)
+        self.assertIn("ui.close-remote-panel", js)
+        # 页签只在一个地方创建：重复创建会让关闭后重开出现两个「远程设备」页签
+        self.assertEqual(js.count("makeTab('remote'"), 1)
+        # 门控关闭（VIBE_REMOTE=0）：活动栏按钮隐藏，switchPanel 直接返回
+        self.assertIn("remoteAct.hidden = !remoteOn;", js)
+        self.assertIn("if (!S.remote.enabled) return;", js)
+
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        for rule in (".remote-head {", ".remote-path-crumb {", ".remote-drawer {", ".remote-left {", ".remote-resizer {"):
+            self.assertIn(rule, css)
+        # 旧的三栏常驻结构已废弃，留着只会误导后续改动
+        self.assertNotIn(".remote-conn-col {", css)
+        self.assertNotIn(".remote-path {", css)
+
+    def test_rollback_ui_contract(self) -> None:
+        """P3：每条用户提问下的「回退到这条之前」+ 确认框 + 重铺视图。
+
+        锁住四个缺一就会「点了没反应」的点：按钮在哪渲染（addUser 的 seq 参数）、
+        确认框 DOM、确认后重铺（messages 带 seq）、执行中置灰（syncRollbackButtons）。
+        """
+        with self.get("/", token=self.token) as response:
+            body = response.read().decode("utf-8")
+        for token in ('id="rb-modal"', 'id="rb-files"', 'id="btn-rb-confirm"'):
+            self.assertIn(token, body)
+
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        for token in (
+            "function addUser(text, seq = 0)",
+            "function syncRollbackButtons(",
+            "function openRollbackConfirm(",
+            "function confirmRollback(",
+            "api.post('/api/rollback', { userSeq: seq })",
+            "function addRemoteRollbackNote(",
+            "addRemoteRollbackNote(res.remote);",
+            "addUser(ev.prompt, ev.userSeq || 0)",
+            "addUser(m.content, m.seq || 0)",
+            "ui.close-rollback-confirm",
+            "$('btn-rb-confirm').addEventListener('click', confirmRollback);",
+        ):
+            self.assertIn(token, js)
+
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        for rule in (".btn-rollback-inline {", ".rb-files {", ".rb-notes {"):
+            self.assertIn(rule, css)
+
     def test_layout_mode_switch_contract(self) -> None:
         """IDE / SOLO 布局切换靠 body[data-mode] 驱动，这里锁住 app.js 依赖的 DOM 契约。
 
@@ -688,6 +1002,144 @@ class HttpTests(unittest.TestCase):
         self.assertIn('data-mode="solo"', body)
         for element_id in ("chatpane", "editor-stack", "sidebar", "sb-resizer", "chat-resizer"):
             self.assertIn(f'id="{element_id}"', body)
+
+    def test_tree_ref_menu_contract(self) -> None:
+        """工作区树右键「加入对话」：三处契约缺一就会静默失效。
+
+        1) 文件与目录节点都挂 contextmenu（旧逻辑只给带 index.html 的目录开菜单，
+           文件右键会被浏览器原生菜单接管）；
+        2) 目录映射成 `folder`、文件映射成 `file` —— 类型错了后端会按错误口径解析；
+        3) 复用既有 `addRef` 引用通道，不新开一条数据通路。
+
+        远端节点（M12/M13）走 `addRemoteRef`，值是 `@remote/<连接>/<路径>`：
+        用户当前工作区常常是远端工作区，只覆盖本地树等于「右键还是原生菜单」。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function addTreeRef(", js)
+        self.assertIn("label: '加入对话'", js)
+        self.assertIn("node.type === 'dir' ? 'folder' : 'file'", js)
+        self.assertIn("addRef(item);", js)
+        # 远端三处入口：工作区树的远端子节点、远端根、远程设备面板
+        self.assertIn("function addRemoteRef(", js)
+        self.assertIn("`@remote/${connection}", js)
+        self.assertEqual(js.count("addRemoteRef("), 4)  # 定义 1 + 调用点 3
+
+    def test_ws_modal_remote_tab_contract(self) -> None:
+        """切换工作区弹层的「远程目录」页签（M13 / ADR-042）锁住三层契约。
+
+        这三段任何一处改名都会让页签静默失效：DOM 里没有 id、前端误把文件当候选、
+        样式丢了弱化 —— 用户会以为文件也能切过去，切的时候才发现不行。
+        """
+        with self.get("/", token=self.token) as response:
+            body = response.read().decode("utf-8")
+        for element_id in (
+            "ws-tab-local",
+            "ws-tab-remote",
+            "ws-local-body",
+            "ws-remote-body",
+            "ws-conn",
+            "ws-remote-cwd",
+            "ws-remote-dirs",
+            "ws-remote-list",
+        ):
+            self.assertIn(f'id="{element_id}"', body)
+
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        # 目录做成按钮（可下钻）；文件只列出行（同一层里两类同屏，但只有目录是候选）
+        self.assertIn("/api/remote/tree", js)
+        self.assertIn("entry.type === 'dir'", js)
+        self.assertIn("function remoteDirRow(", js)
+        self.assertIn("el('button', 'ws-dir')", js)
+        self.assertIn("function remoteFileRow(", js)
+
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".ws-file {", css)
+
+    def test_remote_root_sub_normalized_contract(self) -> None:
+        """M12 收尾：连接根层的 `./名称` 必须压平后再比较与传参（回归锁）。
+
+        后端列目录在连接根层回的 `entry.path` 是 `./名称`（那一层的 rel 就是 `.`），
+        而落库的 sub 已被 `store.normalize_sub()` 压平成 `名称`。前端若拿原样值比较，
+        已加入的目录在「远程设备」右键菜单里仍显示「加入工作区」，点下去才报
+        「该目录已在工作区」—— 实机实测就是这么暴露的。这条锁住：判「在不在工作区」、
+        加入、移出三处都经过同一个压平函数，别再退回原样比较。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function normalizeRootSub(", js)
+        self.assertIn("const wanted = normalizeRootSub(sub);", js)
+        self.assertIn("sub: normalized", js)
+        self.assertIn("sub: normalizeRootSub(sub)", js)
+
+    def test_ws_remote_file_opens_in_editor_contract(self) -> None:
+        """点工作区树里的远端文件要开在中间编辑区，不能把人切到远程设备面板。
+
+        用户要的是「和本地文件一样」：同一套标签与代码视图，内容直接出现在中间。
+        编辑/保存走 `/api/remote/save`（乐观锁），本机 LSP / 补全 / 静态预览
+        这些只认本机路径的能力必须显式让位，否则会读到同名的本地文件。
+        """
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        # 工作区树远端文件节点 → 编辑器，而不是 openRemoteInPanel
+        self.assertIn("else openRemoteInEditor(connection, e.path, !!e.link, row);", js)
+        self.assertNotIn("openRemoteInPanel", js)
+        self.assertIn("async function openRemoteInEditor(connection, path, isLink, row) {", js)
+        # 标签路径用命名空间写法，与本地同名文件不冲突
+        self.assertIn("const ns = `@remote/${connection}/${path}`;", js)
+        self.assertIn("const id = `file:${ns}`;", js)
+        self.assertIn("const data = await api.get('/api/remote/file', { path });", js)
+        # 编辑/保存落远端，本机独占能力对远端文件让位
+        self.assertIn("const data = await api.post('/api/remote/save', {", js)
+        self.assertIn("if (entry.remote) return;", js)
+        self.assertIn("if (!entry || entry.remote || !lspSupported(entry.path))", js)
+        self.assertIn("previewBtn.hidden = !!entry.remote ||", js)
+
+    def test_middle_stage_tabs_contract(self) -> None:
+        """中间区三视图：浏览器 / 终端 / 编辑器都能在同一列里显示。
+
+        浏览器视图内嵌本机跑起来的界面，地址校验仍走服务端
+        `/api/preview/external`（门控 VIBE_PREVIEW_EXTERNAL）；终端视图复用
+        底部那块终端并展开到全高，不复制第二份终端 DOM。
+        """
+        with self.get("/", token=self.token) as response:
+            html = response.read().decode("utf-8")
+        for chunk in (
+            'id="stage-tabs"',
+            'data-stage="browser"',
+            'data-stage="terminal"',
+            'data-stage="editor"',
+            'id="browser-pane"',
+            'id="browser-url"',
+            'id="btn-browser-detected"',
+        ):
+            self.assertIn(chunk, html)
+
+        with self.get("/app.js", token=self.token) as response:
+            js = response.read().decode("utf-8")
+        self.assertIn("function switchStage(name) {", js)
+        self.assertIn("function browserOpen(raw) {", js)
+        self.assertIn("function maybeLocalUrl(text) {", js)
+        self.assertIn("api.get('/api/preview/external')", js)
+        self.assertIn("api.post('/api/preview/external', { url })", js)
+        # 终端视图 = 底部面板展开 + 页签切到终端，不新建第二份终端 DOM
+        self.assertIn("toggleBottom(true);", js)
+        self.assertIn("switchBottom('terminal');", js)
+        # 只认本机回环 + 显式端口，与服务端的校验口径一致
+        self.assertIn(r"/http:\/\/(?:localhost|127\.0\.0\.1):\d{1,5}", js)
+        # 桌面壳里改用 webview 承载本机应用：X-Frame-Options / frame-ancestors 只
+        # 约束 iframe，webview 是独立 WebContents 的顶层导航，能正常显示被拒嵌入的页面
+        self.assertIn("customElements.get('webview')", js)
+        self.assertIn("document.createElement('webview')", js)
+        self.assertIn("did-fail-load", js)
+
+        with self.get("/styles.css", token=self.token) as response:
+            css = response.read().decode("utf-8")
+        self.assertIn(".stage-tabs {", css)
+        self.assertIn('.editor-stack[data-stage="terminal"] .bottom-panel {', css)
+        self.assertIn("webview.browser-frame {", css)
 
     def test_solo_layout_rules_served(self) -> None:
         with self.get("/styles.css", token=self.token) as response:
@@ -1249,6 +1701,132 @@ class WorkspaceSwitchTests(unittest.TestCase):
         sub.close()
         self.assertIsNotNone(ready, "切换后没有推 session.ready")
         self.assertEqual(ready["workspace"], str(self.ws2))
+
+
+class RollbackTests(unittest.TestCase):
+    """P3 逐条回退：文件 + 对话一起回到某条用户提问之前。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.ws = self.root / "proj"
+        self.ws.mkdir()
+        (self.ws / "a.txt").write_text("one\n", encoding="utf-8", newline="")
+        self.store = SessionStore(self.root / "sessions.db")
+        self.host = HostServer(
+            Config.load(self.ws),
+            port=0,
+            store=self.store,
+            client=FakeClient(
+                [
+                    [("edit_file", {"path": "a.txt", "search": "one", "replace": "ONE"})],
+                    "改好了。",
+                    [("edit_file", {"path": "a.txt", "search": "ONE", "replace": "two"})],
+                    "又改好了。",
+                ]
+            ),
+        )
+        self.host.start_background()
+        # REVIEW 级编辑需要审批：夹具替人按下「批准」，聚焦回退链路本身
+        self.host.session.agent.approver = lambda request: "approve"
+        self.base = f"http://127.0.0.1:{self.host.port}"
+        self.token = self.host.guard.token
+        self.sid = self.host.session.config.session_id
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def tearDown(self) -> None:
+        self.host.shutdown()
+        self.store.close()
+        self._tmp.cleanup()
+
+    # ---- helpers -------------------------------------------------------
+    def _post(self, path: str, body: dict) -> dict:
+        request = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Vibe-Token": self.token},
+            method="POST",
+        )
+        with self._opener.open(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _get(self, path: str) -> dict:
+        request = urllib.request.Request(self.base + path)
+        request.add_header("X-Vibe-Token", self.token)
+        with self._opener.open(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _run(self, text: str) -> None:
+        self._post("/api/run", {"text": text})
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if self.host.session.state == "idle":
+                return
+            time.sleep(0.02)
+        raise AssertionError("会话没有回到空闲状态")
+
+    def _ui_messages(self) -> list[dict]:
+        return self._get(f"/api/sessions/{self.sid}/messages")["messages"]
+
+    # ---- tests ---------------------------------------------------------
+    def test_rollback_restores_files_and_messages(self) -> None:
+        self._run("把 one 改成 ONE")
+        self._run("再改成 two")
+        self.assertEqual((self.ws / "a.txt").read_text(encoding="utf-8"), "two\n")
+
+        users = [m for m in self._ui_messages() if m["role"] == "user"]
+        self.assertEqual([m["content"] for m in users], ["把 one 改成 ONE", "再改成 two"])
+        # UI 通路必须带 seq（锚点）；默认形态不带
+        self.assertEqual([m["seq"] for m in users], [1, 5])
+        self.assertTrue(all("seq" not in m for m in self.store.get_messages(self.sid)))
+
+        res = self._post("/api/rollback", {"userSeq": users[1]["seq"]})
+        self.assertTrue(res["ok"])
+        # 第二轮改动撤回，第一轮成果保留
+        self.assertEqual((self.ws / "a.txt").read_text(encoding="utf-8"), "ONE\n")
+        self.assertEqual(res["truncated"], 4)  # 第二条提问 + 工具往返 + 回答
+        self.assertEqual(
+            [m["content"] for m in res["messages"] if m["role"] == "user"],
+            ["把 one 改成 ONE"],
+        )
+        # 重建后的 Agent 不带 seq（界面字段不能跟着消息发给模型）
+        self.assertTrue(all("seq" not in m for m in self.host.session.agent.messages))
+        self.assertEqual(self.host.session.config.session_id, self.sid)
+
+        # 再回退到第一条：第一轮的改动也撤掉，对话清空
+        res2 = self._post("/api/rollback", {"userSeq": 1})
+        self.assertEqual((self.ws / "a.txt").read_text(encoding="utf-8"), "one\n")
+        self.assertEqual([m for m in res2["messages"] if m["role"] == "user"], [])
+
+    def test_rollback_conflicts_while_running(self) -> None:
+        self._run("把 one 改成 ONE")
+        self.host.session._state = "running"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post("/api/rollback", {"userSeq": 1})
+            self.assertEqual(ctx.exception.code, 409)
+        finally:
+            self.host.session._state = "idle"
+        # 409 = 什么都没动
+        self.assertEqual((self.ws / "a.txt").read_text(encoding="utf-8"), "ONE\n")
+        self.assertEqual(len(self.store.get_messages(self.sid)), 4)
+
+    def test_rollback_rejects_bad_anchor(self) -> None:
+        self._run("把 one 改成 ONE")
+        for seq in (0, 999):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._post("/api/rollback", {"userSeq": seq})
+            self.assertEqual(ctx.exception.code, 400)
+        # 非用户消息（assistant / tool）不能当锚点
+        assistant_seq = next(
+            m["seq"] for m in self._ui_messages() if m["role"] == "assistant"
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/api/rollback", {"userSeq": assistant_seq})
+        self.assertEqual(ctx.exception.code, 400)
+        # 三次拒绝之后文件与消息都原样
+        self.assertEqual((self.ws / "a.txt").read_text(encoding="utf-8"), "ONE\n")
+        self.assertEqual(len(self.store.get_messages(self.sid)), 4)
 
 
 if __name__ == "__main__":

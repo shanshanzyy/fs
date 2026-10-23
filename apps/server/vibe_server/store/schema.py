@@ -247,6 +247,35 @@ CREATE TABLE IF NOT EXISTS secret_meta (
     created_at  INTEGER NOT NULL,
     note        TEXT NOT NULL DEFAULT ''
 );
+
+-- ------------------------------------------------------------------ 客户端发布（M9）
+-- 只存「版本元数据 + 发布签名」，**不存任何用户代码 / 提示词 / 模型输出**（ADR-006）。
+-- 安装器二进制本身（可选托管）落 <DATA_DIR>/packages/，不在本表内。
+-- 刻意**不加** (channel,platform,arch,version) 唯一约束：发布台账是**追加式**的，
+-- 「回退到旧版本」正是重新发布一个旧 version 并赋更高的 seq（见 M9-PLAN §4⑦）。
+CREATE TABLE IF NOT EXISTS client_releases (
+    id              TEXT PRIMARY KEY,
+    channel         TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    platform        TEXT NOT NULL,
+    arch            TEXT NOT NULL,
+    url             TEXT NOT NULL DEFAULT '',
+    sha256          TEXT NOT NULL,
+    size            INTEGER NOT NULL DEFAULT 0,
+    notes           TEXT NOT NULL DEFAULT '',
+    mandatory       INTEGER NOT NULL DEFAULT 0,
+    min_version     TEXT NOT NULL DEFAULT '',
+    rollout_percent INTEGER NOT NULL DEFAULT 100,
+    seq             INTEGER NOT NULL,
+    signature       TEXT NOT NULL DEFAULT '',
+    signature_alg   TEXT NOT NULL DEFAULT 'RS256',
+    pubkey_kid      TEXT NOT NULL DEFAULT '',
+    published_at    INTEGER NOT NULL,
+    revoked_at      INTEGER,
+    created_by      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_client_releases_lookup
+    ON client_releases(channel, platform, arch, seq DESC);
 """
 
 
@@ -387,6 +416,20 @@ CREATE TABLE IF NOT EXISTS secret_meta (
     fingerprint TEXT NOT NULL, rotated_at BIGINT NOT NULL, created_at BIGINT NOT NULL,
     note TEXT NOT NULL DEFAULT ''
 );
+
+-- 与 SQLITE 版本语义一致（M9 客户端发布台账，追加式，不存代码/提示词/模型输出）。
+CREATE TABLE IF NOT EXISTS client_releases (
+    id TEXT PRIMARY KEY, channel TEXT NOT NULL, version TEXT NOT NULL,
+    platform TEXT NOT NULL, arch TEXT NOT NULL, url TEXT NOT NULL DEFAULT '',
+    sha256 TEXT NOT NULL, size BIGINT NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '',
+    mandatory BOOLEAN NOT NULL DEFAULT FALSE, min_version TEXT NOT NULL DEFAULT '',
+    rollout_percent INTEGER NOT NULL DEFAULT 100, seq BIGINT NOT NULL,
+    signature TEXT NOT NULL DEFAULT '', signature_alg TEXT NOT NULL DEFAULT 'RS256',
+    pubkey_kid TEXT NOT NULL DEFAULT '', published_at BIGINT NOT NULL,
+    revoked_at BIGINT, created_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_client_releases_lookup
+    ON client_releases(channel, platform, arch, seq DESC);
 """
 
 __all__ = ["POSTGRES", "SQLITE"]

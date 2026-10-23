@@ -11,6 +11,7 @@ from ..audit import AuditLog
 from ..checkpoint import CheckpointManager
 from ..config import Config
 from ..errors import AgentError, SandboxViolation, ToolError
+from ..preview_media import is_draftable
 from ..sandbox import CommandGuard, PathGuard, Risk
 
 # ---- 不可信内容包裹 -------------------------------------------------------
@@ -71,6 +72,25 @@ class ToolPreview:
 
 
 # ---- 结果与上下文 ---------------------------------------------------------
+@dataclass(frozen=True)
+class DraftFile:
+    """一份「落盘后」的文件内容 —— 只活在内存里，**绝不写盘**。
+
+    与 `ToolPreview` 的分工是刻意的：
+      · `ToolPreview` 回答「改了什么」—— unified diff，对任何文件类型都成立；
+      · `DraftFile` 回答「改完渲染成什么样」—— 完整正文，只对浏览器能渲染的
+        文本资源（html/css/js/svg…）生成，diff 再精确也看不出页面效果。
+
+    生命周期由会话层掌握（绑定一次审批、审批解决即丢弃），工具层只负责**计算**。
+    因此这里没有任何落盘入口，也不该有 —— 草稿一旦能写盘，「审批前不产生副作用」
+    这条就没了。
+    """
+
+    path: str  # 工作区相对路径（POSIX 分隔符）
+    text: str
+    created: bool = False
+
+
 @dataclass
 class ToolResult:
     """工具执行结果。content 会原样进入模型上下文。"""
@@ -151,6 +171,21 @@ class ToolContext:
     # 参数为 (stream: "stdout"|"stderr", chunk: str)。**它只影响界面呈现，不改变
     # 工具返回给模型的 ToolResult** —— 为 None 时走纯累积路径，结果与改造前逐字节一致。
     stream_sink: Callable[[str, str], None] | None = None
+    # Skill / 斜杠命令（M9-A）：`run_skill` 按名展开工作流正文的落点。
+    # 与 `memory_store` 同范式 —— 工具不认识加载器，只读一个列表。
+    # None / 空 = Skill 未启用（VIBE_SKILLS=0 或直接调 registry 的场景）。
+    skills: Any | None = None
+    # 测试闭环（M9-C）：`test_loop` 驱动「跑测试→喂回失败摘要→修复→重跑」的落点。
+    # 与 `subagent_sink` 同范式 —— 工具不认识 `Agent` 类型，只调一个回调，
+    # 由 `Agent._execute_call` 在真正执行前绑到当前 `ToolCall` 上。回调签名
+    # (command: str, max_rounds: int) -> ToolResult，返回整个循环的最终结论。
+    # None = 测试闭环未启用（VIBE_TEST_LOOP=0 或直接调 registry 的场景）。
+    test_loop_sink: Callable[[str, int], ToolResult] | None = None
+    # 远端透明路由（M12）：`@remote/<连接>/<路径>` 形式的文件工具调用按前缀分流到
+    # 远端链路的落点。与 `memory_store` 同范式 —— 工具不认识 `RemoteRouter` 类型，
+    # 只调 `match()`。None = 远端未启用（VIBE_REMOTE 未开或直接调 registry 的场景）：
+    # 此时路由壳对普通本地路径照旧走本地臂，只有真的写了 `@remote/` 前缀才报错。
+    remote_router: Any | None = None
 
     def mark_read(self, rel: str) -> None:
         self.read_files.add(rel)
@@ -304,6 +339,9 @@ class ToolSpec:
     risk: Risk = Risk.SAFE
     assessor: Callable[[ToolContext, dict], tuple[Risk, str]] | None = None
     previewer: Callable[[ToolContext, dict], ToolPreview] | None = None
+    # 审批期的「落盘后正文」预演（P1-2 草稿预览）。与 previewer 同一纪律：
+    # 只计算、不落盘、失败不外抛。可选 —— 不提供时草稿预览对模型不可见。
+    drafter: Callable[[ToolContext, dict], list[DraftFile]] | None = None
 
     def assess(self, ctx: ToolContext, args: dict) -> tuple[Risk, str]:
         """返回 (风险等级, 理由)。工具可提供动态评估。"""
@@ -330,6 +368,27 @@ class ToolSpec:
                 error=f"预演失败: {type(exc).__name__}: {exc}",
                 blocking=False,
             )
+
+    def draft(self, ctx: ToolContext, args: dict) -> tuple[DraftFile, ...]:
+        """无副作用地算出「这条改动落盘后各文件的正文」，供审批期草稿预览。
+
+        只保留浏览器渲染得了的文本资源（见 `preview_media.DRAFT_SUFFIXES`）：
+        对 `.py` / `.png` 来说「草稿正文」既没有渲染意义，又会让
+        「模型产出的内容在审批期被额外传递」的范围无谓扩大。
+
+        失败一律返回空元组 —— 草稿是**附加**能力，它出问题时审批必须照常进行。
+        这与 `preview()` 吞掉预演异常是同一条理由，只是这里更严格：
+        预演失败尚且要给人看一条错误，草稿失败则连提示都不必给（按钮不出现即可）。
+        """
+        if self.drafter is None:
+            return ()
+        try:
+            files = self.drafter(ctx, args)
+        except Exception:  # noqa: BLE001 — 草稿有 bug 不该阻断审批主流程
+            return ()
+        return tuple(
+            f for f in files if isinstance(f, DraftFile) and is_draftable(f.path)
+        )
 
     def openai_schema(self) -> dict:
         return {

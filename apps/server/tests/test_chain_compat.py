@@ -164,6 +164,7 @@ class VocabularyContractTests(unittest.TestCase):
             "gateway.request", "gateway.response", "gateway.denied",
             "policy.fetch", "policy.rejected",
             "web.search_relay",   # 搜索中转（M7）：服务端自己产生，无客户端调用点
+            "release.publish", "release.revoke",   # 客户端发布（M9）：控制台/CLI 自产
         }
         # 目前没有「客户端已实现但尚未接线」的事件，故集合留空；
         # 若将来有，在此登记，避免上面那条反向检查把未接线误报为漂移。
@@ -852,6 +853,23 @@ def _sample_locals() -> dict[str, dict]:
             "paths_digest": "c3d4e5f607182930",
             "checkpoint_id": "cp-20261013-abcdef",
         },
+        "rollback.truncate": {
+            "event": "rollback.truncate",
+            "count": 17,
+            "first_seq": 42,
+            "last_seq": 58,
+            "checkpoint_id": "cp-20261013-abcdef",
+            "restored": 2,
+            "deleted": 1,
+        },
+        "remote.rollback": {
+            "event": "remote.rollback",
+            "connection": "dev",
+            "path": "src/app.py",
+            "action": "restore",
+            "bytes": 2048,
+            "backed_up": True,
+        },
         "git.commit": {
             "event": "git.commit",
             "message": "fix: 修复登录跳转",
@@ -1062,6 +1080,7 @@ def _sample_locals() -> dict[str, dict]:
             "cols": 80,
             "rows": 24,
             "mode": "pty",
+            "remote": "devbox",
             "ms": 8,
         },
         "term.close": {
@@ -1128,6 +1147,30 @@ def _sample_locals() -> dict[str, dict]:
             "tool": "write_file",
             "timeout_s": 120,
         },
+        "preview.draft": {
+            "event": "preview.draft",
+            "path": "site/index.html",
+            "token": "a1b2c3d4e5f60718",
+            "files": 2,
+            "chars": 4096,
+        },
+        "preview.external": {
+            "event": "preview.external",
+            "port": 5173,
+            "host": "127.0.0.1",
+        },
+        "preview.tunnel": {
+            "event": "preview.tunnel",
+            "action": "open",
+            "connection": "dev-box",
+            "remote_port": 3000,
+            "local_port": 51820,
+            "ok": True,
+            "ms": 420,
+            "reason": "transport",
+            "closed": False,
+            "refs": 1,
+        },
         "agent.run.finish": {
             "event": "agent.run.finish",
             "iterations": 5,
@@ -1168,6 +1211,49 @@ def _sample_locals() -> dict[str, dict]:
             "executable": "pytest",
             "exit_code": 0,
             "output_chars": 812,
+        },
+        "test_loop.run": {
+            "event": "test_loop.run",
+            "command": "pytest -q tests/",
+            "rounds": 2,
+            "passed": 1,
+            "failed": 1,
+            "ms": 3200,
+        },
+        "task.spawn": {
+            "event": "task.spawn",
+            "task_id": "ab12cd34ef56",
+            "state": "succeeded",
+            "chars": 512,
+            "ms": 8400,
+        },
+        "schedule.job": {
+            "event": "schedule.job",
+            "job_id": "9f8e7d6c5b4a",
+            "action": "triggered",
+            "state": "enabled",
+            "chars": 240,
+            "ms": 12,
+        },
+        "remote.connection": {
+            "event": "remote.connection",
+            "connection": "devbox",
+            "action": "test",
+            "allow_write": False,
+            "allow_shell": False,
+            "ok": True,
+            "ms": 1180,
+        },
+        "remote.file": {
+            "event": "remote.file",
+            "connection": "devbox",
+            "path": "src/app.py",
+            "action": "save",
+            "bytes": 8123,
+            "sha256": "c" * 16,
+            "added": 12,
+            "removed": 4,
+            "backed_up": True,
         },
         "context.compact": {
             "event": "context.compact",
@@ -1211,6 +1297,30 @@ def _sample_locals() -> dict[str, dict]:
             "count": 3,
             "chars": 280,
         },
+        # Skill / 斜杠命令（M9-A）：形状与 tools/skill.py 的 audit.record 调用点一致。
+        "skill.run": {
+            "event": "skill.run",
+            "name": "commit",
+            "chars": 512,
+            "source": ".vibe/skills/commit/SKILL.md",
+        },
+        # 代码审阅（M9-H）：形状与 tools/review.py 的 audit.record 调用点一致。
+        # 只记计数与耗时，意见正文不出机（ADR-006）。
+        "review.run": {
+            "event": "review.run",
+            "files": 12,
+            "issues": 3,
+            "severity_high": 1,
+            "ms": 240,
+        },
+        # 客户端模型选择器（M9-I）：形状与 llm/openai_compat.py 的 audit.record 调用点一致。
+        # 只记意图、模型名与原因枚举，任务正文不出机（ADR-006）。
+        "model.route": {
+            "event": "model.route",
+            "intent": "complex",
+            "model": "qwen2.5-coder:32b",
+            "reason": "static",
+        },
         # 治理面登录（M3+）：形状与 host/session.py 的 governance_login /
         # governance_register / governance_logout 调用点一致。
         # 只记结果、装配状态与不透明标识；邮箱/口令/地址不上传。
@@ -1232,6 +1342,40 @@ def _sample_locals() -> dict[str, dict]:
             "event": "governance.logout",
             "ok": True,
             "user_id": "u-1",
+        },
+        # 客户端自动更新（M9）：形状与 update/service.py 的 audit.record 调用点一致。
+        # 本机字段叫 source，上传前被词汇表改名 origin（`source` 在 DENIED_KEYS 里）；
+        # 完整 sha256 与来源地址只留本机，上传的是短摘要与来源名。
+        "update.check": {
+            "event": "update.check",
+            "result": "available",
+            "version": "1.4.2",
+            "source": "governance",
+            "seq": 7,
+        },
+        "update.download": {
+            "event": "update.download",
+            "version": "1.4.2",
+            "source": "governance",
+            "size": 41_000_000,
+            "result": "started",
+        },
+        "update.staged": {
+            "event": "update.staged",
+            "version": "1.4.2",
+            "source": "governance",
+            "size": 41_000_000,
+            "sha256Digest": "a1b2c3d4e5f60718",
+        },
+        "update.verify_failed": {
+            "event": "update.verify_failed",
+            "source": "local",
+            "kind": "sha256",
+        },
+        "update.applied": {"event": "update.applied", "version": "1.4.2"},
+        "update.apply_rejected": {
+            "event": "update.apply_rejected",
+            "reason": "staging 路径不在 updates 目录内",
         },
     }
 

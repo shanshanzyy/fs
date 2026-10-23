@@ -14,9 +14,11 @@ from pathlib import Path
 from ..audit import digest
 from ..edit import commit_plan, plan_overwrite
 from ..errors import SandboxViolation, ToolError
+from ..preview_media import is_draftable
 from ..sandbox import PathGuard, Risk
 from .base import (
     DEFAULT_IGNORED_DIRS,
+    DraftFile,
     ToolContext,
     ToolPreview,
     ToolResult,
@@ -225,6 +227,29 @@ def _write_file(ctx: ToolContext, args: dict) -> ToolResult:
     )
 
 
+def _draft_write(ctx: ToolContext, args: dict) -> list[DraftFile]:
+    """草稿：整文件写入后的正文（只算不写）。
+
+    覆盖已有文件时走 `plan_overwrite` 而不是直接回传 `content`：落盘要经过
+    TextDoc 处理（编码 / BOM / 换行风格），草稿必须展示**同一份**结果 ——
+    否则「预览里的样子」和「写下去的样子」会在换行符这种细节上分叉。
+    """
+    raw = str(args.get("path") or "")
+    if not is_draftable(raw):
+        return []
+
+    path = ctx.paths.check_read(raw)
+    rel = ctx.paths.relative(path)
+    if not is_draftable(rel) or path.is_dir():
+        return []
+
+    content = args.get("content") or ""
+    if path.is_file():
+        plan = plan_overwrite(path, content, rel_path=rel)
+        return [DraftFile(path=rel, text=plan.new_text, created=False)]
+    return [DraftFile(path=rel, text=content, created=True)]
+
+
 def _preview_write(ctx: ToolContext, args: dict) -> ToolPreview:
     """审批预演：展示整文件写入会产生什么。
 
@@ -325,4 +350,5 @@ WRITE_FILE_SPEC = ToolSpec(
     handler=_write_file,
     risk=Risk.REVIEW,
     previewer=_preview_write,
+    drafter=_draft_write,
 )

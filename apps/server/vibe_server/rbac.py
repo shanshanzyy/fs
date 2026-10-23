@@ -50,6 +50,10 @@ PERM_DEVICE_REVOKE = "device:revoke"
 PERM_SECRET_READ = "secret:read"
 PERM_SECRET_WRITE = "secret:write"
 PERM_GATEWAY_USE = "gateway:use"
+# M9 客户端发布。`release` 是**全局资源**（一份清单下发到所有客户端），
+# 因此不做团队隔离：读全角色都能看，写只有组织所有者能发。
+PERM_RELEASE_READ = "release:read"
+PERM_RELEASE_WRITE = "release:write"
 
 # 每个角色拿到的最小集合。**从最小权限写起**，需要时再加，
 # 而不是「先给全了，出问题再收」——后者收不回来，因为收权限会被当成故障。
@@ -74,6 +78,8 @@ _ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             PERM_SECRET_READ,
             PERM_SECRET_WRITE,
             PERM_GATEWAY_USE,
+            PERM_RELEASE_READ,
+            PERM_RELEASE_WRITE,
         }
     ),
     ROLE_TEAM_ADMIN: frozenset(
@@ -92,6 +98,7 @@ _ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             PERM_DEVICE_READ,
             PERM_DEVICE_REVOKE,
             PERM_GATEWAY_USE,
+            PERM_RELEASE_READ,
         }
     ),
     ROLE_DEVELOPER: frozenset(
@@ -103,6 +110,7 @@ _ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             PERM_TEAM_READ,
             PERM_DEVICE_READ,
             PERM_GATEWAY_USE,
+            PERM_RELEASE_READ,
         }
     ),
     # 审计员跨团队只读：能看全部审计，但改不了任何东西。
@@ -118,6 +126,7 @@ _ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             PERM_USER_READ,
             PERM_TEAM_READ,
             PERM_DEVICE_READ,
+            PERM_RELEASE_READ,
         }
     ),
     ROLE_VIEWER: frozenset(
@@ -125,6 +134,7 @@ _ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             PERM_USAGE_READ,
             PERM_QUOTA_READ,
             PERM_POLICY_READ,
+            PERM_RELEASE_READ,
         }
     ),
 }
@@ -346,6 +356,8 @@ __all__ = [
     "PERM_POLICY_WRITE",
     "PERM_QUOTA_READ",
     "PERM_QUOTA_WRITE",
+    "PERM_RELEASE_READ",
+    "PERM_RELEASE_WRITE",
     "PERM_SECRET_READ",
     "PERM_SECRET_WRITE",
     "PERM_TEAM_READ",

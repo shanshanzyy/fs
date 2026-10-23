@@ -13,7 +13,8 @@ class SandboxViolation(AgentError):
     `kind` / `path` 是给**审计**用的结构化信息。为什么不从异常消息里解析：
     消息是给人看的，措辞会改；审计字段不能跟着文案一起漂。
     `kind` 取值：escape / sensitive / policy_deny / audit_dir / root_write /
-    malformed / workspace。
+    malformed / workspace / reserved_ns（路径落在保留命名空间，由未路由的
+    本地工具报出，见 M12 的远端透明路由）。
     """
 
     def __init__(self, message: str, *, kind: str = "", path: str = "") -> None:
@@ -50,3 +51,17 @@ class LLMError(AgentError):
 
 class ConfigError(AgentError):
     """配置缺失或非法。"""
+
+
+class UpdateError(AgentError):
+    """客户端自动更新链路失败（M9）。
+
+    `kind` 是给**审计**用的结构化分类（消息措辞会改，审计字段不能跟着漂）：
+    shape / signature / sha256 / size / network / state / staging / no_release。
+    更新是「下载一个可执行文件并运行它」的动作，因此这里的失败必须能分类 ——
+    「验签不过」和「网断了」在排查时是完全不同的两件事。
+    """
+
+    def __init__(self, message: str, *, kind: str = "unknown") -> None:
+        super().__init__(message)
+        self.kind = kind

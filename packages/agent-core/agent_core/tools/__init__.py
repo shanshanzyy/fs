@@ -3,6 +3,7 @@
 from .base import (
     DEFAULT_IGNORED_DIRS,
     ChangeRecord,
+    DraftFile,
     ToolContext,
     ToolPreview,
     ToolRegistry,
@@ -22,10 +23,13 @@ from .multi_edit import EDIT_FILES_SPEC
 from .plan import UPDATE_PLAN_SPEC
 from .repo_map import REPO_MAP_SPEC
 from .repo_wiki import REPO_WIKI_SPEC
+from .review import REVIEW_CHANGES_SPEC
 from .search import FIND_FILES_SPEC, GREP_SPEC
 from .semantic import SEMANTIC_SEARCH_SPEC
 from .shell import RUN_COMMAND_SPEC
+from .skill import RUN_SKILL_SPEC
 from .task import TASK_SPEC
+from .test_loop import TEST_LOOP_SPEC
 from .web import WEB_FETCH_SPEC, WEB_SEARCH_SPEC
 
 __all__ = [
@@ -41,13 +45,17 @@ __all__ = [
     "REMEMBER_SPEC",
     "REPO_MAP_SPEC",
     "REPO_WIKI_SPEC",
+    "REVIEW_CHANGES_SPEC",
     "RUN_COMMAND_SPEC",
+    "RUN_SKILL_SPEC",
     "SEMANTIC_SEARCH_SPEC",
     "TASK_SPEC",
+    "TEST_LOOP_SPEC",
     "UPDATE_PLAN_SPEC",
     "WEB_FETCH_SPEC",
     "WEB_SEARCH_SPEC",
     "ChangeRecord",
+    "DraftFile",
     "ToolContext",
     "ToolPreview",
     "ToolRegistry",
@@ -71,6 +79,10 @@ def build_default_registry(
     subagent: bool = False,
     wiki: bool = False,
     web: bool = False,
+    skills: bool = False,
+    test_loop: bool = False,
+    review: bool = False,
+    remote: bool = False,
     audit: object | None = None,
 ) -> ToolRegistry:
     """注册全部工具。
@@ -104,6 +116,31 @@ def build_default_registry(
     启用时才注册 —— 关掉（`VIBE_WEB=0`，默认）时工具列表与行为与未实现前
     逐字节一致。两个工具**恒 REVIEW**（查询词/URL 是外发内容，ADR-008/015），
     且**不进 build_readonly_registry** —— 子 Agent 恒不联网。
+
+    `skills`（M9-A）同样是**条件注册**：`run_skill` 只在 Skill 启用时才注册 ——
+    关掉（`VIBE_SKILLS=0`，默认）时工具列表与行为与未实现前逐字节一致。
+    `run_skill` 恒 **SAFE**（只展开指令、不写盘、不执行），且**不进
+    build_readonly_registry** —— 子 Agent 不加载 Skill 工作流，保持只读。
+
+    `test_loop`（M9-C）同样是**条件注册**：只在测试闭环启用时才注册 —— 关掉
+    （`VIBE_TEST_LOOP=0`，默认）时工具列表与行为与未实现前逐字节一致。
+    `test_loop` 恒 **SAFE**（只调度既有工具，不直接写盘/执行），且**不进
+    build_readonly_registry** —— 子 Agent 不承担「自动修复」这一父级职责。
+
+    `review`（M9-H）同样是**条件注册**：只在代码审阅启用时才注册 —— 关掉
+    （`VIBE_REVIEW=0`，默认）时工具列表与行为与未实现前逐字节一致。
+    `review_changes` 恒 **SAFE**（只读：不改盘、不执行、不派子 Agent），且**不进
+    build_readonly_registry** —— 子 Agent 不承担「提交前自审」这一父级职责。
+
+    `remote`（M10）同样是**条件注册**：只在远程设备能力启用时才注册 —— 关掉
+    （`VIBE_REMOTE=0`，默认）时工具列表与行为与未实现前逐字节一致。
+    这组工具把本机 Agent 接到**用户自己的远端设备**上（详见
+    agent_core/remote/__init__.py 对红线口径的说明）。三个要点：
+      - 只读类（connections/probe/read/list/grep）恒 SAFE，`remote_grep` 例外
+        —— 检索模式串会发到远端，恒 REVIEW；
+      - 写类（edit/write）与执行类（run_command）恒 REVIEW，走与本地工具
+        完全相同的审批漏斗；目标连接另有 allow_write / allow_shell 能力位；
+      - **不进** build_readonly_registry() —— 子 Agent 不得触达其他机器。
     """
     registry = ToolRegistry()
     specs = [
@@ -142,6 +179,32 @@ def build_default_registry(
         # 未启用时列表逐字节不变。同样**不进** build_readonly_registry()。
         specs.append(WEB_SEARCH_SPEC)
         specs.append(WEB_FETCH_SPEC)
+    if skills:
+        # Skill / 斜杠命令（M9-A）：恒 SAFE（只展开指令，不写盘、不执行）；
+        # 未启用时列表逐字节不变。**不进** build_readonly_registry() ——
+        # 子 Agent 不加载 Skill 工作流，保持只读。
+        specs.append(RUN_SKILL_SPEC)
+    if test_loop:
+        # 测试闭环（M9-C）：恒 SAFE（只调度既有工具，不直接写盘/执行）；
+        # 未启用时列表逐字节不变。**不进** build_readonly_registry() ——
+        # 子 Agent 不承担「自动修复」这一父级职责。
+        specs.append(TEST_LOOP_SPEC)
+    if review:
+        # 代码审阅（M9-H）：恒 SAFE（只读：不改盘、不执行、不派子 Agent）；
+        # 未启用时列表逐字节不变。**不进** build_readonly_registry() ——
+        # 子 Agent 不承担「提交前自审」这一父级职责。
+        specs.append(REVIEW_CHANGES_SPEC)
+    if remote:
+        # 远程设备（M10）：注册顺序即使用顺序 —— 先看有哪些机器、再读、
+        # 最后才是改与跑。写/执行类恒 REVIEW，只读类恒 SAFE（grep 除外）。
+        # 未启用时列表逐字节不变；**不进** build_readonly_registry()。
+        #
+        # 延迟导入：tools 与 remote 互相引用（remote.workspace 要用
+        # tools.base 的扫描上限，tools.remote 要用 remote.workspace），
+        # 模块级 import 会成环 —— 与 mcp / lsp 同一处理方式。
+        from .remote import REMOTE_TOOL_SPECS
+
+        specs.extend(REMOTE_TOOL_SPECS)
     if lsp is None:
         # 延迟导入：tools 与 lsp 互相引用，模块级 import 会成环（见 diagnostics.py）
         from ..lsp import servers
@@ -149,6 +212,16 @@ def build_default_registry(
         lsp = servers.any_available()
     if lsp:
         specs.append(LSP_DIAGNOSTICS_SPEC)
+    if remote:
+        # 远端透明路由（M12）：把六个文件工具的 spec 换成「按 `path` 前缀选臂」的
+        # **同名路由壳** —— name / description / parameters 原样，换的只是实现。
+        # 因此工具清单与 schema 一字不改，模型无需知道「有远端」这回事。
+        #
+        # 位置很关键：必须在下面 `registry.register` 循环**之前**替换 ——
+        # `ToolRegistry.register` 重名会抛错，只能「换实现」不能「再注册一个」。
+        from ..remote.routing import routed_specs
+
+        specs = routed_specs(specs)
     for spec in specs:
         registry.register(spec)
     if mcp:

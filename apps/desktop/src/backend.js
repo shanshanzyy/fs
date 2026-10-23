@@ -252,6 +252,15 @@ class Backend {
     //   2. 内嵌二进制与系统 Python 两条启动路径都继承这里，加一次即可全覆盖。
     if (this.config.serverUrl) env.VIBE_SERVER_URL = this.config.serverUrl;
     if (this.config.gatewayUrl) env.VIBE_GATEWAY_URL = this.config.gatewayUrl;
+    // 客户端更新（M9）同样走环境变量，理由与上一条相同（内核已有读这两个名字的
+    // 既定路径）。**只透传两件非敏感配置**：走哪个通道、本地镜像基址；
+    // 刻意绝不传任何公钥/密钥 —— 验签公钥是内核内置常量，密钥永远不经过壳。
+    if (this.config.updateChannel) env.VIBE_UPDATE_CHANNEL = this.config.updateChannel;
+    if (this.config.updateUrl) env.VIBE_UPDATE_URL = this.config.updateUrl;
+    // 中间区「浏览器」视图要内嵌本机跑起来的界面（http://127.0.0.1:<端口>），
+    // 走的是内核 P2 的同一条门控。桌面端默认打开这一档；用户显式设
+    // VIBE_PREVIEW_EXTERNAL=0 时照旧关闭（内核自身默认仍是关，不影响服务端形态）。
+    if (process.env.VIBE_PREVIEW_EXTERNAL == null) env.VIBE_PREVIEW_EXTERNAL = '1';
     return env;
   }
 

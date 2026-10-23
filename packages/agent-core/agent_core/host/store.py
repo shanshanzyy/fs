@@ -191,16 +191,36 @@ class SessionStore:
         keys = ("id", "workspace", "model", "title", "createdAt", "updatedAt")
         return dict(zip(keys, row))
 
-    def get_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """按序返回消息，形态与 Agent.messages 完全一致（可直接重放）。"""
+    def get_messages(
+        self, session_id: str, *, with_seq: bool = False
+    ) -> list[dict[str, Any]]:
+        """按序返回消息，形态与 Agent.messages 完全一致（可直接重放）。
+
+        `with_seq=True` 时每条多带一个 `seq`（消息表的稳定序号）：
+        逐条回退要拿它当**锚点**——前端只知道「我点了哪条提问」，
+        后端必须能把它换算成「从哪条消息开始截断」。seq 不能塞进
+        `tool_meta`（那是回放给模型的内容，多一个字段就会改变上游请求）。
+        """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT role, content, tool_meta FROM messages"
-                " WHERE session_id = ? ORDER BY seq",
-                (session_id,),
-            ).fetchall()
+            if with_seq:
+                rows = self._conn.execute(
+                    "SELECT seq, role, content, tool_meta FROM messages"
+                    " WHERE session_id = ? ORDER BY seq",
+                    (session_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT role, content, tool_meta FROM messages"
+                    " WHERE session_id = ? ORDER BY seq",
+                    (session_id,),
+                ).fetchall()
         messages: list[dict[str, Any]] = []
-        for role, content, meta in rows:
+        for row in rows:
+            seq = 0
+            if with_seq:
+                seq, role, content, meta = row
+            else:
+                role, content, meta = row
             message: dict[str, Any] = {"role": role, "content": content}
             if meta:
                 try:
@@ -209,8 +229,51 @@ class SessionStore:
                         message.update(extra)
                 except json.JSONDecodeError:
                     pass  # 残缺元数据：丢附加字段，保住正文
+            if with_seq:
+                message["seq"] = int(seq)
             messages.append(message)
         return messages
+
+    def max_seq(self, session_id: str) -> int:
+        """本会话当前最大消息序号；空会话返回 0（下一条消息是 1）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def last_user_seq(self, session_id: str) -> int:
+        """最近一条用户消息的 seq；没有则为 0。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages"
+                " WHERE session_id = ? AND role = 'user'",
+                (session_id,),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def truncate_from(self, session_id: str, seq: int) -> int:
+        """截断 seq >= 给定值的所有消息，返回删除条数。
+
+        逐条回退的会话侧动作：这一条提问连它之后的回答/工具结果一起删掉，
+        等价于「从这个提问开始重来」。调用方必须先校验剩余消息组合法
+        （见 `validate_message_group`），否则会留下「工具结果找不到组头」的残局。
+        """
+        if int(seq) <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM messages WHERE session_id = ? AND seq >= ?",
+                (session_id, int(seq)),
+            )
+            deleted = cur.rowcount if cur.rowcount >= 0 else 0
+            cur.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?", (_now(), session_id)
+            )
+            self._conn.commit()
+        return int(deleted)
 
     def close(self) -> None:
         with self._lock:

@@ -232,6 +232,196 @@ def cmd_invite(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- release
+def _release_service(config: ServerConfig):
+    """打开库并装配 `ReleaseService`（私钥按需加载，不在这里落盘）。"""
+    from .clock import Clock
+    from .release_keys import default_key_path
+    from .releases import ReleaseService
+    from .store import open_store
+
+    store = open_store(config.store_target())
+    service = ReleaseService(
+        store=store, clock=Clock(), key_path=default_key_path(config.data_dir)
+    )
+    return store, service
+
+
+def _file_sha256_and_size(path: Path) -> tuple[str, int]:
+    """边读边算 sha256 与字节数 —— 安装包上百 MB，不能整份读进内存。"""
+    import hashlib
+
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+            total += len(chunk)
+    return digest.hexdigest(), total
+
+
+def cmd_release_usage(_args: argparse.Namespace) -> int:
+    print(
+        "用法：python -m vibe_server release {publish|list|revoke}\n"
+        "  publish --version 1.2.3 --file dist/desktop/installer/VibeAgent-Setup-1.2.3.exe\n"
+        "  list    [--channel stable] [--include-revoked]\n"
+        "  revoke  --id rel_xxxx",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def cmd_release_publish(args: argparse.Namespace) -> int:
+    """发布一个客户端版本（**在服务端主机上运行**）。
+
+    两种给包方式，二选一：
+
+    - `--file <安装器>`：把 `.exe` 拷进 `<DATA_DIR>/packages/` 由治理面自托管，
+      `url` 自动填成 `/api/v1/client/packages/<文件名>`。算 sha256/size 也顺手做了。
+    - `--sha256 <64位hex> --size <字节>`：包已在别处（对象存储 / 局域网镜像），
+      治理面只登记元数据 + 代签清单，`url` 由 `--url` 指定。
+
+    **签名在服务端完成**：私钥不出进程、不进任何请求。这正是「上传包不经过
+    他人机器」的落地形态 —— 内网单机部署里，发布与治理面在同一台机器上。
+    """
+    import shutil
+
+    from .releases import MAX_PACKAGE_BYTES, packages_dir, safe_package_name
+    from .releases import parse_version
+
+    config = _load_config(args)
+    version = str(args.version or "").strip()
+    if not version:
+        print("需要 --version（示例 1.2.3）", file=sys.stderr)
+        return 2
+    if parse_version(version) is None:
+        print(f"version 形态非法：{version!r}（示例 1.2.3）", file=sys.stderr)
+        return 2
+
+    channel = str(args.channel or "stable")
+    platform = str(args.platform or "windows")
+    arch = str(args.arch or "x64")
+    url = str(args.url or "").strip()
+    sha256 = str(args.sha256 or "").strip().lower()
+    size = int(args.size or 0)
+
+    if args.file:
+        source = Path(args.file).expanduser()
+        if not source.is_file():
+            print(f"找不到安装包：{source}", file=sys.stderr)
+            return 2
+        try:
+            name = safe_package_name(source.name)
+        except ApiError as exc:
+            print(exc.message, file=sys.stderr)
+            return 2
+        sha256, measured = _file_sha256_and_size(source)
+        if size and size != measured:
+            # 显式 size 与实测不符：宁可停下 —— 签一份「体积对不上」的清单，
+            # 客户端会在下载那步失败，而失败原因离发布者很远。
+            print(
+                f"--size（{size}）与实测（{measured}）不符，拒绝发布", file=sys.stderr
+            )
+            return 2
+        size = measured
+        if size > MAX_PACKAGE_BYTES:
+            print(f"安装包超过 {MAX_PACKAGE_BYTES} 字节上限", file=sys.stderr)
+            return 2
+        target_dir = packages_dir(config.data_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target_dir / name)
+        url = f"/api/v1/client/packages/{name}"
+    elif not (sha256 and size):
+        print(
+            "需要 --file <安装器>，或同时给 --sha256 与 --size（包已在别处）",
+            file=sys.stderr,
+        )
+        return 2
+
+    store, service = _release_service(config)
+    try:
+        created = service.publish(
+            version=version,
+            channel=channel,
+            platform=platform,
+            arch=arch,
+            url=url,
+            sha256=sha256,
+            size=size,
+            notes=str(args.notes or ""),
+            mandatory=bool(args.mandatory),
+            min_version=str(args.min_version or ""),
+            rollout_percent=int(args.rollout_percent or 100),
+            created_by=str(args.created_by or "cli"),
+        )
+    finally:
+        store.close()
+
+    if args.json:
+        print(json.dumps(created, ensure_ascii=False, indent=2))
+    else:
+        print("已发布客户端版本：")
+        print(f"  id       {created['id']}")
+        print(f"  版本     {created['version']}（{created['channel']}/{created['platform']}/{created['arch']}）")
+        print(f"  体积     {created['size']} 字节")
+        print(f"  sha256   {created['sha256']}")
+        print(f"  灰度     {created['rolloutPercent']}%")
+        print(f"  强制     {'是' if created['mandatory'] else '否'}")
+        print(f"  下载     {created['url'] or '（未托管）'}")
+        print(f"  签名     kid={created['pubkeyKid']} alg={created['signatureAlg']}")
+    return 0
+
+
+def cmd_release_list(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    store, service = _release_service(config)
+    try:
+        rows = service.list(
+            channel=str(args.channel or ""),
+            platform=str(args.platform or ""),
+            arch=str(args.arch or ""),
+            include_revoked=bool(args.include_revoked),
+            limit=int(args.limit or 100),
+        )
+    finally:
+        store.close()
+
+    if args.json:
+        print(json.dumps({"releases": rows}, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("尚无发布记录。")
+        return 0
+    print(f"{'id':<28}{'版本':<12}{'渠道':<9}{'平台/架构':<16}{'体积':>12}{'灰度':>6}  状态")
+    for row in rows:
+        state = "已撤销" if row.get("revokedAt") else ("强制" if row.get("mandatory") else "正常")
+        print(
+            f"{row['id']:<28}{row['version']:<12}{row['channel']:<9}"
+            f"{row['platform'] + '/' + row['arch']:<16}{row['size']:>12}"
+            f"{row['rolloutPercent']:>5}%  {state}"
+        )
+    return 0
+
+
+def cmd_release_revoke(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    release_id = str(args.id or "").strip()
+    if not release_id:
+        print("需要 --id", file=sys.stderr)
+        return 2
+    store, service = _release_service(config)
+    try:
+        service.get(release_id)  # 不存在先报 404，别把「查无此记录」说成「已撤销」
+        ok = service.revoke(release_id)
+    finally:
+        store.close()
+    if not ok:
+        print("该发布记录已撤销", file=sys.stderr)
+        return 1
+    print(f"已撤销：{release_id}（客户端下次 check 起不再看到它）")
+    return 0
+
+
 # --------------------------------------------------------------------------- doctor
 def cmd_doctor(args: argparse.Namespace) -> int:
     config = _load_config(args)
@@ -391,6 +581,40 @@ def build_parser() -> argparse.ArgumentParser:
     invite.add_argument("--team-id", default="", help="限定令牌开通的账号所属团队（留空 = 默认团队）")
     invite.add_argument("--note", default="", help="备注，只进服务端审计（截断展示）")
     invite.set_defaults(func=cmd_invite)
+
+    release = sub.add_parser("release", help="客户端发布（发布 / 列表 / 撤销）")
+    release.set_defaults(func=cmd_release_usage)
+    release_sub = release.add_subparsers(dest="release_command")
+
+    pub = release_sub.add_parser("publish", help="发布一个客户端版本（在服务端主机上运行）")
+    pub.add_argument("--version", required=True, help="版本号，示例 1.2.3")
+    pub.add_argument("--file", default="", help="安装器路径；给了它就把包拷进 <DATA_DIR>/packages/ 并自动算 sha256/size")
+    pub.add_argument("--sha256", default="", help="64 位小写十六进制（包已在别处时用）")
+    pub.add_argument("--size", type=int, default=0, help="包字节数（包已在别处时用）")
+    pub.add_argument("--url", default="", help="下载地址（http(s):// / file:// / / 开头相对路径）")
+    pub.add_argument("--channel", default="stable", help="stable / beta / canary，默认 stable")
+    pub.add_argument("--platform", default="windows", help="默认 windows")
+    pub.add_argument("--arch", default="x64", help="x64 / arm64，默认 x64")
+    pub.add_argument("--notes", default="", help="更新说明（进清单，会显示在客户端）")
+    pub.add_argument("--mandatory", action="store_true", help="强制升级（客户端不可跳过）")
+    pub.add_argument("--min-version", default="", help="低于此版本的客户端视为强制升级")
+    pub.add_argument("--rollout-percent", type=int, default=100, help="灰度百分比 0–100，默认 100")
+    pub.add_argument("--created-by", default="cli", help="发布者标识（进审计）")
+    pub.add_argument("--json", action="store_true", help="以 JSON 输出")
+    pub.set_defaults(func=cmd_release_publish)
+
+    rel_list = release_sub.add_parser("list", help="列出发布记录")
+    rel_list.add_argument("--channel", default="", help="按渠道过滤")
+    rel_list.add_argument("--platform", default="", help="按平台过滤")
+    rel_list.add_argument("--arch", default="", help="按架构过滤")
+    rel_list.add_argument("--include-revoked", action="store_true", help="包含已撤销记录")
+    rel_list.add_argument("--limit", type=int, default=100, help="最多几条（上限 500）")
+    rel_list.add_argument("--json", action="store_true", help="以 JSON 输出")
+    rel_list.set_defaults(func=cmd_release_list)
+
+    rel_revoke = release_sub.add_parser("revoke", help="撤销一个发布（客户端下次 check 起不再看到）")
+    rel_revoke.add_argument("--id", required=True, help="发布记录 id，形如 rel_xxxx")
+    rel_revoke.set_defaults(func=cmd_release_revoke)
 
     doctor = sub.add_parser("doctor", help="环境自检")
     doctor.add_argument("--probe", help="额外探测一个已运行实例的地址，如其 http://127.0.0.1:8787")

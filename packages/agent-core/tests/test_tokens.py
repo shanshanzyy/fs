@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -163,6 +164,31 @@ class BudgetUnitTests(unittest.TestCase):
             self.assertGreater(total, 200, "数据必须跨在两个阈值之间，否则测不出错配")
             agent._trim_context()
         self.assertEqual(agent.stats.trimmed, 0)
+
+
+class ContextBudgetDefaultTests(unittest.TestCase):
+    """上下文字符预算（VIBE_MAX_CONTEXT_CHARS）：默认值与覆盖两条路。
+
+    默认从 120000 提到 400000 —— 与治理面策略默认一致；同秒内多问几轮时，
+    120000 会频繁触发裁剪、把较早的对话丢掉（界面会弹「已裁剪较早的对话」）。
+    这里钉住默认值，避免日后又被悄悄改回小值。
+    """
+
+    def _workspace(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name).resolve()
+
+    def test_default_is_400k(self) -> None:
+        with mock.patch.dict(os.environ):
+            os.environ.pop("VIBE_MAX_CONTEXT_CHARS", None)
+            config = Config.load(self._workspace())
+        self.assertEqual(config.max_context_chars, 400_000)
+
+    def test_env_var_overrides_default(self) -> None:
+        with mock.patch.dict(os.environ, {"VIBE_MAX_CONTEXT_CHARS": "123456"}):
+            config = Config.load(self._workspace())
+        self.assertEqual(config.max_context_chars, 123456)
 
 
 class ContextStatsTests(unittest.TestCase):

@@ -68,6 +68,14 @@ class PathGuard:
     # 特殊目录、某个业务库）。混进内置规则会让通用规则被业务特例污染，
     # 且「为什么这个文件被拒」会变得没法解释。两套并存、理由分开报，更好排查。
     denied_patterns: tuple[str, ...] = ()
+    # 保留命名空间前缀（M12）：以这些前缀开头的路径不由本地工具处理。
+    #
+    # 默认 `()` = 零影响。启用远端路由时由 `Agent` 传入（如 `"@remote/"`）。
+    # 它兜住的是**未路由**的工具（`repo_map` / `semantic_search` / `git_diff` /
+    # `edit_files` / `run_command` …）收到命名空间路径的情况 —— 没有这条，
+    # `@remote/devbox/src/app.py` 会被当成本地相对路径去解析，最后报一句
+    # 「文件不存在」，用户与模型都不知道真正原因。这里明确报错，不静默。
+    reserved_prefixes: tuple[str, ...] = ()
     _root_resolved: Path = field(init=False, repr=False)
     _patterns: tuple[str, ...] = field(init=False, repr=False, default=())
 
@@ -133,6 +141,16 @@ class PathGuard:
         text = str(raw).strip().strip('"').strip("'")
         if "\x00" in text:
             raise SandboxViolation("路径中包含空字节，已拒绝", kind="malformed", path=text)
+
+        for prefix in self.reserved_prefixes:
+            if isinstance(prefix, str) and prefix and text.startswith(prefix):
+                raise SandboxViolation(
+                    f"路径落在保留命名空间 {prefix!r} 内，本地工具不处理：{text}\n"
+                    "  这类路径属于远端工作面，需由路由后的同名文件工具"
+                    "（read_file / edit_file / grep …）处理。",
+                    kind="reserved_ns",
+                    path=text[:200],
+                )
 
         try:
             candidate = Path(text)

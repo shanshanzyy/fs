@@ -17,11 +17,18 @@
 
 'use strict';
 
-const { app, BrowserWindow, dialog, shell, Menu, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, shell, Menu, ipcMain, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 
 const { Backend, waitForHealth } = require('./backend');
+const {
+  applyStaging,
+  isStagingPathValid,
+  readPending,
+  clearPending,
+  stagingVersion,
+} = require('./update');
 
 /* ------------------------------------------------- 壳专有能力的窄桥（W1）
  * 只有一个通道：`vibe:pick-folder` —— 弹系统目录对话框，**只回传一个路径字符串**
@@ -118,6 +125,37 @@ ipcMain.handle('vibe:read-config', async () => {
   };
 });
 
+/* ------------------------------------------------- 终端剪贴板窄桥（P1-7 补强）
+ * 终端里的复制 / 粘贴是高频动作，不能时灵时不灵：渲染进程直接走
+ * `navigator.clipboard` 时，读取要过 Chromium 的权限与 focus 闸门，行为随版本漂移。
+ * 因此把这两下交给壳（Electron 的 clipboard 模块），与 pick-folder 同一纪律：
+ * 白名单方法、**只渡纯文本**、长度封顶，不暴露任何文件 / 进程能力。
+ */
+const CLIPBOARD_MAX = 1024 * 1024;
+
+ipcMain.handle('vibe:clipboard-read', async () => {
+  try {
+    return String(clipboard.readText() || '');
+  } catch {
+    return '';
+  }
+});
+
+ipcMain.handle('vibe:clipboard-write', async (_event, text) => {
+  if (typeof text !== 'string' || !text) {
+    return { ok: false, reason: '拒绝：只接受非空字符串' };
+  }
+  if (text.length > CLIPBOARD_MAX) {
+    return { ok: false, reason: '拒绝：内容过长' };
+  }
+  try {
+    clipboard.writeText(text);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: String((error && error.message) || error) };
+  }
+});
+
 /* 解释器变更必须重启才生效（后端进程要按新路径重起）。先把子进程收干净，
  * 再 app.relaunch() 让 Electron 用同一组参数把自己重新拉起。 */
 ipcMain.handle('vibe:relaunch', async () => {
@@ -127,11 +165,126 @@ ipcMain.handle('vibe:relaunch', async () => {
   return { ok: true };
 });
 
+/* ------------------------------------------------- 客户端更新（M9）窄桥
+ * 第四条跨进程能力：`vibe:update-apply`。它**只接一个 staging 路径字符串** ——
+ * 由内核 check/download 校验 sha256 + RSA 验签后原子落盘的那个安装包路径。
+ * 壳在这里刻意不做任何业务判断：不读 manifest、不算 sha256、不下载
+ * （ADR-030 的「壳不碰更新业务」纪律），只做「形态校验 + spawn + 退出自己」。
+ *
+ * 安装包内容是否可信由内核负责；壳只保证「绝对路径 + 文件名是 Setup-<版本>.exe +
+ * 本机确实存在这个普通文件」。非法一律拒绝，**绝不 spawn**。
+ */
+ipcMain.handle('vibe:update-apply', async (_event, stagingPath) => {
+  // 只认字符串：对象 / null / 数字一律当非法（窄面纪律与 save-config 一致）
+  const target = typeof stagingPath === 'string' ? stagingPath : '';
+  if (!isStagingPathValid(target)) {
+    return { ok: false, reason: '拒绝：staging 路径形态非法' };
+  }
+  return applyStaging({
+    stagingPath: target,
+    pendingFile: PENDING_PATH,
+    fromVersion: backend?.version || '',
+    app, // 装完立刻退出自己，把 exe 让给安装器
+    backend, // 先停后端子进程树（Windows 同步 taskkill，放掉文件句柄）
+  });
+});
+
+/** 向就绪的内核发一次只读 GET（token 从 VIBE_URL 里取，与渲染进程同一口径）。 */
+async function kernelGet(pathname) {
+  if (!backend || !backend.url) throw new Error('内核尚未就绪');
+  const base = new URL(backend.url);
+  const target = new URL(pathname, base.origin);
+  const token = base.searchParams.get('token') || '';
+  if (token) target.searchParams.set('token', token);
+  const res = await fetch(target, { headers: token ? { 'X-Vibe-Token': token } : {} });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+/** 启动时的「未决安装」核对：上次 spawn 安装器后壳就退出了，这里读 marker 判断装成没成。 */
+async function notifyPendingUpdate() {
+  const pending = readPending(PENDING_PATH);
+  if (!pending) return;
+  const current = String(backend?.version || '');
+  const from = String(pending.fromVersion || '');
+  const want = String(pending.toVersion || '');
+  // 有 fromVersion 就按「版本变了没」判定；没有就退化为「读到了 marker 就算装过」。
+  const changed = from ? Boolean(current && current !== from) : Boolean(want);
+  clearPending(PENDING_PATH);
+  await dialog.showMessageBox(mainWindow, {
+    type: changed ? 'info' : 'warning',
+    title: '更新结果',
+    message: changed ? `已更新到 v${current}` : '更新没有生效',
+    detail: changed
+      ? `上次尝试安装 v${want || from}，当前版本 ${current}。`
+      : `上次尝试安装 v${want || '新版本'}，但当前仍是 v${current || '未知'}。可以重新在界面里触发更新。`,
+  });
+}
+
+/** 检查更新（M9）：内核编排双通道与验签，壳只负责发请求并在手动检查时呈现结论。 */
+async function checkForUpdates({ auto = true } = {}) {
+  try {
+    const view = await kernelGet(`/api/update/check?auto=${auto ? 1 : 0}`);
+    if (auto) return view; // 静默检查：内核自己通过事件流提示，不弹框
+    let detail = `状态：${view.status || '未知'}`;
+    if (view.status === 'available') {
+      detail = `发现新版本 v${view.version}（当前 v${view.currentVersion}）。` +
+        (view.mandatory ? '该版本为强制更新。' : '可在界面顶部按提示下载。');
+    } else if (view.status === 'idle') {
+      detail = `已是最新版本（当前 v${view.currentVersion || backend?.version || '未知'}）。`;
+    } else if (view.status === 'disabled') {
+      detail = '更新通道已关闭（VIBE_UPDATE_DISABLE=1）。';
+    } else if (view.status === 'failed') {
+      detail = `检查失败：${view.reason || '未知原因'}`;
+    }
+    await dialog.showMessageBox(mainWindow, {
+      type: view.status === 'failed' ? 'error' : 'info',
+      title: '检查更新',
+      message: '检查完成',
+      detail,
+    });
+    return view;
+  } catch (error) {
+    if (!auto) {
+      await dialog.showMessageBox(mainWindow, {
+        type: 'error',
+        title: '检查更新',
+        message: '检查失败',
+        detail: String((error && error.message) || error),
+      });
+    }
+    throw error;
+  }
+}
+
+/** 「帮助 → 关于」：只展示本机状态，不做任何业务动作。 */
+async function showAbout() {
+  const detail =
+    `工作区：${pickWorkspace()}\n` +
+    `内核版本：${backend?.version || '（未知）'}\n` +
+    `后端来源：${backendKindLabel(backend)}\n` +
+    `后端：${backend?.url || '（未启动）'}\n` +
+    `配置文件：${CONFIG_PATH}\n\n` +
+    '本地执行 + 人工审批：所有高危动作都会先征求你的同意，代码不会离开这台机器。';
+  await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '关于',
+    message: 'Vibe Coding Agent · M1 桌面客户端',
+    detail,
+  });
+}
+
 /* ----------------------------------------------------------------- 配置 */
 const DESKTOP_DIR = path.resolve(__dirname, '..');
 const REPO_ROOT = path.resolve(DESKTOP_DIR, '..', '..');
 const AGENT_CORE = path.join(REPO_ROOT, 'packages', 'agent-core');
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+
+/* 「未决安装」的记账文件（M9）。刻意放在壳自己的 userData 下，而**不是**内核的
+ * ~/.vibe/updates：它是「壳发起的这次安装」的记账，属于壳的职责；安装这件事
+ * 内核既不知道也不该知道（内核永不执行安装）。 */
+const PENDING_PATH = path.join(app.getPath('userData'), 'update', 'pending.json');
 
 const DEFAULT_CONFIG = {
   // 留空表示自动探测
@@ -150,6 +303,12 @@ const DEFAULT_CONFIG = {
   serverUrl: '',
   // 网关基址。留空 = 由 serverUrl 派生，只在网关单独部署时才需要填。
   gatewayUrl: '',
+  // 客户端更新（M9）。两项都**非敏感**，仅作为环境变量透传给后端（内核自己读）：
+  //   updateChannel —— 走 stable/beta/canary 哪个通道，留空用内核默认 stable；
+  //   updateUrl     —— 本地/局域网镜像基址（file:// 或内网 http），留空只走治理面。
+  // 刻意**不在这里放任何公钥/密钥**：验签公钥是内核内置常量，密钥永不经过壳。
+  updateChannel: '',
+  updateUrl: '',
 };
 
 function readConfig() {
@@ -169,6 +328,9 @@ function readConfig() {
   // 所有用户的桌面端就都接上了治理面，不必逐个改 config.json。
   if (process.env.VIBE_SERVER_URL) config.serverUrl = process.env.VIBE_SERVER_URL;
   if (process.env.VIBE_GATEWAY_URL) config.gatewayUrl = process.env.VIBE_GATEWAY_URL;
+  // 更新通道 / 镜像基址同理：运维在机器级环境变量里配一次即可（与 serverUrl 同款）。
+  if (process.env.VIBE_UPDATE_CHANNEL) config.updateChannel = process.env.VIBE_UPDATE_CHANNEL;
+  if (process.env.VIBE_UPDATE_URL) config.updateUrl = process.env.VIBE_UPDATE_URL;
   return config;
 }
 
@@ -197,7 +359,22 @@ function createWindow(url, workspace) {
       sandbox: true,
       // 界面全部由本地 host 服务提供，不需要任何 Node 能力
       preload: path.join(__dirname, 'preload.js'),
+      // 中间区「浏览器」要显示用户自己跑起来的本机应用。不少页面带
+      // X-Frame-Options / CSP frame-ancestors，用 iframe 会被拒成白屏；
+      // webview 是独立 WebContents 的顶层导航，不受这两条限制。
+      webviewTag: true,
     },
+  });
+
+  // webview 纵深防御：只允许挂本机环回地址，且绝不给它任何 Node 能力。
+  mainWindow.webContents.on('will-attach-webview', (event, prefs, params) => {
+    delete prefs.preload;
+    prefs.nodeIntegration = false;
+    prefs.contextIsolation = true;
+    prefs.sandbox = true;
+    if (!/^http:\/\/127\.0\.0\.1:\d{1,5}(\/|$)/.test(String(params.src || ''))) {
+      event.preventDefault();
+    }
   });
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
@@ -288,6 +465,13 @@ async function boot() {
   }
 
   createWindow(url, workspace);
+
+  // 上次退出前留下的「未决安装」（M9 §4 ④ 第 7 步）：读 marker 判断装成了没。
+  // 放 createWindow 之后，弹框才能挂在窗口上；它不挡启动。
+  notifyPendingUpdate().catch(() => {});
+
+  // 启动静默检查更新（M9）：**非阻断** —— 不 await、失败只记日志、绝不弹框。
+  checkForUpdates({ auto: true }).catch(() => {});
 }
 
 function buildMenu() {
@@ -346,22 +530,14 @@ function buildMenu() {
       label: '帮助',
       submenu: [
         {
+          // 手动检查更新（M9）：转发内核 check?auto=0，把结论在本壳里呈现给用户。
+          label: '检查更新',
+          click: () => { checkForUpdates({ auto: false }).catch(() => {}); },
+        },
+        { type: 'separator' },
+        {
           label: '关于',
-          click: () => {
-            dialog.showMessageBox(mainWindow, {
-              type: 'info',
-              title: '关于',
-              message: 'Vibe Coding Agent · M1 桌面客户端',
-              detail:
-                `工作区：${pickWorkspace()}\n` +
-                `内核版本：${backend?.version || '（未知）'}\n` +
-                `后端来源：${backendKindLabel(backend)}\n` +
-                `后端：${backend?.url || '（未启动）'}\n` +
-                `配置文件：${CONFIG_PATH}\n\n` +
-                '本地执行 + 人工审批：所有高危动作都会先征求你的同意，' +
-                '代码不会离开这台机器。',
-            });
-          },
+          click: () => { showAbout().catch(() => {}); },
         },
       ],
     },

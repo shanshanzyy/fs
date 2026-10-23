@@ -16,16 +16,20 @@ from .base import (
     parse_text_tool_calls,
     window_completion_context,
 )
-from .openai_compat import OpenAICompatClient, probe_endpoint
+from .openai_compat import OpenAICompatClient, StreamInterrupted, probe_endpoint
+from .router import ModelRouter, infer_intent
 
 __all__ = [
     "ChatResponse",
     "LLMClient",
+    "ModelRouter",
     "OpenAICompatClient",
+    "StreamInterrupted",
     "ToolCall",
     "build_completion_prompt",
     "build_rewrite_prompt",
     "clean_completion_text",
+    "infer_intent",
     "parse_arguments",
     "parse_text_tool_calls",
     "probe_endpoint",

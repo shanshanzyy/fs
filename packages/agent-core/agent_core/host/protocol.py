@@ -24,25 +24,37 @@
 | type | 触发时机 | 关键字段 |
 |---|---|---|
 | `session.ready` | 连接建立 | `sessionId` `workspace` `model` `tools[]` `config{}` |
-| `run.started` | 用户提交任务 | `runId` `prompt` |
+| `run.started` | 用户提交任务 | `runId` `prompt` `userSeq`（本轮用户消息在会话库里的 seq；逐条回退用它把「这条提问」映射到「这一轮的检查点」，0 = 未持久化/未知） |
 | `run.iteration` | 每轮循环开始 | `runId` `index` `total` |
 | `run.assistant_delta` | 模型纯文本回复的增量（流式输出，A1） | `runId` `text`（片段，按序拼接即全文；工具围栏后的内容不会出现） |
+| `run.reasoning_delta` | 模型思考（reasoning）的增量（流式输出） | `runId` `text`（片段，按序拼接即思考全文）；**纯呈现**，不落盘、不进会话库，最终答案仍以 `run.finished` 的 `answer` 为准 |
 | `run.tool_call` | 工具调用前（含风险分级） | `runId` `callId` `tool` `arguments` `risk` `reason` |
 | `run.tool_result` | 工具执行后 | `runId` `callId` `tool` `ok` `content` `diff` `meta` |
 | `run.tool_output` | `run_command` 子进程有输出（流式回显） | `runId` `callId` `tool` `stream`（`stdout`/`stderr`）`text`（片段，按序拼接即该流全文）`clipped`；**纯呈现**，不落盘、不进会话库，最终结果仍以 `run.tool_result` 为准 |
-| `run.approval` | 需要人工审批 | `runId` `approvalId` `tool` `risk` `reason` `preview{}` |
+| `run.approval` | 需要人工审批 | `runId` `approvalId` `tool` `risk` `reason` `preview{}` `draftPaths[]`（本次改动可生成草稿的工作区相对路径；空数组 = 没有可渲染的页面，界面据此隐藏「预览效果」入口 —— 只给路径，正文要用 `POST /api/preview/draft` 换 token） |
 | `run.approval_resolved` | 审批已处理 | `approvalId` `decision` |
 | `run.notice` | 提醒/警告 | `runId` `text` |
 | `run.plan` | 计划更新（P2-12，模型调用 `update_plan` 或用户手动勾选） | `runId` `steps[]`（`{id,text,status}`）`revision` |
 | `run.context` | 上下文用量（P2-17，每轮**裁剪之后** + 本轮收尾各一次） | `runId` `budgetTokens` `usedTokens` `segments{system,rules,history,toolOutputs}` `estimator` `trimmedLastRun` `cache` |
 | `run.subagent` | 子 Agent 进度（M3，一次 `task` 委派的生命周期） | `runId` `callId` `phase`（`started`/`iteration`/`tool`/`tool_result`/`notice`/`finished`/`failed`）+ 该 phase 的元数据（`index`/`total`/`name`/`risk`/`ok`/`text`/`chars`/`iterations`/`tool_calls`/`answer_chars`/`task_chars`/`error`）；**不含子 Agent 正文**（ADR-006） |
-| `run.finished` | 任务完成 | `runId` `answer` `stats{}` `changedFiles[]` |
+| `run.finished` | 任务完成 | `runId` `answer` `stats{}` `changedFiles[]` `checkpointId`（本轮检查点 id，空 = 本轮没改文件） |
 | `run.failed` | 任务异常 | `runId` `error` `kind` |
 | `run.interrupted` | 用户中断 | `runId` |
 | `test.started` | 用户点了「跑测试」（P2-14，与 `run.*` 分离） | `runId` `total` `nodeIds[]` |
 | `test.finished` | 测试跑完（或跑不起来） | `runId` `total` `passed` `failed` `skipped` `ms` `failures[]`（`{nodeId,file,line,head}`）`error` |
 | `term.data` | 交互式终端有输出（P1-7，**独立通道**，与 `run.*` 分离） | `termId` `data`（原始字节的 base64） |
 | `term.exit` | 终端进程退出（用户敲 `exit` 或点了关闭） | `termId` `exitCode` |
+| `update.available` | 检查发现有可装的新版本（M9，与 `run.*` 分离） | `status` `currentVersion` `version` `mandatory` `channel` `source` `release{}`（含 `notes`/`size`/`sha256`/`seq`，**绝不含私钥**）`reason` |
+| `update.progress` | 安装包下载进度（M9） | `version` `done`（已下字节）`total`（清单声明字节） |
+| `update.staged` | 安装包已验签+sha256 校验+原子落盘，等待用户确认安装（M9） | `version` `stagingPath` `size` `source` |
+| `update.applied` | 壳侧确认本机已更新到该版本（M9，启动读 marker 后补记） | `version` |
+| `update.failed` | 检查或下载失败（M9） | `reason` `kind`（`shape`/`signature`/`sha256`/`size`/`network`/`state`/`no_release`） |
+| `task.state` | 后台任务状态变化（M9-D，与 `run.*` 分离） | `taskId` `state`（`pending`/`running`/`succeeded`/`failed`/`cancelled`）`summary`（一行摘要）；**不含任务正文与结论**（ADR-006） |
+| `schedule.state` | 定时任务状态变化（M10，与 `run.*` 分离） | `jobId` `action`（`created`/`updated`/`toggled`/`deleted`/`triggered`/`skipped`/`failed`）`state`（`enabled`/`disabled`）`nextRunAt`（下次触发时刻，epoch 秒，0 表示不再触发）`lastState` `runCount` `taskId`（本次投出的后台任务 id，未触发时为空）；**不含 prompt 正文**（ADR-006） |
+| `remote.state` | 远程工作面状态变化（M11，与 `run.*` 分离；打开/切换连接、切换浏览目录、远端根增删） | `connection` `display` `root` `browsePath` `allowWrite` `allowShell` `capabilities{degraded[]}` `changes`（本会话远端改动条数）`roots[]`（已加入工作区的远端根的命名空间路径，M12）；**不含任何文件正文**（ADR-006） |
+| `remote.edit` | 远端编辑 / 保存产生了 diff（M11，供界面审阅） | `connection` `path` `action`（`save`/`create`/`edit`）`added` `removed` `strategy` `sha256` `diff`（真实 unified diff）；diff 与本地 `run.approval.preview.body` 同一条口径 —— **供人审的改动内容**，不进审计、不落盘 |
+| `preview.changed` | 文件监听检出增删改（P0，与 `run.*` 分离；来源可能是 Agent 改动，也可能是用户在编辑器里手存） | `paths[]`（工作区相对路径，最多 200 条）`count`（本轮实际变化条数）`truncated`（是否因超过上限被截断；为 `true` 时界面应刷新全部预览标签）；**只记路径，不含内容**（ADR-006），也不进审计链 |
+| `preview.tunnel` | 远端预览转发的**状态机**变化（P3 / ADR-040：`starting`/`up`/`reconnecting`/`down`/`closed`） | `id` `connection` `display` `remotePort` `localPort` `url`（本机 `http://127.0.0.1:<localPort>/`）`state` `refs`（引用数）`restarts`（已重连次数）`error`（失败摘要）`createdAt`；**不含任何被转发的字节**（ADR-006） |
 
 `preview` 的结构见 `agent_core.tools.base.ToolPreview`：
 `{"kind": "diff"|"text"|"json"|"error", "body": ..., "summary": ..., "error": ...}`。
@@ -88,7 +100,7 @@
 | `POST /api/lsp/rename/apply` | 应用重命名（E）：`{token}` → `{ok, changed, files, paths[], added, removed}` |
 | `GET  /api/mcp/status` | 外部 MCP server 状态（P1-6）：`{enabled, configPath, servers[]{name,transport,command,args[],env{},url,available,reason,running,tools[]}, configError}`（`command`/`args`/`env` 回完整值，供界面原地编辑） |
 | `POST /api/mcp/reload` | 重读 MCP servers 配置（P1-6）：不落盘、不 409；重建 `mcp__*` 工具清单后返回最新 status |
-| `POST /api/mcp/servers` | 新增 / 替换一个 MCP server（L 管理面）：`{server{name,transport,command,args,url,env}}` → 最新 status；只写配置文件、不拼命令；未启用 400、执行中 409、治理面 400、非法 400 |
+| `POST /api/mcp/servers` | 新增 / 替换一个 MCP server（L 管理面）：`{server{name,transport,command,args,url,env}}` → 最新 status；只写配置文件、不拼命令；未启用 400、执行中 409、治理面**接管运行时** 400、非法 400 |
 | `POST /api/mcp/servers/remove` | 删除一个 MCP server（L 管理面）：`{name}` → 最新 status；不存在 400；写后自动 reload 并记 `mcp.server_removed` |
 | `POST /api/mcp/test` | 测一个 MCP server 的连接（L 管理面）：`{name}` → `{ok, name, count, tools[]}` 或 `{ok:false, error}`；首次调用惰性启动该 server |
 | `POST /api/governance/login` | 登录治理面（M3+）：`{email, password, serverUrl?, deviceName?}` → `{ok, governance, session}`；`serverUrl` 缺省回退配置里的治理面地址，为空则以 400 拒绝；调 `GovernanceClient.login()` 把令牌落 `~/.vibe/credentials.json`（0o600）后**热接入**当前会话（不重建对话 / 检查点 / 审计链）；执行中 409，治理面拒登按其状态码（4xx），不可达 502。响应只回 `governance.describe()`（**不含令牌**） |
@@ -101,17 +113,89 @@
 | `GET  /api/tests` | 测试树（P2-14）：`{configured, command, cases[{nodeId,file,name}], total, truncated, error}`；`?refresh=1` 强制重新收集（缺省用缓存） |
 | `POST /api/tests/run` | 跑测试（P2-14）：`{nodeIds[]}`（空 = 全部）→ `{runId}`；结果走 `test.started`/`test.finished` 事件 |
 | `GET  /api/tests/last` | 最近一次测试结果（P2-14）：`{configured, runId, result{…}}`，从未跑过则 `result: null` |
-| `POST /api/term/open` | 起一个交互式终端（P1-7）：`{cols, rows}` → `{termId, mode, cols, rows, pid, fallbackReason}`；输出走 `term.data`/`term.exit` 事件 |
+| `GET /api/term` | 列出活着的终端会话（多标签）：界面刷新后据此恢复标签、并与后端对账；`{enabled, maxSessions, idleSeconds, fallbackReason, sessions:[{termId, mode, shell, kind, connection, cols, rows, pid, alive, idleSeconds}]}` |
+| `POST /api/term/open` | 起一个交互式终端（P1-7）：`{cols, rows}` → `{termId, mode, shell, kind, connection, cols, rows, pid, fallbackReason}`；输出走 `term.data`/`term.exit` 事件。**终端跟随工作区**：`@remote/<连接>/<子目录>` 工作区起的是 `ssh -tt <加固参数> <host>`（`kind="remote"`、`shell` 为连接名），本机工作区起本地 shell。**默认不限个数**（`VIBE_TERM_MAX` 未设 = 0），显式配正整数才拦 |
 | `POST /api/term/input` | 把按键/粘贴内容写进终端（P1-7）：`{termId, data}` → `{ok, chars}` |
 | `POST /api/term/resize` | 重设终端窗口（P1-7）：`{termId, cols, rows}` → `{ok, cols, rows}` |
 | `POST /api/term/close` | 关闭终端并收子进程树（P1-7）：`{termId}` → `{ok, mode, exitCode, ms}` |
 | `POST /api/upload-image` | 上传一张图片作多模态输入（P1-10）：`{name, data, mediaType?}`（`data` 为 base64，可带 `data:` 前缀）→ `{ref{type,value}, bytes, ext, digest}`；`VIBE_VISION=off` 时拒绝 |
 | `GET  /preview/<relpath>` | 工作区网页文件的**静态预览**（P1-11）：PathGuard 读校验 + MIME 白名单 + 预览专用 CSP（`connect-src 'none'` 焊死网络出口）；目录回落到 `index.html`。**不是** `/api/*`，故不查令牌（同静态壳），但 Host/Origin 双校验照常生效 |
+| `POST /api/preview/draft` | 审批期**草稿预览**（P1-2）：`{approvalId}` → `{token, url, primary, paths[], created[]}`，同一审批幂等（重复请求回同一个 token）。草稿正文来自 `ApprovalRequest.draft`（工具层在审批发起那一刻算好，**不落盘**）；审批已结束 → 409，本次改动无可渲染文件 → 400 |
+| `GET  /preview-draft/<token>/<relpath>` | 草稿正文的只读出口（P1-2）：路径在草稿清单内 → 内存里的「改后正文」，否则回落磁盘读当前文件（页面引用的图片/字体/未改资源）。与 `/preview/` 同 MIME 白名单、同体积上限、同 `PREVIEW_CSP`、同样 `no-store`；token 绑定单次审批，**审批解决即 404**。裸 token（无 relpath）→ 302 跳到主文档 |
+| `GET  /api/preview/external` | 真实应用预览的**能力探测**（P2 / ADR-039，只读）：`{enabled}`。界面据此决定「本机应用」入口亮不亮；`VIBE_PREVIEW_EXTERNAL=0`（默认）时 `enabled:false`，且界面 CSP 与改造前**逐字节一致** |
+| `POST /api/preview/external` | 登记一次**本机 dev server 预览**（P2）：`{url}` → `{ok, url, port}`。只接受 `http://127.0.0.1:<port>[/path][?query]`，其余（https / `localhost` / 外部域 / userinfo 混淆 / `..` 段 / 本应用自身端口 / 不带端口）一律 400；门控关闭 → 403。**host 不起进程、不转发字节**（dev server 由用户自己启动，故零新增执行面）；审计只记 `preview.external{port, host}`，**不记路径与内容** |
+| `GET  /api/preview/tunnel` | 远端预览的**能力探测 + 名单**（P3 / ADR-040，只读）：`{enabled, tunnels[], max}`。`enabled` 要求 `VIBE_PREVIEW_REMOTE=1` **且** `VIBE_REMOTE=1`；每条隧道只回元数据（连接名 / 两个端口 / `state` / `refs` / `restarts`），**不含正文** |
+| `POST /api/preview/tunnel` | 建一条 `ssh -L 127.0.0.1:<本机随机端口>:127.0.0.1:<remotePort>` 转发（P3）：`{connection, remotePort}` → `{ok, id, url, localPort, remotePort, connection, state}`。`-L` 规格两端由代码钉死为环回，用户只能给整数端口；同一 `(连接名, 远端端口)` 复用一条并**按引用计数**管理；门控关闭 → 403，端口非法 / 连接名不存在 → 400，链路起不来 → 502 |
+| `POST /api/preview/tunnel/close` | 释放一次引用（P3）：`{id}` → `{ok, closed, refs}`；`closed:false` 表示还有别的标签在用同一条转发。界面在**关标签**与**页面卸载**（`pagehide`）两处都会调它 —— 转发是本机监听口，不能活过它的使用者 |
 | `POST /api/visual/check` | 网页自检（P1-11）：`{url, width?, height?, image, baseline?, setBaseline?}`（`image` 为 base64 PNG 截图，来自 Electron 壳的离屏桥）→ `{available, ok, diffRatio, changedBlocks, totalBlocks, baselineMissing, saved?, diffImageDigest, reason?}`；**无截图时如实回 `available:false`**（浏览器直开没有捕获能力），不是 500 |
 | `GET  /api/memories` | 跨会话记忆（P2-15）：`{enabled, memories[]{id, text, tags, scope, createdAt}}`；`VIBE_MEMORY=0` 时 `enabled:false` |
 | `POST /api/memories` | 新增一条记忆（P2-15）：`{text, tags?}` → `{ok, memory{…}}`；空文本 / 超长 / 超上限 → 400。属「用户本人动作」（ADR-011） |
 | `POST /api/memories/delete` | 删除一条记忆（P2-15）：`{id}` → `{ok, removed}` |
 | `GET  /api/audit` | 审计链校验结果 + 最近事件 |
+| `GET  /api/update/check` | 检查客户端更新（M9，`?auto=1` 表示启动自动检查）：编排走双通道（治理面 S1 → 本地镜像 S2），**逐源独立 RSA 验签**，两源都验签失败则硬失败（不下载、记 `update.verify_failed`）；`?auto=1` 且 `update_check_on_start=false` 时直接 idle 且**零网络请求**；只读零副作用（不下载、不落包） |
+| `POST /api/update/download` | 下载安装包到 staging（M9）：`{version?}`（缺省用最近一次检查的目标版本）→ `{ok, reused, version, stagingPath, size, source}`；流式下载 + sha256 校验 + **原子落盘**（先 `part-*.tmp` 再 `os.replace`），进度走 `update.progress`；已有任务在跑 409（下载与落盘不与 Agent 争用），已就绪的同版本幂等复用（`reused:true`）；**内核永不执行安装**（安装由桌面壳在用户确认后自己做） |
+| `GET  /api/update/status` | 本机更新状态（M9，只读）：`{ok, disabled, channel, currentVersion, status, availableVersion, stagedPath, stagedExists, skippedVersion, lastCheckAt, lastError, maxSeq}` |
+| `POST /api/tasks` | 发起后台任务（M9-D）：`{prompt}` → `{ok, taskId}`；空/超长 400；`VIBE_ASYNC_AGENT=0` 时 400。属「用户本人动作」（ADR-011），子任务只读工具面、审计链共用 |
+| `GET  /api/tasks` | 后台任务列表（M9-D，只读）：`[{taskId, state, summary, chars, iterations, toolCalls, error, startedAt, finishedAt, elapsedMs}]`；**不含任务正文与结论**（ADR-006）；未启用回 `[]` |
+| `GET  /api/tasks/{id}` | 单任务状态/结果（M9-D，只读）：同列表项 + 完成后带 `result`（经 `wrap_untrusted` 包裹的结论）；未启用/不存在 404 |
+| `POST /api/tasks/{id}/cancel` | 请求取消后台任务（M9-D）：`{}` → `{ok, cancelled}`；协作式取消（轮次边界停下），已完成/不存在回 `cancelled:false` |
+| `POST /api/schedules` | 新建定时任务（M10）：`{name, schedule, prompt, enabled?}` → `{ok, jobId}`；`schedule` 为 5 字段 cron 或 `@every 30m` / `@at 2026-10-17T09:00:00`；空/超长/语法错 400、条数达上限 400、`VIBE_SCHEDULER=0` 或未开后台 Agent 时 400。属「用户本人动作」（ADR-011），触发的是**只读后台任务**（复用 M9-D 池） |
+| `GET  /api/schedules` | 定时任务列表（M10，只读）：`{jobs[]{jobId, name, schedule, enabled, createdAt, nextRunAt, lastRunAt, lastTaskId, lastState, runCount}, status{…}}`；**不含 prompt 正文**（ADR-006）；未启用回 `{jobs:[], status{enabled:false,…}}` |
+| `POST /api/schedules/{id}` | 更新定时任务（M10）：`{name?, schedule?, prompt?, enabled?}`（缺省字段保留原值）→ `{ok, job{…}}`；变更后重排 `nextRunAt`；不存在 404 |
+| `POST /api/schedules/{id}/delete` | 删除定时任务（M10）：`{}` → `{ok, deleted}`；已投出的后台任务不受影响；不存在回 `deleted:false` |
+| `POST /api/schedules/{id}/run` | 立即触发一次（M10）：`{}` → `{ok, taskId}`；**不改 `nextRunAt`**（不影响既有节奏）；不存在/未启用 404 或 400 |
+| `GET  /api/remote/connections` | 远程连接清单（M11，只读）：`{enabled, configPath, default, active, ssh{available,path}, connections[]{name,host,user,port,root,identity_file,proxy_jump,host_key_policy,connect_timeout,command_timeout,allow_write,allow_shell,note,created_at,display,default,problems[]}}`；**不含私钥内容**（只回路径）；返回的是**连接对象原形**（snake_case），界面原样回填提交；`VIBE_REMOTE=0` 时 `enabled:false` 且清单为空 |
+| `POST /api/remote/connections` | 新增一条远程连接（M11，用户本人动作 ADR-011）：`{connection{name,host,user?,port?,root?,identity_file?,proxy_jump?,host_key_policy?,connect_timeout?,command_timeout?,allow_write?,allow_shell?,note?}, default?}`（也可直接以连接对象为体）→ `{ok, connection}`；**写前校验**（结构 + 私钥存在性），坏 spec 拒收且**不落盘**（400） |
+| `POST /api/remote/connections/{name}` | 更新一条远程连接（M11）：字段缺省保留原值（**不支持改名**）→ `{ok, connection}`；不存在 400、非法 400 |
+| `POST /api/remote/connections/{name}/delete` | 删除一条远程连接（M11）：`{}` → `{ok, removed, default}`；不存在 400；删默认后**不自动选接任者**（与 CLI 一致） |
+| `POST /api/remote/connections/{name}/default` | 设为默认连接（M11）：`{}` → `{ok, default}`；不存在 400 |
+| `POST /api/remote/connections/{name}/permissions` | 改权限位（M11，**热开关**）：`{allowWrite?/allow_write?, allowShell?/allow_shell?}`（至少一项，两项都给也行）→ `{ok, connection}`；改完**立即对活动连接生效**（不重握手）；不存在 400、一项都没给 400 |
+| `POST /api/remote/connections/{name}/test` | 测试连通性（M11，只读无副作用）：`{}` → 成功 `{ok:true, connection, display, root, ms, report, capabilities{os,arch,kernel,user,cwd,git,python,multiplexed,root_writable,degraded[]}}`；连不上回 `{ok:false, connection, display, kind, reason, ms}`（**不抛错**：连不上是正常结果）；**不落盘、不改清单、不改活动连接** |
+| `GET  /api/remote/state` | 远程工作面状态（M11，只读）：`{enabled, connection, display, root, browsePath, allowWrite, allowShell, capabilities{degraded[]}, changes}`（同 `remote.state` 事件载荷）；未打开连接时如实回空（`connection:""`） |
+| `POST /api/remote/open` | 打开 / 切换活动连接（M11）：`{connection?}` → `{ok, ...snapshot}`；换连接 = **关旧开新**（不泄漏复用的 ControlMaster 套接字）；不存在 400 |
+| `GET  /api/remote/tree?connection=&path=` | 远端目录树（M11，只读）：`{ok, connection, path, entries[]{name, type, size}}`；**目录优先排序**、符号链接如实标注**不跟随**；路径越界经 `RemotePathGuard` 拒绝（400）；**只看条目、不读内容**；作用于**活动连接**。`connection`（M12）给出时只在它**正是活动连接**时才列，否则回 `{ok:false, reason:"该连接未打开", entries:[]}`（**不静默换连接**）；`path` 为相对该连接 root 的路径 |
+| `GET  /api/remote/roots` | 已加入工作区的远端根（M12，只读）：`{enabled, roots[]{connection, sub, nsPath, label, target, ok, reason}, problems[]}`；`ok/reason` 是**纯文本校验**结论（连接是否存在 / sub 是否合法），**不探远端** —— 离线也能加根；`problems` 列出载入时被丢弃的坏根原因；`VIBE_REMOTE=0` 时 400 |
+| `POST /api/remote/roots` | 把一个远端目录加入工作区（M12，用户本人动作 ADR-011）：`{connection, sub?, label?}` → `{ok, roots[], problems[]}`；**写前纯文本校验**（未知连接 / 越出 root / 写法非法 / 重复 → 400 人话，不落盘）；登记后该目录可用 `@remote/<连接>/<子目录>` 命名空间路径经**本地同名工具**操作，且当轮提示词即时生效 |
+| `POST /api/remote/roots/delete` | 把一个远端目录移出工作区（M12）：`{connection, sub?}` → `{ok, roots[], problems[]}`；不存在 → 400（**不静默成功**） |
+| `GET  /api/remote/file?path=` | 只读查看远端文件（M11）：`{connection, relPath, size, encoding, newline, hadBom, trailingNewline, sha256, text}`；`sha256` 是保存时的乐观锁基准；内容按**不可信文本**包装（`wrap_untrusted`），界面标注「远端内容，未经审查」；二进制 / 超限（`MAX_SCAN_BYTES`）**明确拒绝**（400）而非截断 |
+| `POST /api/remote/save` | 保存远端文件（M11，用户本人动作）：`{path, content, expectedDigest}` → `{ok, changed, created, digest, added, removed, backedUp, relPath, bytes, diff}`；① **写前本机留底**（存不下就中止 400）；② `expectedDigest` 与远端当前 sha256 不符 → **409 + 远端当前 sha256**（**绝不覆盖**）；③ 受控覆盖（ADR-004 例外，显式 overwrite + 返回真实 diff）；④ 回读校验字节数；⑤ **不产生 `remote.edit` 事件**（正文只走响应）；作用于**活动连接** |
+| `POST /api/remote/patch` | 远端结构化补丁（M11）：`{path, search, replace, replaceAll?}` → `{ok, changed, written, strategy, added, removed, diff}`；复用 `RemoteWorkspace.edit()` 三级匹配引擎（exact/normalized/flexible）；`changed=false` **不写回**；作用于**活动连接** |
+| `GET  /api/remote/changes` | 本会话远端改动台账（M11，只读）：`{enabled, connection, changes[]{rel_path, connection, abs_path, action, bytes, sha256, added, removed, backed_up, backup_path, edited_at}}`；**元数据优先**（不含正文），正文按需从 `/api/remote/file` 取、diff 从 `/api/remote/diff` 取；`backup_path` 是改动前内容在本机的留底绝对路径（供人**手工**回捞，不出机） |
+| `GET  /api/remote/diff?connection=&path=` | 留底 vs 远端当前的 unified diff（M11，只读）：`{available, connection, path, added?, removed?, diff?, hunks[]{index, tag, header, oldStart, oldEnd, oldLines, newLines, added, removed, diff}[]}`；无记录 / 属别的连接 / 远端已删时 `available:false` + `reason`（**不假装成功**）；留底不存在（新建文件）按**全新增**处理；hunks 与本地 `POST /api/edit/rewrite` 同一 `Hunk.to_api()` 口径；**diff 正文不进审计** |
+
+### 定时任务的三条边界（M10）
+
+1. **只投只读后台任务**。定时任务不做具体的「动作」（不改文件、不跑命令），
+   只把 `prompt` 投给 M9-D 的后台池 —— 后者的只读工具面与审批纪律原样继承。
+   因此 `VIBE_SCHEDULER=1` 但 `VIBE_ASYNC_AGENT=0` 时不启动（记一条 notice），
+   不会出现「调度器在跑但没有可投的池」这种半截状态。
+2. **只有用户本人能建/改/删**（ADR-011）。Agent 侧不注册任何调度工具：模型
+   不能给自己排班。界面上的操作等同用户在文件系统里手改 `scheduler.db`。
+3. **默认关 + 逐字节一致**。`VIBE_SCHEDULER=0`（默认）时不建 store、不起线程、
+   不注册端点（POST 400 / GET 回空），与未实现前完全一致。
+
+### 远程设备文件工作面（M11）的四条边界
+
+这一组端点把既有的「远程设备接入」（CLI + Agent 工具）补成**面向用户的工作面**。
+它建立在既有链路之上，**不新增传输协议、不新增门控**：
+
+1. **复用既有实现，只加用户面** —— 传输仍是系统 `ssh`（ADR-036），路径仍过
+   `RemotePathGuard` + `realpath` 二次确认，连接清单仍走 `remote/store.py` 的
+   原子写；本轮只加「会话状态 + 端点 + 事件 + 面板 + 一个只读自审工具」。
+2. **界面上的远端写 = 用户本人动作**（ADR-011，与本地 `/api/edit/save` 同口径）——
+   用户点「保存」即显式决定，**不重复走 Agent 审批漏斗**；但仍**必须**：
+   ① 走结构化补丁 / 受控覆盖（ADR-004）；② **写前本机留底**（存不下就中止，400）；
+   ③ `expectedDigest` 乐观锁（不符即 409，绝不静默覆盖）+ 返回真实 unified diff 供人审。
+   **Agent 侧口径一字未改**：`remote_edit` / `remote_write_file` / `remote_run_command`
+   仍恒 REVIEW，`remote_grep` 恒 REVIEW，只读类恒 SAFE。
+3. **审计只记元数据**（ADR-006）—— 新增 `remote.connection` / `remote.file`
+   只记 连接名 / 路径 / 动作 / 字节数 / 增删行 / 指纹 / 权限位 / 是否留底成败；
+   **远端文件正文、diff 正文、命令输出一个字符都不出机**（diff 只走端点响应、
+   `remote.edit` 事件与界面）。8 个既有 `tool.remote_*` 事件登记为**纯本地**（`upload=""`）：
+   它们带连接名、远端路径与本机留底绝对路径，属 ADR-006 明令外发之外的机器信息。
+4. **挂在同一道 `VIBE_REMOTE` 门上** —— `VIBE_REMOTE=0`（默认）时**无端点、
+   无页签、无事件、无新工具**，行为与改造前**逐字节一致**。一次只活动一条连接
+   （`POST /api/remote/open` 换连接 = 关旧开新），不做多连接并发工作面。
 
 ### `POST /api/run` 的 `refs`（P0-A）
 
@@ -264,6 +348,13 @@ LSP 只做三件事：**看看有什么诊断、跳到定义、改名**。三条
    `[]`）。ConPTY 任一 API 探不到就**降级为管道模式**（`mode:"pipe"`，无 TTY 语义、
    `resize` 为 no-op），并在 `/api/term/open` 的 `fallbackReason` 里给出原因 ——
    界面据此说明，功能不崩。`VIBE_TERM=0` 时 `/api/term/open` 明确拒绝、界面隐藏入口。
+5. **条数不设上限（多标签）** —— 默认（`VIBE_TERM_MAX` 未设）可以开任意多个终端，
+   资源兜底交给**空闲回收**（30 分钟无输入自动收，`idle_seconds`）。显式配正整数
+   才回到有界模式（超了明确拒绝）。每个会话是独立的真进程 + 读线程，前端按
+   `termId` 分发 `term.data` / `term.exit`；**标签只是视图**，切标签不重建缓冲、
+   不动进程。列表端点 `GET /api/term` 只回元数据（id / mode / shell 名 / 尺寸 /
+   空闲秒数），**不含任何终端输出** —— 回滚缓冲只活在浏览器里，服务端从来没有过
+   正文（ADR-006）。
 
 ### 网页预览 / 自检（P1-11）的边界
 
@@ -284,8 +375,33 @@ LSP 只做三件事：**看看有什么诊断、跳到定义、改名**。三条
    能力），不是 500 —— 与 LSP / MCP / 终端同范式，界面据此提示「需桌面端」。
 3. **基线只落 host 侧、审计不记内容** —— 基线写进 `.vibe/visual/`（模型经
    PathGuard 写不进该目录），差异是**粗粒度提示**（分块均色差，非像素级判定）。
+4. **草稿预览（P1-2）是「内容来自模型、但不落盘」的那一个例外** ——
+   `GET /preview-draft/<token>/…` 的正文取自 `ApprovalRequest.draft`，即
+   `plan_patch` / `plan_overwrite` **只算不写**的结果。它被四条边界夹住：
+   token 随机且只在内存、绑定单次审批、审批解决（放行/拒绝/超时）即撤销、
+   响应与原文件预览同 CSP；审计只记 `preview.draft`（token 指纹 + 路径 + 字节数），
+   **不记正文**。任何「把草稿落到磁盘再预览」的实现都违反 ADR-004，不要那样做。
    审计 `visual.check` 只记 `{url_digest, width, height, diff_ratio,
    baseline_missing, ms}`，**不记截图内容**（ADR-006）。
+5. **真实应用预览（P2）是全项目唯一放宽 CSP 的地方，且只放宽一条** ——
+   预览面板可指向用户自己起的本机 dev server（`http://127.0.0.1:<port>`）。
+   隔离**不来自** CSP 而来自**跨源**：该帧是另一个源，读不到 `/api/*`、读不到
+   父页 DOM、拿不到令牌。因此界面 CSP 只把 `frame-src` 从 `'self'` 放宽到
+   `'self' http://127.0.0.1:*`（`csp_with_external_preview()` **从 `CSP` 派生**，
+   不手抄第二份），其余指令与 `/preview/` 的 `connect-src 'none'` 一律不动。
+   门控 `VIBE_PREVIEW_EXTERNAL` **默认关**：关着时界面 CSP 逐字节不变、端点 403。
+   iframe 加 `sandbox="allow-scripts allow-same-origin allow-forms"`（不含
+   `allow-top-navigation` / `allow-popups` / `allow-modals`）。
+   **能力边界要说清**：跨源读不到页面内部错误（`onerror`），也读不到标题；
+   该帧**不参与**自动刷新（dev server 自带 HMR）与截图自检（不把外部页面当基线）。
+6. **远端预览（P3）不新增放宽点，只多一条出站转发** —— `ssh -L` 把远端设备的
+   `127.0.0.1:<remotePort>` 映射到本机 `127.0.0.1:<随机端口>`，再交给上面那个
+   跨源帧。三条硬边界：`-L` 规格两端由 `transport.forward_argv()` **拼死**为环回
+   （用户只能给整数端口，`-L 8080:10.0.0.5:6379` 这种输入在类型层面就不成立）；
+   本地监听只绑 `127.0.0.1`；**不用 `-N`**，而是建会话跑 `cat >/dev/null` ——
+   父进程一死，内核关掉 stdin 管道，ssh 读到 EOF 退出，本地监听随之消失
+   （孤儿不是"事后清理"，而是"不可能存在"）。生命周期靠**引用计数**：
+   关标签 / 页面卸载（`pagehide` 带 keepalive）/ 会话结束三处都会释放。
 
 ### 多 Agent 编排（M3）的三条边界
 
@@ -311,6 +427,10 @@ SESSION_READY = "session.ready"
 RUN_STARTED = "run.started"
 RUN_ITERATION = "run.iteration"
 RUN_ASSISTANT_DELTA = "run.assistant_delta"
+# 模型思考（reasoning）的增量：与 assistant_delta 同定位（**纯呈现**，不落盘、
+# 不进会话库）。支持 reasoning_content 的上游（DeepSeek-R1 系、部分自建网关）
+# 才有此事件；上游不返回思考时这条事件根本不会出现。
+RUN_REASONING_DELTA = "run.reasoning_delta"
 RUN_TOOL_CALL = "run.tool_call"
 RUN_TOOL_RESULT = "run.tool_result"
 # 命令流式输出：`run_command` 子进程边跑边回显的增量片段。与 delta 同定位 ——
@@ -336,6 +456,40 @@ TEST_FINISHED = "test.finished"
 # 一条独立通道，不是 Agent 的一轮任务（详见模块头的「交互式终端」边界）。
 TERM_DATA = "term.data"
 TERM_EXIT = "term.exit"
+# 客户端自动更新（M9）。同样与 `run.*` 分开：检查/下载不是 Agent 的一轮任务，
+# 而是壳在启动时或在菜单里发起的一次本机维护动作。`update.staged` 只带
+# staging 路径 —— 壳据此做形态校验后自己 spawn 安装器（核永不执行安装）。
+UPDATE_AVAILABLE = "update.available"
+UPDATE_PROGRESS = "update.progress"
+UPDATE_STAGED = "update.staged"
+UPDATE_APPLIED = "update.applied"
+UPDATE_FAILED = "update.failed"
+# 后台 / 并行 Agent（M9-D）。同样与 `run.*` 分开：后台任务是**用户本人**经
+# 界面发起的一次独立任务（不是 Agent 的一轮），结果异步回传。`task.state`
+# 只带 `taskId` / `state` / `summary` —— **不含任务正文与结论**（ADR-006）。
+TASK_STATE = "task.state"
+# 定时任务调度（M10）。与 `task.state` 分开：`task.state` 说的是「这次任务跑得
+# 怎么样」，`schedule.state` 说的是「这个定时任务本身发生了什么」（被创建/改/
+# 启停/到点投出/补跑跳过）。同样只带元数据，**不含 prompt 正文**（ADR-006）。
+SCHEDULE_STATE = "schedule.state"
+# 远程设备文件工作面（M11）。同样与 `run.*` 分开：打开连接、浏览远端目录、查看 /
+# 保存远端文件是**用户本人**经面板发起的动作，不是 Agent 的一轮任务。
+# `remote.state` 只带连接与浏览位置的元数据（含能力降级项），**不含文件正文**；
+# `remote.edit` 带真实 unified diff 供界面审阅 —— 与本地 `run.approval.preview.body`
+# 同一条口径（diff 属「供人审的改动内容」），**不进审计、不落盘**（ADR-006）。
+REMOTE_STATE = "remote.state"
+REMOTE_EDIT = "remote.edit"
+# 预览自动刷新（P0）：文件监听检出变化后广播「哪些文件动了」，界面据此决定
+# 要不要重载已打开的预览标签。**只带相对路径，不带任何内容**（ADR-006），
+# 因此可以直接进事件流；它也不写审计链（只有计数类事件才落链）。
+# 注意这条事件**不是** `run.*`：变化来源可能是用户在编辑器里手动保存，
+# 与 Agent 是否在跑无关。
+PREVIEW_CHANGED = "preview.changed"
+# 远端预览转发（P3 / ADR-040）：`ssh -L` 的**状态机**变化（starting / up /
+# reconnecting / down / closed）。载荷是转发的元数据（连接名、两个端口、
+# 本地 URL、重连次数、错误摘要），**不含任何被转发的字节**（ADR-006）。
+# 界面据它显示「已连接 / 正在重连 / 已断开」，而不是让用户对着一片白猜。
+PREVIEW_TUNNEL = "preview.tunnel"
 
 # ---- 审批决定 --------------------------------------------------------------
 DECISIONS = ("approve", "approve_all", "deny", "deny_all")

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- 零构建静态控制台（M8）：不引用任何外部资源（无 CDN / 无框架），
+       全靠同源脚本与样式；CSP 已锁死 default-src 'self'，外链本就加载不了。
+       **页面内不含任何脚本逻辑**：一律走 /console/assets/app.js（ES 模块），
+       所有事件监听在 JS 里 addEventListener —— 内联脚本与内联事件会被 CSP 拦掉。 -->
+  <title>控制台 · Vibe 治理面</title>
+  <link rel="stylesheet" href="/console/assets/console.css">
+</head>
+<body>
+  <div id="app" hidden>
+    <aside class="sidebar">
+      <div class="brand">Vibe 治理面</div>
+      <nav id="nav" class="nav"></nav>
+      <footer class="me">
+        <div class="me-info">
+          <div id="me-name" class="me-name"></div>
+          <div id="me-email" class="me-email"></div>
+        </div>
+        <button id="logout" type="button" class="btn ghost">退出登录</button>
+      </footer>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <h1 id="panel-title">概览</h1>
+        <span id="status" class="status" role="status" aria-live="polite"></span>
+      </header>
+      <section id="panel" class="panel"></section>
+    </main>
+  </div>
+
+  <div id="boot" class="boot">正在加载控制台…</div>
+
+  <script type="module" src="/console/assets/app.js"></script>
+</body>
+</html>

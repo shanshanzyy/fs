@@ -217,6 +217,67 @@ class Store(ABC):
         """原子地占用一次使用额度。返回 False 表示已用尽。"""
 
     @abstractmethod
+    def list_enrollments(self, *, team_id: str = "") -> list[Row]:
+        """列出邀请码台账（M8 控制台）。**永不含 token_hash** ——
+        列表只需要「给哪个团队、何时过期、用了几次」，哈希没有展示价值。"""
+
+    # ============================================================== 客户端发布（M9）
+    @abstractmethod
+    def insert_release(
+        self,
+        release_id: str,
+        *,
+        channel: str,
+        version: str,
+        platform: str,
+        arch: str,
+        url: str,
+        sha256: str,
+        size: int,
+        notes: str,
+        mandatory: bool,
+        min_version: str,
+        rollout_percent: int,
+        seq: int,
+        signature: str,
+        signature_alg: str,
+        pubkey_kid: str,
+        created_by: str,
+        now: int,
+    ) -> Row:
+        """登记一条客户端发布版本。台账是**追加式**的：同一 version 允许再次登记
+        （回退旧版本时正是这么做），查询侧永远取 seq 最大的一条。"""
+
+    @abstractmethod
+    def list_releases(
+        self,
+        *,
+        channel: str = "",
+        platform: str = "",
+        arch: str = "",
+        include_revoked: bool = False,
+        limit: int = 100,
+    ) -> list[Row]:
+        """列出发布台账（M9 控制台）。默认按 seq 倒序、排除已撤销。"""
+
+    @abstractmethod
+    def get_release(self, release_id: str) -> Row | None: ...
+
+    @abstractmethod
+    def latest_release(
+        self, *, channel: str, platform: str, arch: str, now: int
+    ) -> Row | None:
+        """取某 (channel, platform, arch) 下 seq 最大且未撤销的一条。"""
+
+    @abstractmethod
+    def next_release_seq(self) -> int:
+        """返回下一个全局单调递增的发布序号（当前最大值 + 1）。"""
+
+    @abstractmethod
+    def revoke_release(self, release_id: str, now: int) -> bool:
+        """撤销一条发布。返回 False 表示不存在或已撤销。"""
+
+    @abstractmethod
     def revoke_access_jti(self, jti: str, expires_at: int, now: int) -> None: ...
 
     @abstractmethod

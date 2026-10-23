@@ -310,6 +310,95 @@ class SessionRefsTests(RefHarness):
         self._wait(lambda: any("引用未解析" in note for note in session._notices))
 
 
+class RemoteRefTests(RefHarness):
+    """`@remote/...` 引用：只走宿主注入的解析器，绝不回退本地路径。
+
+    这是「右键远端文件加入对话」的后端承接面（M12/M13）。三条不变式：
+
+    1. 没有解析器（VIBE_REMOTE 关）时**降级为提示**，不能把同名的本机文件
+       当远端内容读进来；
+    2. 注入了解析器时，正文原样进块、仍受字符预算约束；
+    3. 远端不支持 `symbol`（符号扫描只在本机索引上做）。
+    """
+
+    def test_remote_ref_degrades_without_resolver(self) -> None:
+        result = self._resolve([{"type": "file", "value": "@remote/devbox/a.py"}])
+        self.assertEqual(result.refs, [])
+        self.assertIn("VIBE_REMOTE", result.errors[0])
+
+    def test_remote_ref_uses_injected_resolver(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def resolver(rtype: str, value: str) -> tuple[str, str]:
+            calls.append((rtype, value))
+            return value, "---8<--- 文件内容开始\nremote = 1\n---8<--- 文件内容结束"
+
+        result = self._resolve(
+            [{"type": "file", "value": "@remote/devbox/src/a.py"}],
+            remote_resolver=resolver,
+        )
+        self.assertEqual(calls, [("file", "@remote/devbox/src/a.py")])
+        self.assertEqual(result.refs[0].label, "@remote/devbox/src/a.py")
+        self.assertIn("remote = 1", result.refs[0].body)
+
+    def test_remote_folder_ref_and_budget_share_local_budget(self) -> None:
+        def resolver(rtype: str, value: str) -> tuple[str, str]:
+            return value, "x" * 200
+
+        result = self._resolve(
+            [{"type": "folder", "value": "@remote/devbox/src"}],
+            max_chars=50,
+            remote_resolver=resolver,
+        )
+        self.assertTrue(result.truncated)
+        self.assertEqual(len(result.refs[0].body), 50)
+
+    def test_remote_symbol_is_rejected(self) -> None:
+        result = self._resolve(
+            [{"type": "symbol", "value": "@remote/devbox/a.py::Foo"}],
+            remote_resolver=lambda rtype, value: ("", "body"),
+        )
+        self.assertEqual(result.refs, [])
+        self.assertIn("只支持 file / folder", result.errors[0])
+
+    def test_remote_failure_does_not_block_local_ref(self) -> None:
+        from agent_core.errors import ToolError
+
+        def resolver(rtype: str, value: str) -> tuple[str, str]:
+            raise ToolError("远端不可达")
+
+        self._write("ok.py", PY_SAMPLE)
+        result = self._resolve(
+            [
+                {"type": "file", "value": "@remote/devbox/a.py"},
+                {"type": "file", "value": "ok.py"},
+            ],
+            remote_resolver=resolver,
+        )
+        self.assertEqual([ref.value for ref in result.refs], ["ok.py"])
+        self.assertIn("远端不可达", result.errors[0])
+
+    def test_build_refs_prompt_passes_resolver_through(self) -> None:
+        prompt, resolution = build_refs_prompt(
+            self.guard,
+            "看一下远端那个文件",
+            [{"type": "file", "value": "@remote/devbox/a.py"}],
+            remote_resolver=lambda rtype, value: (value, "remote body"),
+        )
+        self.assertTrue(resolution.ok)
+        self.assertIn("[引用上下文]", prompt)
+        self.assertIn("remote body", prompt)
+
+
+class SessionRemoteRefTests(RefHarness):
+    """会话层：未启用远端路由时**不注入**解析器（引用按提示降级）。"""
+
+    def test_no_resolver_when_remote_disabled(self) -> None:
+        config = Config.load(self.ws)
+        session = Session(config, client=object())
+        self.assertIsNone(session._remote_ref_resolver())
+
+
 class ValidateRefsTests(unittest.TestCase):
     """`/api/run` 的 refs 形状校验 —— 前端 bug 应 400，而不是静默丢弃。"""
 

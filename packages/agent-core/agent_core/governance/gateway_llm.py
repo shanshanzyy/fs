@@ -19,6 +19,7 @@ ADR-007 的客户端落地：**客户端永不持有云端 API Key**。
 
 from __future__ import annotations
 
+import inspect
 import json
 import urllib.error
 import urllib.parse
@@ -135,6 +136,8 @@ class GatewayLLMClient:
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         on_delta=None,
+        on_reasoning=None,
+        should_stop=None,
     ) -> ChatResponse:
         """流式版 chat()：SSE 透传链路（客户端 ← 网关 ← 上游）。
 
@@ -170,7 +173,10 @@ class GatewayLLMClient:
                     raise LLMError(f"网关返回的不是合法 JSON: {exc}") from exc
             try:
                 content, tool_calls_raw, finish_reason, usage = consume_chat_sse(
-                    response, on_delta=on_delta
+                    response,
+                    on_delta=on_delta,
+                    on_reasoning=on_reasoning,
+                    should_stop=should_stop,
                 )
             except TimeoutError as exc:
                 raise LLMError(
@@ -499,6 +505,8 @@ class GovernedClient:
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
         on_delta=None,
+        on_reasoning=None,
+        should_stop=None,
     ) -> ChatResponse:
         """流式版 chat()，降级语义与 chat() 完全一致。
 
@@ -509,11 +517,23 @@ class GovernedClient:
         if self._failed or self.primary is None:
             if self.fallback is None:
                 raise LLMError("主模型不可用，且没有配置本地回退模型")
-            return self._delegate_fallback_stream(messages, tools, temperature, on_delta)
+            return self._delegate_fallback_stream(
+                messages,
+                tools,
+                temperature,
+                on_delta,
+                on_reasoning,
+                should_stop,
+            )
 
         try:
             response = self.primary.chat_stream(
-                messages, tools=tools, temperature=temperature, on_delta=on_delta
+                messages,
+                tools=tools,
+                temperature=temperature,
+                on_delta=on_delta,
+                on_reasoning=on_reasoning,
+                should_stop=should_stop,
             )
             route = getattr(self.primary, "last_route", None)
             if isinstance(route, RouteInfo):
@@ -539,7 +559,14 @@ class GovernedClient:
             )
             if note not in self.notices:
                 self.notices.append(note)
-            return self._delegate_fallback_stream(messages, tools, temperature, on_delta)
+            return self._delegate_fallback_stream(
+                messages,
+                tools,
+                temperature,
+                on_delta,
+                on_reasoning,
+                should_stop,
+            )
 
     def _delegate_fallback_stream(
         self,
@@ -547,13 +574,29 @@ class GovernedClient:
         tools: list[dict[str, Any]] | None,
         temperature: float | None,
         on_delta,
+        on_reasoning=None,
+        should_stop=None,
     ) -> ChatResponse:
         stream_fn = getattr(self.fallback, "chat_stream", None)
         try:
             if callable(stream_fn):
-                return stream_fn(
-                    messages, tools=tools, temperature=temperature, on_delta=on_delta
-                )
+                kwargs: dict[str, Any] = {
+                    "tools": tools,
+                    "temperature": temperature,
+                    "on_delta": on_delta,
+                    "on_reasoning": on_reasoning,
+                }
+                # 回退客户端可能是旧式实现：探测一次，避免 TypeError 把
+                # 「停止按钮」变成「任务失败」。
+                try:
+                    accepts = "should_stop" in inspect.signature(
+                        stream_fn
+                    ).parameters
+                except (TypeError, ValueError):
+                    accepts = False
+                if accepts:
+                    kwargs["should_stop"] = should_stop
+                return stream_fn(messages, **kwargs)
             return self.fallback.chat(messages, tools=tools, temperature=temperature)  # type: ignore[no-any-return]
         except LLMError as exc:
             raise LLMError(
