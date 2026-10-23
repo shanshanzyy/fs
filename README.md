@@ -22,18 +22,27 @@
 的服务都可以 —— 本机 Ollama / vLLM / LM Studio / llama.cpp，或公司内网的推理服务。
 本项目**不带模型权重**，也不替你申请 API Key。
 
-### 二、方式一：双击安装（推荐给同事）
+### 二、方式一：下载即用（推荐给同事）
 
-1. 拿到维护者打出的 `VibeAgent-Setup-<版本>.exe`（打法是
-   `python scripts/build_desktop.py --backend --installer`，见下文「CI 与发版」）。
-2. 双击安装。默认装到 `%LOCALAPPDATA%\Programs\VibeAgent`，**无需管理员权限**；
-   安装包已内嵌后端二进制，目标机器**不需要装 Python**。
-3. 首次启动 → 右上「设置」→「模型设置」：填 `接入地址`（例 `http://10.0.1.50:8002/v1`）、
+**在 [Releases](https://github.com/shanshanzyy/fs/releases) 下载对应版本：**
+
+| 产物 | 适用 | 用法 |
+|---|---|---|
+| `VibeAgent-<版本>-win-x64-portable.zip` | 所有 Windows 10/11 x64 | 解压到任意可写目录 → 双击 `VibeAgent.exe` |
+| `VibeAgent-Setup-<版本>.exe`（若该版次提供） | 同上 | 双击安装，默认落 `%LOCALAPPDATA%\Programs\VibeAgent` |
+
+两者功能一致，**后端二进制已内嵌，目标机器不需要装 Python / Node，也不需要管理员权限**。
+便携版注意别解压到受系统策略限制的目录（如某些同步盘、只读共享）。
+
+1. 解压 / 安装后启动客户端。
+2. 右上「设置」→「模型设置」：填 `接入地址`（例 `http://10.0.1.50:8002/v1`）、
    `模型`（例 `deepseek-v4-flash`）、`API Key`（本地服务可随便填）→ 保存，立即生效。
-4. 选择工作区（本地目录，或先经「远程设备」连上的远端目录）→ 开始对话。
+3. 选择工作区（本地目录，或先经「远程设备」连上的远端目录）→ 开始对话。
 
-> 分发形态就是**拷一个安装包**：不用装 Python、Node，也不用管理员权限。
+> 分发形态就是**拷一个压缩包**：不用装 Python、Node，也不用管理员权限。
 > 壳的配置落 `%APPDATA%\VibeAgent\`，工作区资产落 `<工作区>\.vibe\`。
+> 未签名的内部构建，首次运行可能遇到 SmartScreen 提示 —— 选「更多信息 → 仍要运行」。
+
 
 ### 三、方式二：从源码跑（开发者）
 
