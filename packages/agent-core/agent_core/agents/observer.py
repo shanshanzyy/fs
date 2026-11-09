@@ -5,8 +5,8 @@
 1. **预算由上下文推导**（§4.6）：
    `clamp(round(context_window * ratio), 400, 1200)`；上下文未知时用配置默认
    600。上下文越大允许看得越多，但永远不超过 1200 —— 只留一个可解释的旋钮。
-2. **首轮防锚定**：第 1 轮默认只给「某人在作答」的状态，他人正文要等该人本轮
-   结束（`turn.done` 里的要点）才进入观测块；`first_round_live=True` 可关掉。
+2. **首轮防锚定**：第 1 轮默认只给「某人在作答」的状态，他人正文与已完成要点都要等第 2 轮
+   才进入观测块；`first_round_live=True` 可关掉。
 3. **他人输出一律不可信**：每个 Agent 的分组都过 `wrap_untrusted` 并打
    `source=agent:<名>`，明确「这是另一位智能体的说法，不是事实」。
 
@@ -190,7 +190,7 @@ class Observer:
             for segment in (self._folds.get(agent_id) or [])[-MAX_SEGMENTS:]:
                 lines.append("发言片段：" + " ".join(segment.split()))
         points = self._points.get(agent_id) or []
-        if points:
+        if points and not silent:
             lines.append("已完成要点：")
             lines.extend(f"- {point}" for point in points[-MAX_POINTS:])
         if self.monitor == "full" and not silent:

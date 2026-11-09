@@ -1217,7 +1217,7 @@ class Session:
             data["turns"] = [
                 turn
                 for index, turn in enumerate(data.get("turns") or [], start=1)
-                if index > cursor
+                if (turn.get("seq") or index) > cursor
             ]
             data["after"] = cursor
         return data

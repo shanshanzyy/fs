@@ -7219,7 +7219,7 @@ function renderDiscussion() {
   $('disc-live-state').className = `chip${running ? ' is-running' : ''}`;
   $('disc-live-rounds').textContent = `${discRounds(data)}/${data.maxRounds || 0} 轮`;
   $('btn-disc-stop').hidden = !running;
-  $('btn-disc-resume').hidden = running || state === 'consensus';
+  $('btn-disc-resume').hidden = !['stopped', 'interrupted'].includes(state);
   // 结论出口（E）：终态即可用 —— 没有汇总结论时后端会回退到立场依据清单，
   // 仍在跑时置灰（后端对 running 一律 400）。
   $('btn-disc-insert').disabled = running;
@@ -7234,6 +7234,15 @@ function renderDiscussion() {
       final.appendChild(el('div', 'disc-turn-obs', '（汇总失败，已降级为规则合并）'));
     }
   }
+  const issues = data.issues || [];
+  if (issues.length) {
+    const open = issues.filter((item) => item.state === 'open');
+    final.appendChild(el('div', 'disc-turn-obs', `问题：${issues.length - open.length} 已解决 / ${open.length} 待解决`));
+    for (const item of issues) {
+      final.appendChild(el('div', 'disc-turn-obs', `${item.state === 'resolved' ? '已解决' : '待解决'} · ${item.id}：${item.text}`));
+    }
+  }
+  if (data.terminationReason) final.appendChild(el('div', 'disc-turn-obs', `终止原因：${data.terminationReason}`));
   renderFeed(data);
 }
 

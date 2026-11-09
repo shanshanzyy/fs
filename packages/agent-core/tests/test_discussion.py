@@ -109,7 +109,7 @@ class DiscussionHarness(unittest.TestCase):
 
 
 class TerminationTests(DiscussionHarness):
-    def test_unanimous_consensus(self) -> None:
+    def test_first_round_agreement_is_not_consensus(self) -> None:
         engine, _ = self._engine(
             [
                 _json_turn("agree", ["采用方案 A"]),
@@ -118,8 +118,8 @@ class TerminationTests(DiscussionHarness):
             ]
         )
         discussion = self._start(engine)
-        self.assertEqual(discussion.state, "consensus")
-        self.assertEqual(discussion.termination_reason, "unanimous")
+        self.assertEqual(discussion.state, "no_consensus")
+        self.assertEqual(discussion.termination_reason, "max_rounds")
         self.assertEqual(discussion.final_answer, "最终结论：达成一致，采用方案 A。")
         self.assertEqual(len(discussion.basis), 2)
         self.assertFalse(discussion.summary_degraded)
@@ -141,7 +141,7 @@ class TerminationTests(DiscussionHarness):
         self.assertTrue(discussion.disagreements)
         self.assertIn("回滚", discussion.disagreements[0])
 
-    def test_unverified_basis_blocks_consensus(self) -> None:
+    def test_first_round_with_bad_evidence_is_not_consensus(self) -> None:
         bad = [{"path": "missing.py", "line": 1, "quote": "不存在的话"}]
         engine, _ = self._engine(
             [
@@ -152,7 +152,7 @@ class TerminationTests(DiscussionHarness):
         )
         discussion = self._start(engine)
         self.assertEqual(discussion.state, "no_consensus")
-        self.assertEqual(discussion.termination_reason, "unverified_basis")
+        self.assertEqual(discussion.termination_reason, "max_rounds")
         self.assertFalse(discussion.turns[0].evidence[0].verified)
         self.assertEqual(discussion.turns[0].evidence[0].reason, "unreadable")
 
@@ -228,7 +228,7 @@ class TerminationTests(DiscussionHarness):
             ]
         )
         discussion = self._start(engine)
-        self.assertEqual(discussion.state, "consensus")
+        self.assertEqual(discussion.state, "no_consensus")
         self.assertTrue(discussion.summary_degraded)
         self.assertIn("规则汇总", discussion.final_answer)
 
@@ -261,7 +261,7 @@ class PersistenceTests(DiscussionHarness):
             ]
         )
         final = resumed.resume(discussion.id)
-        self.assertEqual(final.state, "consensus")
+        self.assertEqual(final.state, "no_consensus")
         self.assertEqual([turn.agent_id for turn in final.turns], ["a", "b"])
         self.assertEqual(final.turns[0].turn_id, stored.turns[0].turn_id)
 
@@ -304,7 +304,7 @@ class SpeakerPolicyTests(DiscussionHarness):
         )
         discussion = self._start(engine, speaker_policy="moderator_selects")
         self.assertEqual(discussion.turns[0].agent_id, "b")
-        self.assertEqual(discussion.state, "consensus")
+        self.assertEqual(discussion.state, "no_consensus")
         self.assertEqual(client.calls, 4)
 
     def test_select_falls_back_to_fixed_order(self) -> None:
@@ -459,7 +459,7 @@ class ObserverTests(unittest.TestCase):
         text = self._observer(monitor="full").build(round_no=2)
         self.assertIn("原始增量片段", text)
 
-    def test_first_round_is_silent_but_points_still_arrive(self) -> None:
+    def test_first_round_hides_completed_points(self) -> None:
         self._delta(text="首轮正文" * 80, round_no=1)
         self.bus.publish(
             "turn.done",
@@ -471,7 +471,7 @@ class ObserverTests(unittest.TestCase):
         )
         text = self._observer(monitor="live").build(round_no=1)
         self.assertNotIn("首轮正文", text, "首轮不该看到他人正文")
-        self.assertIn("采用方案 A", text, "本轮结束后的要点应可见")
+        self.assertNotIn("采用方案 A", text, "首轮必须隐藏已完成要点")
 
     def test_first_round_live_switch_opens_body(self) -> None:
         self._delta(text="首轮正文" * 80, round_no=1)
@@ -707,3 +707,109 @@ class ConclusionPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConsensusRevisionTests(DiscussionHarness):
+    def _confirmation(self, proposal, **extra):
+        return _json_turn("agree", ["采用已有方案"], proposalId=proposal, claimType="judgment", **extra)
+
+    def test_same_proposal_after_independent_round_reaches_consensus(self):
+        engine, _ = self._engine([
+            _json_turn("agree", ["方案 A"]), _json_turn("agree", ["方案 B"]),
+            self._confirmation("fixed/r1/a"), self._confirmation("fixed/r1/a"), "汇总",
+        ])
+        result = self._start(engine, discussion_id="fixed", max_rounds=2)
+        self.assertEqual(result.state, "consensus")
+        self.assertEqual(len(result.turns), 4)
+
+    def test_different_proposals_do_not_reach_consensus(self):
+        engine, _ = self._engine([
+            _json_turn("agree", ["方案 A"]), _json_turn("agree", ["方案 B"]),
+            self._confirmation("fixed/r1/a"), self._confirmation("fixed/r1/b"), "汇总",
+        ])
+        self.assertEqual(self._start(engine, discussion_id="fixed", max_rounds=2).state, "no_consensus")
+
+    def test_fact_without_evidence_blocks_consensus(self):
+        engine, _ = self._engine([
+            _json_turn("agree", ["A"]), _json_turn("agree", ["B"]),
+            _json_turn("agree", ["事实"], proposalId="fixed/r1/a"),
+            _json_turn("agree", ["事实"], proposalId="fixed/r1/a"), "汇总",
+        ])
+        self.assertEqual(self._start(engine, discussion_id="fixed", max_rounds=2).termination_reason, "unverified_basis")
+
+    def test_user_constraints_reach_every_speaker(self):
+        engine, _ = self._engine([self._confirmation("x"), self._confirmation("x")])
+        discussion = Discussion(id="fixed", topic="test", participants=["a", "b"], moderator="m")
+        engine._active = discussion
+        engine.interject("必须兼容 Python 3.10")
+        engine._run_turn(discussion, "a", 1)
+        self.assertFalse(discussion.user_messages[0]["delivered"])
+        engine._run_turn(discussion, "b", 1)
+        self.assertEqual(discussion.user_messages[0]["deliveredTo"], ["a", "b"])
+        self.assertTrue(discussion.user_messages[0]["delivered"])
+
+    def test_resume_uses_deleted_profile_snapshot(self):
+        engine, _ = self._engine([_json_turn("agree", ["A"])], should_stop=lambda: True)
+        discussion = self._start(engine)
+        resumed, _ = self._engine([_json_turn("agree", ["A"]), _json_turn("agree", ["B"]), "汇总"])
+        resumed.profiles.clear()
+        result = resumed.resume(discussion.id)
+        self.assertEqual(result.state, "no_consensus")
+        self.assertEqual(resumed.profiles["a"].name, "甲")
+
+    def test_call_budget_ends_without_summary_request(self):
+        from unittest.mock import patch
+        engine, client = self._engine([_json_turn("agree", ["A"])])
+        with patch("agent_core.agents.discussion.MAX_MODEL_CALLS", 1):
+            result = self._start(engine)
+        self.assertEqual(result.termination_reason, "call_budget")
+        self.assertEqual(client.calls, 1)
+
+
+class IssueRevisionTests(DiscussionHarness):
+    def test_only_owner_can_resolve_objection_with_reason(self):
+        from agent_core.agents.discussion import Turn
+        discussion = Discussion(id="d", topic="t", participants=["a", "b"])
+        discussion.turns = [
+            Turn("d/r1/a", "a", 1, rebuttals=["缺少回滚"]),
+            Turn("d/r2/b", "b", 2, changed_by=["已修复"], resolved_issues=["d/r1/a/issue1"]),
+        ]
+        self.assertEqual(discussion.issues()[0]["state"], "open")
+        discussion.turns.append(Turn("d/r2/a", "a", 2, stance="agree"))
+        self.assertEqual(discussion.issues()[0]["state"], "open")
+        discussion.turns[-1].changed_by = ["已补充回滚设计"]
+        discussion.turns[-1].resolved_issues = ["d/r1/a/issue1"]
+        self.assertEqual(discussion.issues()[0]["state"], "resolved")
+
+    def test_evidence_wrong_line_and_empty_quote_are_unverified(self):
+        result = verify_evidence([
+            Evidence("notes.md", 2, "采用方案 A"), Evidence("notes.md", 1, "")
+        ], self.ws)
+        self.assertFalse(any(item.verified for item in result))
+
+
+class BudgetAndSummaryTests(DiscussionHarness):
+    def test_zero_time_budget_stops_before_model_call(self):
+        from unittest.mock import patch
+        engine, client = self._engine([])
+        with patch("agent_core.agents.discussion.DISCUSSION_TIMEOUT", 0):
+            result = self._start(engine)
+        self.assertEqual(result.termination_reason, "timeout")
+        self.assertEqual(client.calls, 0)
+
+    def test_moderator_receives_rule_and_objections(self):
+        engine, client = self._engine([
+            _json_turn("disagree", ["A"], rebuttals=["缺少回滚"]),
+            _json_turn("agree", ["B"]), "汇总",
+        ])
+        captured = []
+        original = client.chat
+        def chat(messages, **kwargs):
+            captured.append(str(messages))
+            return original(messages, **kwargs)
+        client.chat = chat
+        result = self._start(engine)
+        self.assertIn("no_consensus", captured[-1])
+        self.assertIn("max_rounds", captured[-1])
+        self.assertIn("缺少回滚", captured[-1])
+        self.assertTrue(result.disagreements)

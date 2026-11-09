@@ -276,8 +276,8 @@ class DiscussionHttpTests(unittest.TestCase):
         self.assertEqual(payload["state"], "running")
 
         final = self._wait_terminal(discussion_id)
-        self.assertEqual(final["state"], "consensus")
-        self.assertEqual(final["terminationReason"], "unanimous")
+        self.assertEqual(final["state"], "no_consensus")
+        self.assertEqual(final["terminationReason"], "max_rounds")
         self.assertEqual(len(final["turns"]), 2)
 
         # 列表：摘要里有这一场，且不含 turns 正文
@@ -302,7 +302,6 @@ class DiscussionHttpTests(unittest.TestCase):
             "discussion.round",
             "discussion.turn_started",
             "discussion.turn",
-            "discussion.consensus",
             "discussion.finished",
         ):
             self.assertIn(expected, types)
@@ -444,7 +443,7 @@ class DiscussionHttpTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         final = self._wait_terminal(discussion_id)
-        self.assertEqual(final["state"], "consensus")
+        self.assertEqual(final["state"], "no_consensus")
         self.assertEqual(len(final["turns"]), 2)
         self.assertEqual(final["turns"][1]["agentId"], b)
         # 续跑不重复记 start
@@ -503,7 +502,7 @@ class DiscussionHttpTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         discussion_id = payload["discussionId"]
         final = self._wait_terminal(discussion_id)
-        self.assertEqual(final["state"], "consensus")
+        self.assertEqual(final["state"], "no_consensus")
         status, state = self._request("GET", "/api/state")
         self.assertEqual(status, 200)
         return discussion_id, state["sessionId"]
