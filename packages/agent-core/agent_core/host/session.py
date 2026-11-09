@@ -622,6 +622,7 @@ class Session:
         self._collaboration_constraints = constraints
         self._collaboration = None
         self._collaboration_lock = threading.RLock()
+        self._collaboration_approval_lock = threading.Lock()
         self.agent = Agent(
             config=config,
             registry=self.registry,
@@ -4736,7 +4737,7 @@ class Session:
             preview = "\n".join(f"{task_id}/{item['name']} · {item['bytes']} bytes · {item['sha256']}" for task_id, _, item in manifest)
             request = ApprovalRequest(tool="collaboration_deliver", arguments={"projectId": key, "destination": str(target)},
                 risk=Risk.REVIEW, reason="交付已经验收的协作成果", preview=ToolPreview(kind="text", body=preview, summary="创建新版本交付目录"))
-            with self._collaboration_lock:
+            with self._collaboration_approval_lock:
                 return self._approve(request) in {"approve", "approve_all"}
         return service.deliver(key, approve, self.agent.paths.check_write)
 
@@ -4751,7 +4752,7 @@ class Session:
             if self._collaboration is None:
                 def approve(request):
                     # Existing approval UI has a single active card; serialize it.
-                    with self._collaboration_lock:
+                    with self._collaboration_approval_lock:
                         return self._approve(request)
                 def emit(event):
                     self.bus.publish(event)

@@ -497,6 +497,13 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "chars": "int",
     },
     "multiagent.stop": {"discussion_id": "str", "rounds": "int"},
+    # 通用协作执行（M15）。只收项目/任务归属 id 与状态枚举；
+    # 目标描述、子任务说明与产出正文不出机（ADR-006）。
+    "collaboration.state": {
+        "project_id": "str",
+        "task_id": "str",
+        "state": "str",
+    },
     # 上下文裁剪（C4）。只收「压掉了几条」与「摘要多长」——
     # 摘要**正文**必然引述对话里的约束、路径与命令原文，属于 ADR-006 的正文类，
     # 客户端也不会把它放进载荷。

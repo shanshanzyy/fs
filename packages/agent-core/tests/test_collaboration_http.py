@@ -64,3 +64,30 @@ class CollaborationHttpTests(unittest.TestCase):
                 self.assertFalse((root / '.vibe/collaborations').exists())
             finally:
                 host.shutdown()
+
+    def test_pending_approval_does_not_block_project_queries(self):
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = HostServer(Config.load(root, collaboration_enabled=True, index_watch=False, memory_enabled=False), port=0, client=Client())
+            entered, release, queried = threading.Event(), threading.Event(), threading.Event()
+            try:
+                session = host.ctx.session
+                def approve(request):
+                    entered.set()
+                    release.wait(3)
+                    return 'deny'
+                session._approve = approve
+                service = session.collaboration_service()
+                worker = threading.Thread(target=lambda: service.runner.approver(None))
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                query = threading.Thread(target=lambda: (session.collaboration_service().list(), queried.set()))
+                query.start()
+                self.assertTrue(queried.wait(1), 'query blocked behind pending approval')
+            finally:
+                release.set()
+                worker.join(3)
+                query.join(3)
+                session.close()
+                host._server.server_close()

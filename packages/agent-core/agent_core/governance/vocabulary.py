@@ -1110,6 +1110,17 @@ _RULES: dict[str, Rule] = {
         },
         note="用户停止讨论的元数据：讨论 id 与停在第几轮",
     ),
+    # 通用协作执行（M15）：项目/任务状态迁移的元数据。只记归属 id 与状态枚举，
+    # 目标描述、子任务说明、产出正文一个字符都不出机（ADR-006）。
+    "collaboration.state": Rule(
+        upload="collaboration.state",
+        fields={
+            "project_id": ("project_id", "str"),
+            "task_id": ("task_id", "str"),
+            "state": ("state", "str"),
+        },
+        note="协作项目/任务一次状态迁移：项目 id、任务 id（项目级为空）与状态枚举",
+    ),
     # ---------------------------------------------------------------- 上下文裁剪
     "context.compact": Rule(
         upload="context.compact",

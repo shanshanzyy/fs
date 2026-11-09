@@ -106,6 +106,11 @@ const S = {
   changesMode: 'session',  // 改动面板视图：'session'（本会话）| 'git'（相对 git，P0-C）
   git: null,               // 最近一次 /api/git/status 的结果（Git 面板与改动面板共用）
   refs: [],                // 已选引用（P0-A）：[{type, value}]，随 /api/run 一起提交
+  // 回答模式（M15）：'single' 走 /api/run（原行为）；'multi' 先出分工计划再执行。
+  // enabled 由 applySession 按 info.collaboration.enabled 门控（关闭时控件不渲染）。
+  compMode: 'single',
+  collabEnabled: false,
+  collabPlanning: false,   // 正在生成分工计划（POST /api/collaborations 尚未返回）
   treePayload: null,       // 最近一次 /api/tree 的结果（远端根展开时重渲染要用）
   // 已加入工作区的远端根（M12）：GET /api/remote/roots 的 roots。
   // 工作区树把它们渲染成本地根之后的顶级节点，右键「加入 / 移出工作区」改的就是它。
@@ -353,6 +358,17 @@ function applySession(info) {
   const collabAct = document.querySelector('.act[data-panel="collaborations"]');
   if (collabAct) collabAct.hidden = !info.collaboration?.enabled;
   if (!info.collaboration?.enabled && S.activePanel === 'collaborations') switchPanel('explorer');
+  // 对话框里的单 / 多智能体切换同理：协作执行关闭时整个控件不渲染，
+  // 已选的多智能体模式回落到单智能体，避免留下一个看不见却生效的状态。
+  S.collabEnabled = !!info.collaboration?.enabled;
+  const compMode = $('comp-mode');
+  if (compMode) {
+    compMode.hidden = !S.collabEnabled;
+    if (!S.collabEnabled) S.compMode = 'single';
+    for (const btn of compMode.querySelectorAll('.mode-btn')) {
+      btn.classList.toggle('is-active', btn.dataset.mode === S.compMode);
+    }
+  }
   const multiOn = !!(info.multiAgent && info.multiAgent.enabled);
   S.agents.enabled = multiOn;
   S.discussion.enabled = multiOn;
@@ -6070,7 +6086,7 @@ function acceptSkillPop(index = skillPop.index) {
 }
 
 function syncSendState() {
-  $('btn-send').disabled = S.running || !$('input').value.trim();
+  $('btn-send').disabled = S.running || S.collabPlanning || !$('input').value.trim();
 }
 
 function closeMention() {
@@ -6279,7 +6295,9 @@ function autoGrow() {
 async function send() {
   const input = $('input');
   const text = input.value.trim();
-  if (!text || S.running) return;
+  if (!text || S.running || S.collabPlanning) return;
+  // 多智能体（M15）：同一个输入框，先出分工计划；用户在对话流里审阅后才执行。
+  if (S.compMode === 'multi' && S.collabEnabled) { await sendMultiAgent(text); return; }
   const refs = S.refs.slice();     // 失败时要把引用一并还回去
   input.value = '';
   S.refs = [];
@@ -10689,21 +10707,40 @@ async function boot() {
 boot();
 
 
-// M15: durable collaboration projects; explicit plan review before execution.
+/* ═════════════ 多智能体协作（M15） ═════════════
+   任务统一在底部输入框发起：选「多智能体」后先生成分工计划，计划以卡片形式
+   留在对话流里；用户审阅（可修订）后点「确认执行」才真正开跑，全部任务通过
+   独立验收后再点「审查并交付」落盘（交付沿用 REVIEW 审批）。
+   左侧「协作记录」只读 —— 不再发起任务，也不再承载操作按钮。 */
+
+const COLLAB_TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'blocked']);
+const COLLAB_STATE_TEXT = {
+  draft: '待审阅', running: '执行中', succeeded: '已通过验收',
+  failed: '执行失败', cancelled: '已取消', interrupted: '已中断', blocked: '被阻塞',
+};
+const COLLAB_TASK_TEXT = {
+  pending: '待执行', running: '执行中', succeeded: '已完成',
+  failed: '失败', cancelled: '已取消', interrupted: '已中断', blocked: '阻塞',
+};
+
 let collabCurrent = null;
 let collabRefreshing = false;
+
+/* ---------- 左侧：只读协作记录 ---------- */
 async function refreshCollaborations(id) {
   if (collabRefreshing) return;
   collabRefreshing = true;
   try {
     const response = await api.get('/api/collaborations');
     const list = $('collab-list');
+    if (!list) return;
     list.replaceChildren();
     for (const project of response.projects || []) {
-      const button = el('button', 'btn btn-small', `${project.goal.slice(0, 45)} · ${project.state}`);
+      const button = el('button', 'btn btn-small', `${project.goal.slice(0, 45)} · ${COLLAB_STATE_TEXT[project.state] || project.state}`);
       button.onclick = () => selectCollaboration(project);
       list.appendChild(button);
     }
+    if (!(response.projects || []).length) list.appendChild(el('p', 'empty', '还没有协作记录'));
     const selected = (response.projects || []).find((project) => project.id === (id || collabCurrent?.id));
     if (selected) {
       collabCurrent = selected;
@@ -10714,20 +10751,19 @@ async function refreshCollaborations(id) {
 }
 function selectCollaboration(project) {
   collabCurrent = project;
-  $('collab-goal').value = project.goal;
-  $('collab-tasks').value = JSON.stringify(project.tasks.map(({id, goal, role, dependsOn, resources, outputs, acceptance, timeout}) =>
-    ({id, goal, role, dependsOn, resources, outputs, acceptance, timeout})), null, 2);
   renderCollaboration();
 }
 function renderCollaboration() {
   const project = collabCurrent;
-  if (!project) return;
   const detail = $('collab-detail');
-  detail.replaceChildren(el('p', '', `版本 ${project.revision} · ${project.state}`));
+  if (!detail) return;
+  detail.replaceChildren();
+  if (!project) return;
+  detail.appendChild(el('p', '', `版本 ${project.revision} · ${COLLAB_STATE_TEXT[project.state] || project.state}`));
   if (project.delivery) detail.appendChild(el('p', '', `交付目录：${project.delivery}`));
   for (const task of project.tasks) {
     const card = el('div', 'disc-turn');
-    card.appendChild(el('b', '', `${task.id} · ${task.role} · ${task.state} · 第 ${task.attempt} 次`));
+    card.appendChild(el('b', '', `${task.id} · ${task.role} · ${COLLAB_TASK_TEXT[task.state] || task.state} · 第 ${task.attempt} 次`));
     card.appendChild(el('p', '', task.goal));
     card.appendChild(el('p', '', `依赖：${task.dependsOn.join(', ') || '无'}；资源：${task.resources.join(', ') || '独立'}`));
     if (task.error) card.appendChild(el('p', '', task.error));
@@ -10746,29 +10782,331 @@ function renderCollaboration() {
     detail.appendChild(card);
   }
 }
-async function collabAction(action, body = {}) {
-  if (!collabCurrent) throw new Error('请先选择协作项目');
-  await api.post(`/api/collaborations/${collabCurrent.id}/${action}`, body);
-  await refreshCollaborations();
+/* ---------- 对话流：发起 → 计划卡 → 审阅 → 执行 → 交付 ---------- */
+async function sendMultiAgent(text) {
+  const input = $('input');
+  const refs = S.refs.slice();
+  input.value = '';
+  S.refs = [];
+  renderRefs();
+  closeMention();
+  autoGrow();
+  syncSendState();
+  addUser(text);
+  const view = addCollaborationCard(null);
+  view.goal = text;
+  const ok = await requestPlan(view);
+  // 规划失败把问题还回输入框，用户改完可直接重发
+  if (!ok) {
+    input.value = text;
+    S.refs = refs;
+    renderRefs();
+    autoGrow();
+    syncSendState();
+  }
 }
-$('collab-plan').onclick = async () => {
-  const button = $('collab-plan'); button.disabled = true;
+
+/* 规划请求本身可能失败（模型输出不是合法 JSON / 网络错误）：
+   卡片留在原地给出「重新生成 / 手动填写计划」，不让用户白打一遍目标。 */
+async function requestPlan(view) {
+  view.planning = true;
+  view.failed = '';
+  view.editor.hidden = true;
+  S.collabPlanning = true;
+  syncSendState();
+  renderCollaborationCard(view);
   try {
-    const project = await api.post('/api/collaborations', {goal: $('collab-goal').value, requestId: crypto.randomUUID()});
-    selectCollaboration(project); await refreshCollaborations(project.id);
-  } catch (error) { toast(error.message, 'error'); }
-  finally { button.disabled = false; }
-};
-$('collab-refresh').onclick = () => refreshCollaborations();
-for (const action of ['start', 'stop', 'deliver']) $('collab-' + action).onclick = async () => {
-  try { await collabAction(action); } catch (error) { toast(error.message, 'error'); }
-};
-$('collab-save').onclick = async () => {
-  try { await collabAction('revise', {tasks: JSON.parse($('collab-tasks').value), revision: collabCurrent?.revision}); }
-  catch (error) { toast(error.message, 'error'); }
-};
-$('collab-send').onclick = async () => {
-  try { await collabAction('message', {text: $('collab-message').value}); $('collab-message').value = ''; }
-  catch (error) { toast(error.message, 'error'); }
-};
+    view.project = await api.post('/api/collaborations', { goal: view.goal, requestId: crypto.randomUUID() });
+    view.planning = false;
+    renderCollaborationCard(view);
+    refreshCollaborations(view.project.id);
+    return true;
+  } catch (error) {
+    view.planning = false;
+    view.failed = error.message;
+    renderCollaborationCard(view);
+    toast(error.message, 'error');
+    return false;
+  } finally {
+    S.collabPlanning = false;
+    syncSendState();
+  }
+}
+
+function planTemplate(goal) {
+  return JSON.stringify([{
+    id: 'analyze',
+    goal: `分析并给出可执行方案：${String(goal).slice(0, 120)}`,
+    role: '分析者',
+    dependsOn: [],
+    resources: [],
+    outputs: ['analysis.md'],
+    acceptance: ['覆盖目标中的关键要求', '明确步骤、风险与待确认项'],
+    timeout: 300,
+  }], null, 2);
+}
+
+function addCollaborationCard(project) {
+  hideChatWelcome();
+  const node = block('collab');
+  const card = el('div', 'collab-card');
+  const head = el('div', 'collab-card-head');
+  const badge = el('span', 'collab-badge', '多智能体分工计划');
+  const stateText = el('span', 'collab-state');
+  head.append(badge, stateText);
+  const idText = el('div', 'collab-id');
+  const list = el('ol', 'collab-task-list');
+  const actions = el('div', 'collab-actions');
+  const editor = el('div', 'collab-edit');
+  editor.hidden = true;
+  const area = document.createElement('textarea');
+  area.rows = 10;
+  area.spellcheck = false;
+  const editActions = el('div', 'collab-actions');
+  const save = el('button', 'btn btn-primary btn-small', '保存修订');
+  const cancelEdit = el('button', 'btn btn-small', '放弃编辑');
+  save.type = 'button';
+  cancelEdit.type = 'button';
+  editActions.append(save, cancelEdit);
+  editor.append(area, editActions,
+    el('p', 'collab-hint', '按 JSON 修改任务字段；保存后版本 +1，并重新回到待审阅。'));
+  const note = el('div', 'collab-note');
+  card.append(head, idText, list, actions, editor, note);
+  node.appendChild(card);
+  const view = { node, card, project: project || null, goal: project?.goal || '', planning: !project, stateText, idText, list, actions, editor, area, note, save, failed: '', cancelled: false, delivering: false, timer: 0 };
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const tasks = JSON.parse(area.value);
+      if (view.project) {
+        view.project = await api.post(`/api/collaborations/${view.project.id}/revise`, { tasks, revision: view.project.revision });
+      } else {
+        // 规划失败后的手动兜底：同一个接口，直接带上 tasks 建项目（仍为草稿，等待审阅）
+        view.project = await api.post('/api/collaborations', { goal: view.goal, tasks, requestId: crypto.randomUUID() });
+        view.failed = '';
+      }
+      view.planning = false;
+      view.editor.hidden = true;
+      view.cancelled = false;
+      renderCollaborationCard(view);
+      toast('计划已更新', 'ok');
+      refreshCollaborations(view.project.id);
+    } catch (error) { toast(error.message, 'error'); }
+    finally { save.disabled = false; }
+  };
+  cancelEdit.onclick = () => { editor.hidden = true; };
+  renderCollaborationCard(view);
+  scrollToEnd(true);
+  return view;
+}
+
+function renderCollaborationCard(view) {
+  const project = view.project;
+  view.actions.replaceChildren();
+  view.note.className = 'collab-note';
+  view.note.textContent = '';
+  if (!project) {
+    view.stateText.textContent = view.planning ? '规划中…' : '规划失败';
+    view.stateText.dataset.state = view.planning ? 'planning' : 'failed';
+    view.idText.textContent = view.planning ? '正在拆解任务分工，请稍候…' : `原因：${view.failed}`;
+    view.list.replaceChildren();
+    if (!view.planning) {
+      const retry = el('button', 'btn btn-primary btn-small', '重新生成');
+      retry.type = 'button';
+      retry.onclick = () => requestPlan(view);
+      const manual = el('button', 'btn btn-small', '手动填写计划');
+      manual.type = 'button';
+      manual.onclick = () => openPlanEditor(view);
+      view.actions.append(retry, manual);
+      view.note.textContent = '模型没能给出可用的分工计划；可以重试，或按模板手写任务后再审阅。';
+    }
+    return;
+  }
+  const state = view.cancelled ? 'cancelled' : project.state;
+  view.stateText.textContent = `${COLLAB_STATE_TEXT[state] || state} · 版本 ${project.revision}`;
+  view.stateText.dataset.state = state;
+  view.idText.textContent = `项目 ${project.id}`;
+  view.list.replaceChildren(...project.tasks.map((task) => {
+    const li = el('li', 'collab-task');
+    li.dataset.state = task.state || 'pending';
+    const taskHead = el('div', 'collab-task-head');
+    taskHead.append(
+      el('b', '', task.id),
+      el('span', 'collab-role', task.role || '执行者'),
+      el('span', 'collab-task-state', COLLAB_TASK_TEXT[task.state] || task.state || ''),
+    );
+    li.appendChild(taskHead);
+    li.appendChild(el('div', 'collab-task-goal', task.goal));
+    const meta = [];
+    if (task.dependsOn?.length) meta.push(`依赖 ${task.dependsOn.join('、')}`);
+    if (task.resources?.length) meta.push(`资源 ${task.resources.join('、')}`);
+    if (task.outputs?.length) meta.push(`产出 ${task.outputs.join('、')}`);
+    if (task.acceptance?.length) meta.push(`验收 ${task.acceptance.join('；')}`);
+    if (meta.length) li.appendChild(el('div', 'collab-task-meta', meta.join(' · ')));
+    if (task.error) li.appendChild(el('div', 'collab-task-meta is-error', task.error));
+    return li;
+  }));
+  if (view.cancelled) {
+    view.note.textContent = '已取消，未执行这份分工计划（对应记录仍保留在左侧协作记录中）。';
+    return;
+  }
+  if (project.state === 'draft') {
+    const start = el('button', 'btn btn-primary btn-small', '确认执行');
+    start.type = 'button';
+    start.onclick = () => startCollaboration(view, start);
+    const edit = el('button', 'btn btn-small', '编辑计划');
+    edit.type = 'button';
+    edit.onclick = () => openPlanEditor(view);
+    const cancel = el('button', 'btn btn-small', '取消');
+    cancel.type = 'button';
+    cancel.onclick = () => {
+      view.cancelled = true;
+      view.editor.hidden = true;
+      stopCollaborationPoll(view);
+      renderCollaborationCard(view);
+    };
+    view.actions.append(start, edit, cancel);
+    view.note.textContent = '确认后才会开始执行；执行中的写盘动作仍会单独弹审批。';
+    return;
+  }
+  if (project.state === 'running') {
+    const stop = el('button', 'btn btn-small', '停止');
+    stop.type = 'button';
+    stop.onclick = () => stopCollaboration(view, stop);
+    view.actions.append(stop);
+    view.note.textContent = '正在按依赖顺序推进；相同资源的任务会串行。';
+    return;
+  }
+  if (project.state === 'succeeded') {
+    if (project.delivery) {
+      view.note.textContent = `已交付：${project.delivery}`;
+      return;
+    }
+    const deliver = el('button', 'btn btn-primary btn-small', view.delivering ? '等待审批…' : '审查并交付');
+    deliver.type = 'button';
+    deliver.disabled = view.delivering;
+    deliver.onclick = () => deliverCollaboration(view, deliver);
+    const edit = el('button', 'btn btn-small', '编辑计划');
+    edit.type = 'button';
+    edit.disabled = view.delivering;
+    edit.onclick = () => openPlanEditor(view);
+    view.actions.append(deliver, edit);
+    view.note.textContent = '全部任务已通过独立验收。交付会创建新的版本目录，并再次弹审批。';
+    return;
+  }
+  // failed / interrupted / cancelled（服务端）/ blocked：允许修订后重跑
+  const retry = el('button', 'btn btn-primary btn-small', '重新执行');
+  retry.type = 'button';
+  retry.onclick = () => startCollaboration(view, retry);
+  const edit = el('button', 'btn btn-small', '编辑计划');
+  edit.type = 'button';
+  edit.onclick = () => openPlanEditor(view);
+  view.actions.append(retry, edit);
+  view.note.textContent = `当前状态：${COLLAB_STATE_TEXT[project.state] || project.state}。可以先修订计划再重新执行。`;
+}
+
+function openPlanEditor(view) {
+  if (view.project) {
+    view.area.value = JSON.stringify(view.project.tasks.map(({ id, goal, role, dependsOn, resources, outputs, acceptance, timeout }) =>
+      ({ id, goal, role, dependsOn, resources, outputs, acceptance, timeout })), null, 2);
+  } else {
+    view.area.value = planTemplate(view.goal);
+  }
+  view.editor.hidden = false;
+  // 卡片在对话流里可能已顶到可视区以下：把「保存修订」也带进视野，
+  // 免得编辑框展开了、按钮却被底部输入区挡住（看起来像点不动）。
+  view.area.focus();
+  view.save.scrollIntoView({ block: 'center' });
+}
+
+async function startCollaboration(view, button) {
+  if (!view.project) return;
+  button.disabled = true;
+  button.textContent = '启动中…';
+  try {
+    view.project = await api.post(`/api/collaborations/${view.project.id}/start`, {});
+    view.editor.hidden = true;
+    view.cancelled = false;
+    renderCollaborationCard(view);
+    scheduleCollaborationPoll(view);
+    refreshCollaborations(view.project.id);
+  } catch (error) {
+    toast(error.message, 'error');
+    button.disabled = false;
+    button.textContent = '确认执行';
+  }
+}
+
+async function stopCollaboration(view, button) {
+  if (!view.project) return;
+  button.disabled = true;
+  try {
+    await api.post(`/api/collaborations/${view.project.id}/stop`, {});
+    scheduleCollaborationPoll(view);
+  } catch (error) {
+    toast(error.message, 'error');
+    button.disabled = false;
+  }
+}
+
+async function deliverCollaboration(view, button) {
+  if (!view.project) return;
+  view.delivering = true;
+  button.disabled = true;
+  button.textContent = '等待审批…';
+  view.note.className = 'collab-note';
+  view.note.textContent = '已弹出交付审批，确认后写入 collaboration-deliveries/。';
+  try {
+    await api.post(`/api/collaborations/${view.project.id}/deliver`, {});
+    view.project = await api.get(`/api/collaborations/${view.project.id}`);
+    view.delivering = false;
+    renderCollaborationCard(view);
+    toast('已交付', 'ok');
+    refreshCollaborations(view.project.id);
+  } catch (error) {
+    view.delivering = false;
+    renderCollaborationCard(view);
+    view.note.className = 'collab-note is-error';
+    view.note.textContent = error.message;
+    toast(error.message, 'error');
+  }
+}
+
+/* 轮询只覆盖「执行中」这一段：到终态就停，避免离开页签后还在空转。 */
+function scheduleCollaborationPoll(view) {
+  if (view.timer || !view.project) return;
+  view.timer = setInterval(async () => {
+    if (!view.project) { stopCollaborationPoll(view); return; }
+    try {
+      const project = await api.get(`/api/collaborations/${view.project.id}`);
+      view.project = project;
+      renderCollaborationCard(view);
+      if (COLLAB_TERMINAL.has(project.state)) {
+        stopCollaborationPoll(view);
+        refreshCollaborations(project.id);
+      }
+    } catch (error) {
+      stopCollaborationPoll(view);
+    }
+  }, 1500);
+}
+
+function stopCollaborationPoll(view) {
+  if (view.timer) { clearInterval(view.timer); view.timer = 0; }
+}
+
+/* ---------- 输入区的单 / 多智能体切换 ---------- */
+for (const button of document.querySelectorAll('#comp-mode .mode-btn')) {
+  button.onclick = () => {
+    S.compMode = button.dataset.mode === 'multi' ? 'multi' : 'single';
+    for (const item of document.querySelectorAll('#comp-mode .mode-btn')) {
+      item.classList.toggle('is-active', item === button);
+    }
+    $('input').placeholder = S.compMode === 'multi'
+      ? '描述要交给多智能体团队完成的任务…（Enter 生成分工计划，审阅后再执行）'
+      : '描述你想让 Agent 做的事…（Enter 发送，@ 引用文件/符号/目录）';
+    $('input').focus();
+  };
+}
+if ($('collab-refresh')) $('collab-refresh').onclick = () => refreshCollaborations();
 setInterval(() => { if (S.activePanel === 'collaborations') refreshCollaborations(); }, 2500);

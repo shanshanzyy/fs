@@ -1725,3 +1725,49 @@ body[data-mode="solo"]:not(.has-open-tab) .bottom-panel.is-collapsed { flex: 0 0
 .disc-list-topic { font: 12px/1.4 var(--sans); color: var(--fg); }
 .disc-list-meta { font-size: 11px; color: var(--fg-faint); }
 
+/* ── 回答模式（M15）：单智能体 / 多智能体 ── */
+.comp-mode { width: fit-content; margin: 0 0 6px 1px; }
+
+/* ── 对话流内的分工计划卡（M15）：审阅 → 执行 → 交付 ── */
+.block-collab { white-space: normal; }
+.collab-card {
+  border: 1px solid #2c4a77; border-radius: 10px; padding: 9px 11px;
+  background: var(--panel-2); font: 12.5px/1.55 var(--sans); word-break: break-word;
+}
+.collab-card-head { display: flex; align-items: center; gap: 8px; }
+.collab-badge {
+  padding: 1px 8px; border-radius: 9px; background: var(--accent-soft);
+  color: var(--accent); font-size: 11px; font-weight: 600; white-space: nowrap;
+}
+.collab-state { margin-left: auto; font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+.collab-state[data-state="running"] { color: var(--accent); }
+.collab-state[data-state="succeeded"] { color: var(--ok); }
+.collab-state[data-state="failed"] { color: var(--danger); }
+.collab-id { margin-top: 1px; font: 10.5px/1.5 var(--mono); color: var(--fg-faint); word-break: break-all; }
+.collab-task-list {
+  list-style: none; margin: 7px 0; padding: 0;
+  display: flex; flex-direction: column; gap: 5px;
+}
+.collab-task { border-left: 2px solid var(--line); padding: 3px 0 3px 9px; }
+.collab-task[data-state="running"] { border-left-color: var(--accent); }
+.collab-task[data-state="succeeded"] { border-left-color: var(--ok); }
+.collab-task[data-state="failed"] { border-left-color: var(--danger); }
+.collab-task[data-state="interrupted"],
+.collab-task[data-state="blocked"] { border-left-color: var(--warn); }
+.collab-task-head { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); }
+.collab-task-head b { color: var(--fg); font-weight: 600; }
+.collab-role { padding: 0 6px; border-radius: 8px; background: var(--raise); font-size: 10.5px; color: var(--fg-dim); }
+.collab-task-state { margin-left: auto; font-size: 10.5px; color: var(--fg-faint); }
+.collab-task-goal { margin-top: 2px; color: var(--fg); }
+.collab-task-meta { margin-top: 1px; font-size: 11px; color: var(--fg-faint); }
+.collab-task-meta.is-error { color: var(--danger); }
+.collab-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.collab-note { margin-top: 6px; font-size: 11.5px; color: var(--fg-faint); white-space: pre-wrap; }
+.collab-note.is-error { color: var(--danger); }
+.collab-hint { margin: 4px 0 0; font-size: 11px; color: var(--fg-faint); }
+.collab-edit textarea {
+  width: 100%; box-sizing: border-box; margin-top: 2px;
+  background: var(--raise); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font: 11.5px/1.55 var(--mono); resize: vertical;
+}
+

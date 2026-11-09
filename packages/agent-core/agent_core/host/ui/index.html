@@ -119,18 +119,10 @@
     </div>
 
     <section class="sb-body" data-body="collaborations" hidden>
-      <div class="sb-caption">多智能体协作执行</div>
-      <label>任务目标<textarea id="collab-goal" rows="4" placeholder="描述需要共同完成的目标"></textarea></label>
-      <button class="btn btn-small" id="collab-plan">生成分工计划</button>
-      <button class="btn btn-small" id="collab-refresh">刷新</button>
-      <p class="empty">先审查计划再执行。首版支持隔离文本成果；写入沿用审批。</p>
-      <label>任务计划（JSON，可修改）<textarea id="collab-tasks" rows="12"></textarea></label>
-      <button class="btn btn-small" id="collab-save">保存计划修订</button>
-      <button class="btn btn-small" id="collab-start">执行 / 重试</button>
-      <button class="btn btn-small" id="collab-stop">停止</button>
-      <button class="btn btn-small" id="collab-deliver">审查并交付</button>
-      <label>补充要求<textarea id="collab-message" rows="2"></textarea></label>
-      <button class="btn btn-small" id="collab-send">补充并停止，修订后执行</button>
+      <!-- 这里只做「记录」，不再发起任务：任务统一在底部对话框输入，
+           发送前选单 / 多智能体，分工计划回到对话流里审阅。 -->
+      <div class="sb-caption">协作记录 <button class="btn btn-small" id="collab-refresh">刷新</button></div>
+      <p class="empty">发起任务请在底部输入框选择「多智能体」，计划会出现在对话流里。</p>
       <div id="collab-list"></div>
       <div id="collab-detail"></div>
     </section>
@@ -663,6 +655,14 @@
       </div>
       <!-- 已选中的引用（P0-A）：只存「意图」({type,value})，正文由后端经 PathGuard 解析 -->
       <div class="refs-bar" id="refs-bar" hidden></div>
+      <!-- 回答模式（M15）：单智能体 = 现有行为；多智能体 = 先出分工计划，审阅后再执行。
+           仅在 VIBE_COLLABORATION=1 时渲染，关闭时连这个控件都不存在。 -->
+      <div class="mode-switch comp-mode" id="comp-mode" role="group" aria-label="回答模式" hidden>
+        <button class="mode-btn is-active" type="button" data-mode="single"
+                title="由单个 Agent 直接完成，和原来完全一致">单智能体</button>
+        <button class="mode-btn" type="button" data-mode="multi"
+                title="先给出多智能体分工计划，你确认后才会执行">多智能体</button>
+      </div>
       <div class="composer-box">
         <!-- `@` 引用候选浮层：绝对定位在输入框上方，避免把输入框往下顶 -->
         <div class="mention-pop" id="mention-pop" hidden>

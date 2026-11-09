@@ -1269,6 +1269,12 @@ def _sample_locals() -> dict[str, dict]:
             "discussion_id": "d1c2b3a4f5e6",
             "rounds": 1,
         },
+        "collaboration.state": {
+            "event": "collaboration.state",
+            "project_id": "1a2b3c4d5e6f",
+            "task_id": "6f5e4d3c2b1a",
+            "state": "running",
+        },
         "remote.connection": {
             "event": "remote.connection",
             "connection": "devbox",
