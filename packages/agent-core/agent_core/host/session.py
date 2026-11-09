@@ -619,6 +619,9 @@ class Session:
             client = self.governance.client
             constraints = self.governance.constraints
 
+        self._collaboration_constraints = constraints
+        self._collaboration = None
+        self._collaboration_lock = threading.RLock()
         self.agent = Agent(
             config=config,
             registry=self.registry,
@@ -823,6 +826,8 @@ class Session:
         与子进程不能跟着「丢」在进程里 —— 那会留下一串持续运行、无人使用的
         终端进程（见 terminal/manager 的 atexit 兜底）。
         """
+        if self._collaboration is not None:
+            self._collaboration.close()
         watcher, self.watcher = self.watcher, None
         if watcher is not None:
             watcher.stop()
@@ -2520,6 +2525,8 @@ class Session:
                 "enabled": True,
                 "activeId": self._discussion_active_id,
             }
+        if cfg.collaboration_enabled:
+            extra["collaboration"] = {"enabled": True}
         return {**base, **extra}
 
     def _remote_describe(self) -> dict[str, Any]:
@@ -4721,6 +4728,39 @@ class Session:
         self.bus.publish(P.event(P.SESSION_READY, **self.describe()))
 
     # ------------------------------------------------------------------ 审批
+    def collaboration_deliver(self, key):
+        service = self.collaboration_service()
+        if not self.agent.config.allow_write:
+            raise AgentError("当前会话不允许写入工作区")
+        def approve(project, manifest, target):
+            preview = "\n".join(f"{task_id}/{item['name']} · {item['bytes']} bytes · {item['sha256']}" for task_id, _, item in manifest)
+            request = ApprovalRequest(tool="collaboration_deliver", arguments={"projectId": key, "destination": str(target)},
+                risk=Risk.REVIEW, reason="交付已经验收的协作成果", preview=ToolPreview(kind="text", body=preview, summary="创建新版本交付目录"))
+            with self._collaboration_lock:
+                return self._approve(request) in {"approve", "approve_all"}
+        return service.deliver(key, approve, self.agent.paths.check_write)
+
+    def collaboration_service(self):
+        from ..collaboration import CollaborationService
+        from ..collaboration.agent import AgentRunner
+        if not self.agent.config.collaboration_enabled:
+            raise AgentError("协作执行未启用（VIBE_COLLABORATION=1）")
+        if self._is_remote_workspace():
+            raise AgentError("首版协作执行仅支持本地工作区")
+        with self._collaboration_lock:
+            if self._collaboration is None:
+                def approve(request):
+                    # Existing approval UI has a single active card; serialize it.
+                    with self._collaboration_lock:
+                        return self._approve(request)
+                def emit(event):
+                    self.bus.publish(event)
+                    self.agent.audit.record("collaboration.state", project_id=event["projectId"],
+                                            task_id=event["taskId"], state=event["taskState"] or event["state"])
+                self._collaboration = CollaborationService(self.agent.config.workspace,
+                    AgentRunner(self.agent, approve, self._collaboration_constraints), emit=emit)
+            return self._collaboration
+
     def _approve(self, request: ApprovalRequest) -> str:
         """审批会合点。运行在 Agent 工作线程上，会阻塞到这个函数被唤醒。"""
         # 失效安全之一：已被请求中断

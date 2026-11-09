@@ -1050,6 +1050,10 @@ class VibeHandler(BaseHTTPRequestHandler):
         # ---- 多智能体讨论（M14-C）：HTTP 面 + 事件 + 审计 ------------------
         # 与档案共用 `VIBE_MULTI_AGENT` 同一道门：关闭时 endpoint 一律 400，
         # 事件、工具与端点与未实现前逐字节一致（fail-closed）。
+        if path == "/api/collaborations" or path.startswith("/api/collaborations/"):
+            self._handle_collaborations(method, path)
+            return
+
         if path == "/api/discussions" or path.startswith("/api/discussions/"):
             self._handle_discussions(method, path, query)
             return
@@ -2141,6 +2145,60 @@ class VibeHandler(BaseHTTPRequestHandler):
             # 档案文件被手改坏也回 400（带文件路径的人话），不伪装成 500。
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
+    def _handle_collaborations(self, method, path):
+        from ..collaboration import CollaborationError
+        session = self.server.ctx.session
+        try:
+            service = session.collaboration_service()
+            parts = [part for part in path.split("/") if part]
+            if len(parts) == 2 and method == "GET":
+                self._send_json({"projects": service.list()})
+                return
+            if len(parts) == 2 and method == "POST":
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    raise CollaborationError("请求体必须是对象")
+                goal = body.get("goal", "")
+                tasks = body.get("tasks")
+                if tasks is None:
+                    if not isinstance(goal, str) or not 1 <= len(goal.strip()) <= 12000:
+                        raise CollaborationError("目标需为 1–12000 字")
+                    tasks = service.runner.plan(goal)
+                self._send_json(service.create(goal, tasks, body.get("requestId", "")))
+                return
+            if len(parts) == 3 and method == "GET":
+                self._send_json(service.get(parts[2]))
+                return
+            if len(parts) == 4 and method == "POST":
+                key, action = parts[2:]
+                if action == "start":
+                    result = service.start(key)
+                elif action == "stop":
+                    result = service.stop(key)
+                elif action == "deliver":
+                    result = session.collaboration_deliver(key)
+                elif action in {"revise", "message", "artifact"}:
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        raise CollaborationError("请求体必须是对象")
+                    if action == "artifact":
+                        file_path, artifact = service.artifact(key, body.get("taskId"), body.get("name"))
+                        if artifact["bytes"] > 200000:
+                            raise CollaborationError("预览最多支持 200 KB，请交付后查看文件")
+                        result = {"artifact": artifact, "text": file_path.read_text(encoding="utf-8", errors="replace")}
+                    elif action == "revise":
+                        result = service.revise(key, body.get("tasks"), body.get("revision"))
+                    else:
+                        result = service.message(key, body.get("text"))
+                else:
+                    self._send_json({"error": "未知协作动作"}, status=404)
+                    return
+                self._send_json(result)
+                return
+            self._send_json({"error": "不支持的方法或路径"}, status=405)
+        except (CollaborationError, AgentError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=400)
+
     def _handle_discussions(
         self, method: str, path: str, query: dict[str, list[str]]
     ) -> None:
@@ -3213,6 +3271,8 @@ class HostServer:
     def shutdown(self) -> None:
         self.ctx.shutdown.set()
         self.session.interrupt()
+        if self.session._collaboration is not None:
+            self.session._collaboration.close()
         self._server.shutdown()
         self._server.server_close()
         if self.store is not None:

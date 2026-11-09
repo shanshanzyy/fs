@@ -378,6 +378,7 @@ class Config:
     # 工具清单与配置快照与未实现前**逐字节一致**。
     # 智能体档案落 `<workspace>/.vibe/agents.json`（恒随工作区）；讨论面结构只读
     # （复用 `build_readonly_registry()` 白名单），写盘仍回主 Agent 走审批漏斗。
+    collaboration_enabled: bool = False
     multi_agent_enabled: bool = False
     # 实时互监（B2）：监控档位、观测预算、举手次数上限、首轮是否放开正文
     multi_agent_monitor: str = "live"
@@ -656,6 +657,7 @@ class Config:
                 "VIBE_SCHEDULER_CATCHUP", cls.scheduler_catch_up
             ),
             # 多智能体讨论（M14）：默认关，启用后才暴露 /api/agents 与讨论端点
+            collaboration_enabled=_env_bool("VIBE_COLLABORATION", cls.collaboration_enabled),
             multi_agent_enabled=_env_bool("VIBE_MULTI_AGENT", cls.multi_agent_enabled),
             multi_agent_monitor=_env_str("VIBE_MULTI_AGENT_MONITOR", cls.multi_agent_monitor),
             multi_agent_observe_chars=_env_int(

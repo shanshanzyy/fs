@@ -105,6 +105,7 @@
       <svg viewBox="0 0 16 16"><path d="M2 2.5h8a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H6.5L4 10.5v-2H2a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1zm9 2h1a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-1v2l-2.5-2H7v-1h4.5a.5.5 0 0 0 .5-.5V5a.5.5 0 0 0-.5-.5H11V4.5a0 0 0 0 0 0 0z" fill="currentColor"/></svg>
       <em class="act-badge" id="act-badge-discussions" hidden>0</em>
     </button>
+    <button class="act" data-panel="collaborations" title="协作执行" hidden>协作</button>
     <span class="act-spring"></span>
     <button class="act" data-panel="welcome" title="开始（欢迎页）">
       <svg viewBox="0 0 16 16"><path d="M8 1.5 15 8l-7 6.5L1 8l7-6.5zM8 3.6 3.1 8 8 12.4 12.9 8 8 3.6zM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4z" fill="currentColor"/></svg>
@@ -116,6 +117,23 @@
     <div class="sb-head"><span id="sb-title">资源管理器</span>
       <button class="icon-btn" id="btn-tree-refresh" title="刷新">⟳</button>
     </div>
+
+    <section class="sb-body" data-body="collaborations" hidden>
+      <div class="sb-caption">多智能体协作执行</div>
+      <label>任务目标<textarea id="collab-goal" rows="4" placeholder="描述需要共同完成的目标"></textarea></label>
+      <button class="btn btn-small" id="collab-plan">生成分工计划</button>
+      <button class="btn btn-small" id="collab-refresh">刷新</button>
+      <p class="empty">先审查计划再执行。首版支持隔离文本成果；写入沿用审批。</p>
+      <label>任务计划（JSON，可修改）<textarea id="collab-tasks" rows="12"></textarea></label>
+      <button class="btn btn-small" id="collab-save">保存计划修订</button>
+      <button class="btn btn-small" id="collab-start">执行 / 重试</button>
+      <button class="btn btn-small" id="collab-stop">停止</button>
+      <button class="btn btn-small" id="collab-deliver">审查并交付</button>
+      <label>补充要求<textarea id="collab-message" rows="2"></textarea></label>
+      <button class="btn btn-small" id="collab-send">补充并停止，修订后执行</button>
+      <div id="collab-list"></div>
+      <div id="collab-detail"></div>
+    </section>
 
     <section class="sb-body" data-body="explorer">
       <div class="sb-caption">工作区</div>

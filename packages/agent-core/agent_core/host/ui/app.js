@@ -350,6 +350,9 @@ function applySession(info) {
   if (wsRemoteTab) wsRemoteTab.hidden = !remoteOn;
   // 多智能体（M14）：VIBE_MULTI_AGENT=0 时两个入口都不渲染；正在看的面板
   // 退回资源管理器 —— 与终端/定时任务/远程同一纪律，不留隐形的空壳页签。
+  const collabAct = document.querySelector('.act[data-panel="collaborations"]');
+  if (collabAct) collabAct.hidden = !info.collaboration?.enabled;
+  if (!info.collaboration?.enabled && S.activePanel === 'collaborations') switchPanel('explorer');
   const multiOn = !!(info.multiAgent && info.multiAgent.enabled);
   S.agents.enabled = multiOn;
   S.discussion.enabled = multiOn;
@@ -4454,6 +4457,7 @@ function switchPanel(name) {
   $('sidebar').style.display = showSidebar ? '' : 'none';
   $('sb-resizer').style.display = showSidebar ? '' : 'none';
   document.querySelectorAll('.sb-body').forEach((b) => { b.hidden = b.dataset.body !== name; });
+  if (name === 'collaborations') refreshCollaborations();
   if (name === 'changes') refreshChanges();
   if (name === 'git') refreshGit();
   if (name === 'audit') refreshAudit();
@@ -10683,3 +10687,88 @@ async function boot() {
 }
 
 boot();
+
+
+// M15: durable collaboration projects; explicit plan review before execution.
+let collabCurrent = null;
+let collabRefreshing = false;
+async function refreshCollaborations(id) {
+  if (collabRefreshing) return;
+  collabRefreshing = true;
+  try {
+    const response = await api.get('/api/collaborations');
+    const list = $('collab-list');
+    list.replaceChildren();
+    for (const project of response.projects || []) {
+      const button = el('button', 'btn btn-small', `${project.goal.slice(0, 45)} · ${project.state}`);
+      button.onclick = () => selectCollaboration(project);
+      list.appendChild(button);
+    }
+    const selected = (response.projects || []).find((project) => project.id === (id || collabCurrent?.id));
+    if (selected) {
+      collabCurrent = selected;
+      renderCollaboration();
+    }
+  } catch (error) { toast(error.message, 'error'); }
+  finally { collabRefreshing = false; }
+}
+function selectCollaboration(project) {
+  collabCurrent = project;
+  $('collab-goal').value = project.goal;
+  $('collab-tasks').value = JSON.stringify(project.tasks.map(({id, goal, role, dependsOn, resources, outputs, acceptance, timeout}) =>
+    ({id, goal, role, dependsOn, resources, outputs, acceptance, timeout})), null, 2);
+  renderCollaboration();
+}
+function renderCollaboration() {
+  const project = collabCurrent;
+  if (!project) return;
+  const detail = $('collab-detail');
+  detail.replaceChildren(el('p', '', `版本 ${project.revision} · ${project.state}`));
+  if (project.delivery) detail.appendChild(el('p', '', `交付目录：${project.delivery}`));
+  for (const task of project.tasks) {
+    const card = el('div', 'disc-turn');
+    card.appendChild(el('b', '', `${task.id} · ${task.role} · ${task.state} · 第 ${task.attempt} 次`));
+    card.appendChild(el('p', '', task.goal));
+    card.appendChild(el('p', '', `依赖：${task.dependsOn.join(', ') || '无'}；资源：${task.resources.join(', ') || '独立'}`));
+    if (task.error) card.appendChild(el('p', '', task.error));
+    if (task.summary) card.appendChild(el('pre', '', task.summary));
+    for (const artifact of task.artifacts || []) {
+      const preview = el('button', 'btn btn-small', `查看 ${artifact.name}（${artifact.bytes} 字节）`);
+      preview.onclick = async () => {
+        try {
+          const response = await api.post(`/api/collaborations/${project.id}/artifact`, {taskId: task.id, name: artifact.name});
+          const text = el('pre', '', response.text); card.appendChild(text);
+        } catch (error) { toast(error.message, 'error'); }
+      };
+      card.appendChild(preview);
+    }
+    if (task.validation) card.appendChild(el('pre', '', JSON.stringify(task.validation, null, 2)));
+    detail.appendChild(card);
+  }
+}
+async function collabAction(action, body = {}) {
+  if (!collabCurrent) throw new Error('请先选择协作项目');
+  await api.post(`/api/collaborations/${collabCurrent.id}/${action}`, body);
+  await refreshCollaborations();
+}
+$('collab-plan').onclick = async () => {
+  const button = $('collab-plan'); button.disabled = true;
+  try {
+    const project = await api.post('/api/collaborations', {goal: $('collab-goal').value, requestId: crypto.randomUUID()});
+    selectCollaboration(project); await refreshCollaborations(project.id);
+  } catch (error) { toast(error.message, 'error'); }
+  finally { button.disabled = false; }
+};
+$('collab-refresh').onclick = () => refreshCollaborations();
+for (const action of ['start', 'stop', 'deliver']) $('collab-' + action).onclick = async () => {
+  try { await collabAction(action); } catch (error) { toast(error.message, 'error'); }
+};
+$('collab-save').onclick = async () => {
+  try { await collabAction('revise', {tasks: JSON.parse($('collab-tasks').value), revision: collabCurrent?.revision}); }
+  catch (error) { toast(error.message, 'error'); }
+};
+$('collab-send').onclick = async () => {
+  try { await collabAction('message', {text: $('collab-message').value}); $('collab-message').value = ''; }
+  catch (error) { toast(error.message, 'error'); }
+};
+setInterval(() => { if (S.activePanel === 'collaborations') refreshCollaborations(); }, 2500);

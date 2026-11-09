@@ -297,3 +297,8 @@ python scripts/build_desktop.py --backend --installer
 - 桌面客户端需要 Node ≥ 20 与 Electron（仅一个 npm 依赖）
 - 若要接真实模型：Ollama / vLLM / 任意 OpenAI 兼容服务
 
+
+
+## M15 通用协作执行（首版）
+
+设置 `VIBE_COLLABORATION=1` 后，在桌面活动栏「协作」生成并审查分工计划，再并行执行。支持依赖调度、资源互斥、隔离文本成果、独立验收、停止重试和审批交付。首版尚不支持命令执行或外部应用操作；详细范围与限制见 [M15 实施说明](docs/M15-PLAN.md)。
