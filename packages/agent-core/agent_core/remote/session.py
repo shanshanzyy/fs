@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 from .connection import RemoteConnection
 from .errors import RemoteConfigError
-from .store import RemoteStore, store_path_for
+from .store import load_store
 from .workspace import RemoteWorkspace, close_transport, open_workspace
 
 # 远端改动台账里允许的动作枚举。与审计 `remote.file(action=...)` 同一套取值。
@@ -94,7 +94,7 @@ class RemoteSessions:
         机器上比报错严重得多。
         """
         with self._lock:
-            store = RemoteStore.load(store_path_for(self.config))
+            store = load_store(self.config)
             default = str(getattr(self.config, "remote_default", "") or "").strip()
             conn = store.resolve(name or default or None)
             self._swap(conn)
@@ -207,7 +207,7 @@ class RemoteSessions:
         整个界面（真正的坏清单原因由 `/api/remote/roots` 的 problems 展示）。
         """
         try:
-            store = RemoteStore.load(store_path_for(self.config))
+            store = load_store(self.config)
         except Exception:
             return []
         return [root.ns_path() for root in store.roots]

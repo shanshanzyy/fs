@@ -47,6 +47,16 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"环境变量 {name} 需要整数，实际收到: {raw!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"环境变量 {name} 需要小数，实际收到: {raw!r}") from exc
+
+
 # LSP 模式是枚举而不是布尔：三态（auto/on/off）里「探测不到」与「被关掉」
 # 是两种不同的降级原因，界面要分开显示，所以不能压成布尔。
 _LSP_MODES = ("auto", "on", "off")
@@ -362,6 +372,20 @@ class Config:
     # 不连补 N 次）；置 0 则只把 next_run_at 推到未来、不触发。
     scheduler_catch_up: bool = True
 
+    # --- 多智能体讨论（M14）---
+    # 默认**关**：开启后 host 才暴露 `/api/agents` 与 `/api/discussions` 端点，
+    # 界面才出现智能体 / 讨论页签。关着时无端点、无页签、无事件、无工具，
+    # 工具清单与配置快照与未实现前**逐字节一致**。
+    # 智能体档案落 `<workspace>/.vibe/agents.json`（恒随工作区）；讨论面结构只读
+    # （复用 `build_readonly_registry()` 白名单），写盘仍回主 Agent 走审批漏斗。
+    multi_agent_enabled: bool = False
+    # 实时互监（B2）：监控档位、观测预算、举手次数上限、首轮是否放开正文
+    multi_agent_monitor: str = "live"
+    multi_agent_observe_chars: int = 600
+    multi_agent_observe_ratio: float = 0.005
+    multi_agent_interject_max: int = 2
+    multi_agent_first_round_live: bool = False
+
     # --- 代码审阅工作流（M9-H）---
     # 默认**关**：开启后 Agent 多出一个 `review_changes` 工具（SAFE，只读：不改盘、
     # 不执行、不派子 Agent），对「当前工作区相对 HEAD 的改动」产出一份结构化意见
@@ -630,6 +654,21 @@ class Config:
             ),
             scheduler_catch_up=_env_bool(
                 "VIBE_SCHEDULER_CATCHUP", cls.scheduler_catch_up
+            ),
+            # 多智能体讨论（M14）：默认关，启用后才暴露 /api/agents 与讨论端点
+            multi_agent_enabled=_env_bool("VIBE_MULTI_AGENT", cls.multi_agent_enabled),
+            multi_agent_monitor=_env_str("VIBE_MULTI_AGENT_MONITOR", cls.multi_agent_monitor),
+            multi_agent_observe_chars=_env_int(
+                "VIBE_MULTI_AGENT_OBSERVE_CHARS", cls.multi_agent_observe_chars
+            ),
+            multi_agent_observe_ratio=_env_float(
+                "VIBE_MULTI_AGENT_OBSERVE_RATIO", cls.multi_agent_observe_ratio
+            ),
+            multi_agent_interject_max=_env_int(
+                "VIBE_MULTI_AGENT_INTERJECT_MAX", cls.multi_agent_interject_max
+            ),
+            multi_agent_first_round_live=_env_bool(
+                "VIBE_MULTI_AGENT_FIRST_ROUND_LIVE", cls.multi_agent_first_round_live
             ),
             # 代码审阅工作流（M9-H）：默认关，启用后才注册 review_changes 工具
             review_enabled=_env_bool("VIBE_REVIEW", cls.review_enabled),

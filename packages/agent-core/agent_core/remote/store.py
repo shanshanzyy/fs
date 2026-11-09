@@ -24,6 +24,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .connection import RemoteConnection
 from .errors import RemoteConfigError
@@ -52,6 +53,26 @@ def store_path_for(config: object) -> Path:
     return default_store_path(Path(str(getattr(config, "workspace"))))
 
 
+def roots_path_for(config: object) -> Path:
+    """「已加入工作区的远端根」的落点：`<workspace>/.vibe/remote-roots.json`。
+
+    **恒随 `Config.workspace`，不跟 `remote_config` 走。** 连接清单可以被钉在
+    别处（ADR-042 决策 13：切到远程工作区时保住用户配好的连接），但工作区根
+    属于「这个工作区里挂了哪些远端目录」—— 跟着被钉住的清单跑，就会出现
+    「打开一个本地文件夹，上一个工作区的远端目录还挂在工作区树里」。
+    """
+    return (
+        Path(str(getattr(config, "workspace"))).expanduser()
+        / ".vibe"
+        / "remote-roots.json"
+    )
+
+
+def load_store(config: object) -> "RemoteStore":
+    """按配置载入连接清单 + **本工作区**的远端根（调用方一律走这里）。"""
+    return RemoteStore.load(store_path_for(config), roots_path=roots_path_for(config))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -61,6 +82,8 @@ class RemoteStore:
     """连接清单的内存视图 + 落盘能力。"""
 
     path: Path
+    # 工作区根的独立落点（M12）。None = 与连接清单同文件（CLI / 单元测试的旧行为）。
+    roots_path: Path | None = None
     connections: dict[str, RemoteConnection] = field(default_factory=dict)
     default_name: str = ""
     # 已登记的「工作区根」（M12）：远端连接上的某个子目录，出现在工作区树里，
@@ -73,45 +96,44 @@ class RemoteStore:
 
     # ------------------------------------------------------------------ 载入
     @classmethod
-    def load(cls, path: Path | str) -> "RemoteStore":
+    def load(
+        cls, path: Path | str, roots_path: Path | str | None = None
+    ) -> "RemoteStore":
         file_path = Path(path).expanduser()
-        if not file_path.exists():
-            # 文件不存在是**正常状态**（还没加过任何连接），与「损坏」区别对待。
-            return cls(path=file_path)
+        roots_file = Path(roots_path).expanduser() if roots_path is not None else None
+        data: dict[str, Any] = {}
+        if file_path.exists():
+            try:
+                raw_text = file_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RemoteConfigError(
+                    f"无法读取远程连接清单 {file_path}: {exc}"
+                ) from exc
 
-        try:
-            raw_text = file_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise RemoteConfigError(
-                f"无法读取远程连接清单 {file_path}: {exc}"
-            ) from exc
+            if raw_text.strip():
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    raise RemoteConfigError(
+                        f"远程连接清单不是合法 JSON：{file_path}\n"
+                        f"  错误: {exc}\n"
+                        "  修复方式：改对语法，或删除该文件后重新用 "
+                        "`python -m agent_core.remote add` 添加连接。"
+                    ) from exc
 
-        if not raw_text.strip():
-            return cls(path=file_path)
+                if not isinstance(data, dict):
+                    raise RemoteConfigError(
+                        f"远程连接清单顶层需为对象，实际: {type(data).__name__}（{file_path}）"
+                    )
 
-        try:
-            data = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            raise RemoteConfigError(
-                f"远程连接清单不是合法 JSON：{file_path}\n"
-                f"  错误: {exc}\n"
-                "  修复方式：改对语法，或删除该文件后重新用 "
-                "`python -m agent_core.remote add` 添加连接。"
-            ) from exc
+                version = data.get("version", FORMAT_VERSION)
+                if not isinstance(version, int) or version > FORMAT_VERSION:
+                    raise RemoteConfigError(
+                        f"远程连接清单版本 {version!r} 高于本客户端支持的 {FORMAT_VERSION}（{file_path}）。"
+                        "请升级客户端，或换用兼容清单。"
+                    )
 
-        if not isinstance(data, dict):
-            raise RemoteConfigError(
-                f"远程连接清单顶层需为对象，实际: {type(data).__name__}（{file_path}）"
-            )
-
-        version = data.get("version", FORMAT_VERSION)
-        if not isinstance(version, int) or version > FORMAT_VERSION:
-            raise RemoteConfigError(
-                f"远程连接清单版本 {version!r} 高于本客户端支持的 {FORMAT_VERSION}（{file_path}）。"
-                "请升级客户端，或换用兼容清单。"
-            )
-
-        store = cls(path=file_path)
+        store = cls(path=file_path, roots_path=roots_file)
         entries = data.get("connections") or []
         if not isinstance(entries, list):
             raise RemoteConfigError(f"connections 字段需为数组（{file_path}）")
@@ -135,9 +157,22 @@ class RemoteStore:
 
         # 工作区根（M12）：条目非法（连接不存在 / 子目录写法不对）一律**丢弃并记录**，
         # 不抛错 —— 与上面 default 指向不存在的连接同一条理由。
-        raw_roots = data.get("roots") or []
+        #
+        # 来源三选一（按优先级）：
+        # ① 独立根文件存在 → 只认它；
+        # ② 根文件不存在、且与清单同目录 → 这是本工作区自己的旧数据，读清单里的
+        #    `roots` 兼容迁移（下次落盘会写进独立文件）；
+        # ③ 清单被钉在别的工作区（目录不同）→ **一条都不读**：那些根属于别的
+        #    工作区，跟着过来就是「打开新文件夹还挂着旧远端目录」。
+        roots_data: dict[str, Any] = data
+        if roots_file is not None:
+            if roots_file.exists():
+                roots_data = _read_roots_file(roots_file)
+            elif roots_file.parent != file_path.parent:
+                roots_data = {}
+        raw_roots = roots_data.get("roots") or []
         if not isinstance(raw_roots, list):
-            raise RemoteConfigError(f"roots 字段需为数组（{file_path}）")
+            raise RemoteConfigError(f"roots 字段需为数组（{roots_file or file_path}）")
         seen: set[str] = set()
         for index, entry in enumerate(raw_roots):
             try:
@@ -170,30 +205,29 @@ class RemoteStore:
 
     # ------------------------------------------------------------------ 保存
     def save(self) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "version": FORMAT_VERSION,
             "default": self.default_name,
             "connections": [self.connections[name].to_dict() for name in sorted(self.connections)],
-            "roots": [root.to_dict() for root in self.roots],
         }
-        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        if self.roots_path is None:
+            payload["roots"] = [root.to_dict() for root in self.roots]
+            _write_json(self.path, payload)
+            return
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{self.path.name}.", suffix=".vibetmp", dir=str(self.path.parent)
-        )
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
-                fh.flush()
-                os.fsync(fh.fileno())
-            _restrict(tmp_path)
-            os.replace(tmp_path, self.path)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
-        _restrict(self.path)
+        # 清单被钉在**别的工作区**时（ADR-042 决策 13），那份文件里的 roots 属于
+        # 那个工作区：原样留着 —— 否则「在这里加一条连接」会顺手删掉别人的登记。
+        if self.path.parent != self.roots_path.parent:
+            legacy = _peek_roots(self.path)
+            if legacy is not None:
+                payload["roots"] = legacy
+        _write_json(self.path, payload)
+        # 空根且从未落过盘时不建空文件：没加过远端根的工作区不该多一个资产文件。
+        if self.roots or self.roots_path.exists():
+            _write_json(
+                self.roots_path,
+                {"version": FORMAT_VERSION, "roots": [root.to_dict() for root in self.roots]},
+            )
 
     # ------------------------------------------------------------------ 查询
     def names(self) -> list[str]:
@@ -355,6 +389,58 @@ class RemoteStore:
         return min(candidates, key=lambda item: len(item.sub))
 
 
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    """原子写（同目录临时文件 + os.replace），连接清单与根清单共用同一条纪律。"""
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".vibetmp", dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _restrict(tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    _restrict(path)
+
+
+def _read_roots_file(path: Path) -> dict[str, Any]:
+    """读独立根文件。**坏文件要报错**（与清单同一条纪律：配置不是缓存）。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RemoteConfigError(f"无法读取远端根清单 {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RemoteConfigError(
+            f"远端根清单不是合法 JSON：{path}\n  错误: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise RemoteConfigError(
+            f"远端根清单顶层需为对象，实际: {type(raw).__name__}（{path}）"
+        )
+    return raw
+
+
+def _peek_roots(path: Path) -> list[Any] | None:
+    """取清单文件里现存的 roots 原样（用于「不属于我、但要保住」的共享清单）。
+
+    读不出来就返回 None —— 保不住别人的登记不该让**当前**这次变更失败；
+    真正坏掉的清单在 `load()` 那一步已经报过错了。
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    roots = raw.get("roots") if isinstance(raw, dict) else None
+    return roots if isinstance(roots, list) else None
+
+
 def _restrict(path: Path) -> None:
     """尽力把文件权限收到 0600。
 
@@ -368,4 +454,11 @@ def _restrict(path: Path) -> None:
         pass
 
 
-__all__ = ["FORMAT_VERSION", "RemoteStore", "default_store_path", "store_path_for"]
+__all__ = [
+    "FORMAT_VERSION",
+    "RemoteStore",
+    "default_store_path",
+    "load_store",
+    "roots_path_for",
+    "store_path_for",
+]

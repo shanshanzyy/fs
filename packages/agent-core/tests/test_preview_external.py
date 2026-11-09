@@ -308,9 +308,18 @@ class ExternalPreviewEnabledTests(_ExternalPreviewBase):
         log = self.audit_text()
         self.assertIn("preview.external", log)
         self.assertIn('"port": 5173', log)
-        # 路径 / query 不该进审计
-        self.assertNotIn("secret", log)
-        self.assertNotIn("abc", log)
+        # 路径 / query 不该进审计。逐字段判断：整份日志做子串匹配会被
+        # 随机哈希里的 "abc" 撞上（哈希是十六进制，天然可能包含任意短串）。
+        for line in log.splitlines():
+            record = json.loads(line)
+            self.assertNotIn("url", record)
+            self.assertNotIn("path", record)
+            self.assertNotIn("query", record)
+            for key, value in record.items():
+                if key in ("hash", "prev"):
+                    continue
+                self.assertNotIn("secret", str(value))
+                self.assertNotIn("abc", str(value))
 
     def test_endpoint_still_requires_token(self) -> None:
         """新端点没绕开既有鉴权：/api/* 一律要令牌。"""

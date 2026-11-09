@@ -63,7 +63,7 @@ from ..remote.connection import RemoteConnection
 from ..remote.errors import RemoteError
 from ..remote.pathguard import RemotePathGuard
 from ..remote.roots import PREFIX, RouteHit
-from ..remote.store import RemoteStore, store_path_for
+from ..remote.store import RemoteStore, load_store
 from ..remote.workspace import RemoteWorkspace, open_workspace
 from ..sandbox import Risk
 from .base import (
@@ -87,7 +87,7 @@ _MAX_REMOTE_BYTES = MAX_SCAN_BYTES
 # 公共装配
 # --------------------------------------------------------------------------- #
 def _store(ctx: ToolContext) -> RemoteStore:
-    return RemoteStore.load(store_path_for(ctx.config))
+    return load_store(ctx.config)
 
 
 def _resolve_conn(ctx: ToolContext, args: dict) -> RemoteConnection:

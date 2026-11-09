@@ -51,6 +51,18 @@
 | `update.failed` | 检查或下载失败（M9） | `reason` `kind`（`shape`/`signature`/`sha256`/`size`/`network`/`state`/`no_release`） |
 | `task.state` | 后台任务状态变化（M9-D，与 `run.*` 分离） | `taskId` `state`（`pending`/`running`/`succeeded`/`failed`/`cancelled`）`summary`（一行摘要）；**不含任务正文与结论**（ADR-006） |
 | `schedule.state` | 定时任务状态变化（M10，与 `run.*` 分离） | `jobId` `action`（`created`/`updated`/`toggled`/`deleted`/`triggered`/`skipped`/`failed`）`state`（`enabled`/`disabled`）`nextRunAt`（下次触发时刻，epoch 秒，0 表示不再触发）`lastState` `runCount` `taskId`（本次投出的后台任务 id，未触发时为空）；**不含 prompt 正文**（ADR-006） |
+| `discussion.started` | 讨论开始（M14-C，与 `run.*` 分离） | `discussionId` `topic` `participants[{id,name}]` `maxRounds` `state` `seq` |
+| `discussion.round` | 进入新一轮 | `discussionId` `index` `total` |
+| `discussion.turn_started` | 某位参与者开始发言 | `discussionId` `round` `agentId` `name` |
+| `discussion.agent_state` | 发言者状态（思考 / 调工具） | `discussionId` `agentId` `state`（`thinking`/`tool`）`tool?` |
+| `discussion.observe` | 本次迭代看到了谁、折了多少字（**不含内容**） | `discussionId` `agentId` `from[]` `chars` |
+| `discussion.interjection` | 举手插话及是否受理（供人审视，正文不进审计） | `discussionId` `from` `target` `accepted` `chars` `text` |
+| `discussion.delta` | 发言增量（纯呈现，不落盘） | `discussionId` `agentId` `text` |
+| `discussion.turn` | 一条发言结束（只给要点摘要） | `discussionId` `round` `agentId` `stance` `points[]` `chars` `ok` `errorKind` |
+| `discussion.consensus` | 规则判定达成一致 | `discussionId` `round` `agreed[]` `disagreed[]` |
+| `discussion.finished` | 讨论结束（含未达成） | `discussionId` `state` `terminationReason` `rounds` `finalChars` `disagreements[]` |
+| `discussion.message` | 用户插话已入队 / 已送达下一个模型边界 | `discussionId` `chars`（正文走 `GET /api/discussions/<id>`） |
+| `discussion.failed` | 讨论异常中断 | `discussionId` `kind` |
 | `remote.state` | 远程工作面状态变化（M11，与 `run.*` 分离；打开/切换连接、切换浏览目录、远端根增删） | `connection` `display` `root` `browsePath` `allowWrite` `allowShell` `capabilities{degraded[]}` `changes`（本会话远端改动条数）`roots[]`（已加入工作区的远端根的命名空间路径，M12）；**不含任何文件正文**（ADR-006） |
 | `remote.edit` | 远端编辑 / 保存产生了 diff（M11，供界面审阅） | `connection` `path` `action`（`save`/`create`/`edit`）`added` `removed` `strategy` `sha256` `diff`（真实 unified diff）；diff 与本地 `run.approval.preview.body` 同一条口径 —— **供人审的改动内容**，不进审计、不落盘 |
 | `preview.changed` | 文件监听检出增删改（P0，与 `run.*` 分离；来源可能是 Agent 改动，也可能是用户在编辑器里手存） | `paths[]`（工作区相对路径，最多 200 条）`count`（本轮实际变化条数）`truncated`（是否因超过上限被截断；为 `true` 时界面应刷新全部预览标签）；**只记路径，不含内容**（ADR-006），也不进审计链 |
@@ -144,6 +156,17 @@
 | `POST /api/schedules/{id}` | 更新定时任务（M10）：`{name?, schedule?, prompt?, enabled?}`（缺省字段保留原值）→ `{ok, job{…}}`；变更后重排 `nextRunAt`；不存在 404 |
 | `POST /api/schedules/{id}/delete` | 删除定时任务（M10）：`{}` → `{ok, deleted}`；已投出的后台任务不受影响；不存在回 `deleted:false` |
 | `POST /api/schedules/{id}/run` | 立即触发一次（M10）：`{}` → `{ok, taskId}`；**不改 `nextRunAt`**（不影响既有节奏）；不存在/未启用 404 或 400 |
+| `GET  /api/agents` | 智能体档案列表（M14-A，只读）：`{enabled, agents[]{id,name,role,systemPrompt,tools,enabled}, tools[]{只读工具名}}`；档案落 `<workspace>/.vibe/agents.json`，**恒随工作区**；`VIBE_MULTI_AGENT=0`（默认）时 400（fail-closed，不回空列表） |
+| `POST /api/agents` | 新增 / 更新一条档案（M14-A，用户本人动作 ADR-011）：`{profile{id?,name,role?,systemPrompt?,tools?,enabled?}}` → `{ok, agent}`；省略 `id` 即新增，给了 `id` 必须已存在；**落盘前校验**（名称唯一/长度、工具必须是只读白名单子集、提示词 ≤8KB、整文件 ≤256KB），坏档案拒收且**不落盘**；`tools` 省略 = 全部只读工具、`[]` = 不给工具 |
+| `POST /api/agents/delete` | 删除一条档案（M14-A）：`{id}` → `{ok, deleted}`；不存在 400；`VIBE_MULTI_AGENT=0` 时 400 |
+| `GET  /api/discussions` | 最近讨论摘要（M14-C，只读）：`{enabled, activeId, discussions[]{id,topic,state,terminationReason,rounds,participants}}`；**不含发言正文**；`VIBE_MULTI_AGENT=0` 时 400 |
+| `POST /api/discussions` | 开始一场讨论（M14-C，用户本人动作 ADR-011）：`{topic, participants[], moderator, maxRounds?, speakerPolicy?, requestId}` → `{ok, discussionId, state}`；`moderator` 与 `requestId` **必填**（缺失/档案不存在 400）；同一 `requestId` 重放返回原讨论（`reused:true`）；已有一场在跑且 requestId 不同 → 409 |
+| `GET  /api/discussions/{id}?after=<seq>` | 单场详情（M14-C）：全量 `Discussion.to_dict()`；带 `after` 时只返回 `seq > after` 的增量 Turn（刷新续播）；不存在 400 |
+| `POST /api/discussions/{id}/message` | 讨论中用户插话（M14-C）：`{text}` → `{ok, chars}`；在下一个模型边界注入，优先级最高；讨论未在进行中 400，空文本 400 |
+| `POST /api/discussions/{id}/resume` | 续跑 `interrupted` / `stopped` 的讨论（M14-C）：`{}` → `{ok, discussionId}`；从最后一个未完成 Turn 接着跑；状态不允许 400，已有讨论在跑 409 |
+| `POST /api/discussions/{id}/stop` | 停止讨论（M14-C）：`{}` → `{ok, stopping}`；立即掐断当前发言的流式生成并在回合边界收尾为 `stopped`；未在进行中 400 |
+| `POST /api/discussions/{id}/insert` | 结论插入对话（M14-E，用户本人动作）：`{}` → `{ok, mode:"insert", discussionId, chars}`；以**用户消息**追加到当前会话（带议题/场次/终止原因来源标注，正文 `wrap_untrusted` 包裹）；不启动新一轮；讨论仍在跑 400、已有任务在执行 409 |
+| `POST /api/discussions/{id}/dispatch` | 结论作为任务下发（M14-E，用户本人动作）：`{}` → `{ok, mode:"dispatch", discussionId, runId}`；走普通 `submit` 通道，改文件仍走既有审批漏斗（ADR-008）；讨论仍在跑 400、已有任务在执行 409 |
 | `GET  /api/remote/connections` | 远程连接清单（M11，只读）：`{enabled, configPath, default, active, ssh{available,path}, connections[]{name,host,user,port,root,identity_file,proxy_jump,host_key_policy,connect_timeout,command_timeout,allow_write,allow_shell,note,created_at,display,default,problems[]}}`；**不含私钥内容**（只回路径）；返回的是**连接对象原形**（snake_case），界面原样回填提交；`VIBE_REMOTE=0` 时 `enabled:false` 且清单为空 |
 | `POST /api/remote/connections` | 新增一条远程连接（M11，用户本人动作 ADR-011）：`{connection{name,host,user?,port?,root?,identity_file?,proxy_jump?,host_key_policy?,connect_timeout?,command_timeout?,allow_write?,allow_shell?,note?}, default?}`（也可直接以连接对象为体）→ `{ok, connection}`；**写前校验**（结构 + 私钥存在性），坏 spec 拒收且**不落盘**（400） |
 | `POST /api/remote/connections/{name}` | 更新一条远程连接（M11）：字段缺省保留原值（**不支持改名**）→ `{ok, connection}`；不存在 400、非法 400 |
@@ -490,6 +513,22 @@ PREVIEW_CHANGED = "preview.changed"
 # 本地 URL、重连次数、错误摘要），**不含任何被转发的字节**（ADR-006）。
 # 界面据它显示「已连接 / 正在重连 / 已断开」，而不是让用户对着一片白猜。
 PREVIEW_TUNNEL = "preview.tunnel"
+# 多智能体圆桌讨论（M14-C）。与 `run.*` 分开：讨论是用户本人发起的**独立会话**，
+# 不占用主对话的 run 状态机，也不把发言正文灌进会话库。所有事件都带
+# `discussionId` / `state` / `seq`，`seq` 是逐 Turn 单调游标，供刷新续播。
+# **不含发言全文**：时间线用 `points` 摘要，全文走 `GET /api/discussions/<id>`。
+DISCUSSION_STARTED = "discussion.started"
+DISCUSSION_ROUND = "discussion.round"
+DISCUSSION_TURN_STARTED = "discussion.turn_started"
+DISCUSSION_AGENT_STATE = "discussion.agent_state"
+DISCUSSION_OBSERVE = "discussion.observe"
+DISCUSSION_INTERJECTION = "discussion.interjection"
+DISCUSSION_DELTA = "discussion.delta"
+DISCUSSION_TURN = "discussion.turn"
+DISCUSSION_CONSENSUS = "discussion.consensus"
+DISCUSSION_FINISHED = "discussion.finished"
+DISCUSSION_MESSAGE = "discussion.message"
+DISCUSSION_FAILED = "discussion.failed"
 
 # ---- 审批决定 --------------------------------------------------------------
 DECISIONS = ("approve", "approve_all", "deny", "deny_all")

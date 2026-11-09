@@ -373,6 +373,7 @@ class Agent:
         memory: MemoryStore | None = None,
         audit: AuditLog | None = None,
         system_prompt: str | None = None,
+        observation_provider: Callable[[], str] | None = None,
     ) -> None:
         self.config = config
         self.hooks = hooks or AgentHooks()
@@ -383,6 +384,10 @@ class Agent:
         # 保证 assistant(tool_calls) 与 tool 消息仍然一一对应。
         # 绝不在工具执行中途硬杀：那会留下配不上对的残缺历史，多数服务端直接 400。
         self.should_stop = should_stop
+        # 观测注入（M14-B2）：讨论中的 Agent 在每次模型调用前把「他人最新动态」
+        # 作为**临时 user 消息**插进去，取回响应后立刻撤掉 —— 不写历史、不进
+        # 会话库、不污染最终答案。非讨论场景保持 None，行为与改造前一致。
+        self.observation_provider = observation_provider
         # 审计（M3）：允许注入一个**既有**实例。子 Agent 必须复用父 Agent 的
         # 同一个 AuditLog —— 链的正确性建立在「单实例持有 `_last_hash`」之上
         #（见 audit.py 的「写入必须串行」说明），父/子各建一个会让两条链交错，
@@ -559,9 +564,8 @@ class Agent:
             return {}
         try:
             # 延迟导入：远端子系统较重，且默认关时不该把它拉进 import 链。
-            from ..remote.store import RemoteStore, store_path_for
-
-            store = RemoteStore.load(store_path_for(config))
+            from ..remote.store import load_store
+            store = load_store(config)
         except Exception:
             return {}
         names = tuple(store.names())
@@ -848,12 +852,23 @@ class Agent:
             # 若报在裁剪前，预算条会长期停在「超限」红区，而实际早就压下来了。
             self.hooks.on_context(self.context_stats())
 
-            # 临时提示只在本次模型调用中可见，取回响应后立即撤掉，避免污染历史
+            # 临时提示只在本次模型调用中可见，取回响应后立即撤掉，避免污染历史。
+            # 观测块（M14-B2）同样走这条临时通道：它是「他人动态」，不是本轮事实。
             hint = build_task_hint(
                 iteration=index, max_iterations=self.config.max_iterations
             )
+            ephemeral: list[dict[str, Any]] = []
             if hint:
-                self.messages.append({"role": "user", "content": hint})
+                ephemeral.append({"role": "user", "content": hint})
+            if self.observation_provider is not None:
+                try:
+                    observation = str(self.observation_provider() or "")
+                except Exception:  # noqa: BLE001 — 观测是增强项，失败不阻断本轮
+                    observation = ""
+                if observation:
+                    ephemeral.append({"role": "user", "content": observation})
+            ephemeral_start = len(self.messages)
+            self.messages.extend(ephemeral)
             try:
                 response = self._ask_model()
             except StreamInterrupted:
@@ -862,8 +877,10 @@ class Agent:
                 # 用户可以直接接着发下一条。
                 return self._finish_interrupted(index)
             finally:
-                if hint:
-                    self.messages.pop()
+                # 按插入位置精确移除：中断分支会在临时消息之后追加 assistant，
+                # 用 pop() 会误删那条 assistant、把临时提示留在历史里。
+                if ephemeral:
+                    del self.messages[ephemeral_start : ephemeral_start + len(ephemeral)]
             self._accumulate_usage(response)
 
             if response.has_tool_calls:
@@ -1256,6 +1273,14 @@ class Agent:
         """追加历史消息并广播给持久化钩子。所有真实消息的唯一入口。"""
         self.messages.append(message)
         self.hooks.on_message(message)
+
+    def record_user_message(self, text: str) -> None:
+        """把一条用户侧消息写进历史（含持久化），但不启动新一轮。
+
+        讨论结论「插入对话」走这里：界面上用户看到的是自己的一条消息，
+        下次提问时它已经在上下文里，不需要为「只是记下来」再跑一次模型。
+        """
+        self._record({"role": "user", "content": text})
 
     def _append_assistant_message(self, response: ChatResponse, *, text_protocol: bool) -> None:
         """按 OpenAI 协议回写 assistant 消息。原生 tool_calls 需要完整结构。"""

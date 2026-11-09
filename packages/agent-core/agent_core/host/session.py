@@ -86,7 +86,7 @@ from ..remote.degrade import is_remote_workspace, remote_degraded
 from ..remote.errors import RemoteConfigError, RemoteError
 from ..remote.roots import PREFIX, RemoteRoot, parse_ns_root, validate_root
 from ..remote.session import ChangeEntry, RemoteSessions
-from ..remote.store import RemoteStore, store_path_for
+from ..remote.store import RemoteStore, load_store, store_path_for
 from ..remote.tunnel import MAX_TUNNELS, TunnelManager
 from ..remote.workspace import open_workspace, transport_for
 from ..terminal.manager import (
@@ -743,6 +743,15 @@ class Session:
         ):
             self._open_remote_workspace()
 
+        # 多智能体讨论（M14-C）：一场讨论跑在独立守护线程里，同一时刻只允许一场
+        # （并发会同时写同一个 AuditLog，链交错即判篡改；也会同时打同一个模型端点）。
+        # 这里只持锁与线程句柄；讨论自身的状态全部在 `<workspace>/.vibe/discussions/`。
+        self._discussion_lock = threading.Lock()
+        self._discussion_thread: threading.Thread | None = None
+        self._discussion_stop: threading.Event | None = None
+        self._discussion_active_id: str = ""
+        self._discussion_engine: Any | None = None
+
     def _open_remote_workspace(self) -> None:
         """打开远程工作区指向的那条连接，并把浏览位置落到子目录上。
 
@@ -822,6 +831,12 @@ class Session:
         scheduler, self.scheduler = self.scheduler, None
         if scheduler is not None:
             scheduler.stop()
+        # 多智能体讨论（M14-C）：给正在跑的讨论发停止信号，让它在回合边界
+        # 收尾成 stopped 并落盘 —— 守护线程不 join，但不会有人在关掉的会话上
+        # 再写事件（引擎的 on_event 只走 bus，bus 生命周期由 HostServer 管）。
+        stop_event, self._discussion_stop = self._discussion_stop, None
+        if stop_event is not None:
+            stop_event.set()
         # 后台任务池（M9-D）：会话收尾时一起关掉（wait=False，进程内任务随会话结束）。
         tasks, self.tasks = self.tasks, None
         if tasks is not None:
@@ -965,6 +980,505 @@ class Session:
         """调度器状态（只读）：未启用返回 None。"""
         return self.scheduler.status() if self.scheduler is not None else None
 
+    # ------------------------------------------------------------------ 智能体档案（M14-A）
+    # 档案是**用户本人**维护的配置（ADR-011 同口径），不是 Agent 可写的状态：
+    # 这里只提供宿主侧读写，讨论引擎（B1）再按档案派生只读子 Agent。
+    # 门控 fail-closed：`VIBE_MULTI_AGENT=0` 时一律报错（host 转 400），
+    # 不返回空列表 —— 「静默回空」会让用户以为档案丢了。
+    def _require_multi_agent(self) -> None:
+        if not self.agent.config.multi_agent_enabled:
+            raise AgentError("多智能体讨论未启用（VIBE_MULTI_AGENT=0）")
+
+    def _agent_store(self) -> "AgentStore":
+        from ..agents.store import AgentStore, store_path_for
+
+        return AgentStore.load(store_path_for(self.agent.config))
+
+    def agent_profiles(self) -> dict[str, Any]:
+        """`GET /api/agents`：档案列表 + 当前可用的只读工具名。"""
+        from ..agents.profile import readonly_tool_names
+
+        self._require_multi_agent()
+        store = self._agent_store()
+        return {
+            "enabled": True,
+            "agents": [profile.to_dict() for profile in store.list()],
+            "tools": readonly_tool_names(),
+        }
+
+    def agent_save(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """`POST /api/agents`：新增或更新一条档案（落盘前校验，坏档案不落盘）。"""
+        from ..agents.profile import (
+            AgentProfile,
+            AgentProfileError,
+            readonly_tool_names,
+            validate_profile,
+        )
+
+        self._require_multi_agent()
+        store = self._agent_store()
+        raw_id = str(payload.get("id") or "").strip()
+        existing = store.get(raw_id) if raw_id else None
+        if raw_id and existing is None:
+            raise AgentError(f"智能体档案不存在：{raw_id}")
+        if raw_id:
+            agent_id = raw_id
+        else:
+            agent_id = uuid.uuid4().hex[:12]
+            while store.get(agent_id) is not None:
+                agent_id = uuid.uuid4().hex[:12]
+
+        # 更新时省略字段 = 保留原值（尤其 tools：省略绝不能等于「恢复全部」，
+        # 否则一次改名就会把裁剪过的工具面静默放大）。
+        if "tools" in payload:
+            tools_raw = payload.get("tools")
+            if not isinstance(tools_raw, list):
+                raise AgentError("tools 需为数组")
+            tools = tuple(str(item) for item in tools_raw)
+        elif existing is not None:
+            tools = existing.tools
+        else:
+            tools = tuple(readonly_tool_names())
+
+        enabled = payload.get("enabled", existing.enabled if existing else True)
+        if not isinstance(enabled, bool):
+            raise AgentError("enabled 需为布尔值")
+
+        role = payload.get("role", existing.role if existing else "")
+        prompt = payload.get(
+            "systemPrompt",
+            payload.get(
+                "system_prompt",
+                existing.system_prompt if existing else "",
+            ),
+        )
+        name = payload.get("name", existing.name if existing else "")
+
+        profile = AgentProfile(
+            id=agent_id,
+            name=str(name or "").strip(),
+            role=str(role or "").strip(),
+            system_prompt=str(prompt or ""),
+            tools=tools,
+            enabled=enabled,
+        )
+        try:
+            validate_profile(
+                profile,
+                existing=store.agents,
+                readonly_tools=readonly_tool_names(),
+            )
+        except AgentProfileError as exc:
+            raise AgentError(str(exc)) from exc
+
+        store.upsert(profile)
+        try:
+            store.save()
+        except AgentProfileError as exc:
+            raise AgentError(str(exc)) from exc
+        return {"ok": True, "agent": profile.to_dict()}
+
+    def agent_delete(self, agent_id: str) -> bool:
+        """`POST /api/agents/delete`：删除一条档案。不存在明确报错。"""
+        self._require_multi_agent()
+        store = self._agent_store()
+        if not store.remove(agent_id):
+            raise AgentError(f"智能体档案不存在：{agent_id}")
+        store.save()
+        return True
+
+    # ------------------------------------------------------------------ 多智能体讨论（M14-C）
+    def _discussion_store(self) -> "DiscussionStore":
+        from ..agents.discussion import DiscussionStore
+
+        return DiscussionStore(self.agent.config.workspace)
+
+    def _discussion_new_engine(self, stop: threading.Event) -> "DiscussionEngine":
+        from ..agents.discussion import DiscussionEngine
+
+        return DiscussionEngine(
+            self.agent.config,
+            self._agent_store().list(),
+            self.agent.client,
+            audit=self.agent.audit,
+            should_stop=stop.is_set,
+            on_event=self._on_discussion_event,
+            store=self._discussion_store(),
+        )
+
+    def _reject_if_discussion_running(self) -> None:
+        """同一时刻只允许一场讨论：并发会交错写同一条审计链、并把模型端点打满。"""
+        if self._discussion_thread is not None and self._discussion_thread.is_alive():
+            raise BusyError("已有一场讨论正在进行，请先停止或等待它结束")
+
+    def discussion_list(self) -> dict[str, Any]:
+        """`GET /api/discussions`：最近讨论摘要（不含正文）。"""
+        self._require_multi_agent()
+        return {
+            "enabled": True,
+            "activeId": self._discussion_active_id,
+            "discussions": self._discussion_store().summaries(),
+        }
+
+    def discussion_start(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """`POST /api/discussions`：开一场讨论（后台线程跑，立即返回 id）。
+
+        参数在**起线程之前**同步校验：坏参数必须当场 400，而不是先回 200
+        再在事件流里冒一个 `discussion.failed` —— 后者用户既看不懂也无从修正。
+        """
+        from ..agents.discussion import DiscussionError
+
+        self._require_multi_agent()
+        request_id = str(
+            payload.get("requestId") or payload.get("request_id") or ""
+        ).strip()
+        if not request_id:
+            raise AgentError("缺少 requestId（同一 requestId 重放不会新开一场）")
+        store = self._discussion_store()
+        cached = store.find_by_request(request_id)
+        if cached is not None:
+            return {
+                "ok": True,
+                "discussionId": cached.id,
+                "state": cached.state,
+                "reused": True,
+            }
+        topic = str(payload.get("topic") or "").strip()
+        raw = payload.get("participants")
+        if not isinstance(raw, (list, tuple)):
+            raise AgentError("participants 需为数组")
+        participants = [str(item).strip() for item in raw if str(item).strip()]
+        moderator = str(payload.get("moderator") or "").strip()
+        try:
+            max_rounds = int(payload.get("maxRounds", payload.get("max_rounds", 3)))
+        except (TypeError, ValueError) as exc:
+            raise AgentError("maxRounds 需为整数") from exc
+        speaker_policy = str(
+            payload.get("speakerPolicy")
+            or payload.get("speaker_policy")
+            or "round_robin"
+        )
+        discussion_id = uuid.uuid4().hex[:12]
+        with self._discussion_lock:
+            self._reject_if_discussion_running()
+            stop = threading.Event()
+            engine = self._discussion_new_engine(stop)
+            try:
+                engine.validate(
+                    topic=topic,
+                    participants=participants,
+                    moderator=moderator,
+                    max_rounds=max_rounds,
+                    speaker_policy=speaker_policy,
+                )
+            except DiscussionError as exc:
+                raise AgentError(str(exc)) from exc
+            self._discussion_stop = stop
+            self._discussion_engine = engine
+            self._discussion_active_id = discussion_id
+            thread = threading.Thread(
+                target=self._discussion_worker,
+                args=(engine, "start", discussion_id),
+                kwargs={
+                    "topic": topic,
+                    "participants": participants,
+                    "moderator": moderator,
+                    "max_rounds": max_rounds,
+                    "speaker_policy": speaker_policy,
+                    "request_id": request_id,
+                },
+                name=f"vibe-discussion-{discussion_id}",
+                daemon=True,
+            )
+            self._discussion_thread = thread
+            # 在锁内启动：否则「已赋值但尚未 start」的空隙会被第二个请求
+            # 误判为没有讨论在跑（is_alive() 仍为 False），从而并发起两场。
+            thread.start()
+        return {"ok": True, "discussionId": discussion_id, "state": "running"}
+
+    def discussion_detail(self, discussion_id: str, after: str = "") -> dict[str, Any]:
+        """`GET /api/discussions/{id}?after=<seq>`：全量或增量（刷新续播）。"""
+        from ..agents.discussion import DiscussionError
+
+        self._require_multi_agent()
+        try:
+            discussion = self._discussion_store().load(discussion_id)
+        except DiscussionError as exc:
+            raise AgentError(str(exc)) from exc
+        data = discussion.to_dict()
+        data["active"] = self._discussion_active_id == discussion_id
+        try:
+            cursor = int(after) if str(after or "").strip() else 0
+        except (TypeError, ValueError):
+            cursor = 0
+        if cursor > 0:
+            # 逐 Turn 落盘时 seq 与 Turn 序号一一对应（每完成一条 +1），
+            # 因此按位置过滤即可，不需要给 Turn 再存一份 seq。
+            data["turns"] = [
+                turn
+                for index, turn in enumerate(data.get("turns") or [], start=1)
+                if index > cursor
+            ]
+            data["after"] = cursor
+        return data
+
+    def discussion_message(self, discussion_id: str, text: str) -> dict[str, Any]:
+        """`POST /api/discussions/{id}/message`：用户插话，下一个模型边界注入。"""
+        from ..agents.discussion import DiscussionError
+
+        self._require_multi_agent()
+        with self._discussion_lock:
+            engine = self._discussion_engine
+            active = self._discussion_active_id == discussion_id
+        if engine is None or not active:
+            raise AgentError("讨论未在进行中")
+        try:
+            record = engine.interject(text)
+        except DiscussionError as exc:
+            raise AgentError(str(exc)) from exc
+        return {"ok": True, "chars": int(record.get("chars") or 0)}
+
+    def discussion_resume(self, discussion_id: str) -> dict[str, Any]:
+        """`POST /api/discussions/{id}/resume`：从最后一个未完成 Turn 接着跑。"""
+        from ..agents.discussion import DiscussionError
+
+        self._require_multi_agent()
+        try:
+            discussion = self._discussion_store().load(discussion_id)
+        except DiscussionError as exc:
+            raise AgentError(str(exc)) from exc
+        if discussion.state not in ("interrupted", "stopped"):
+            raise AgentError(
+                f"只有 interrupted / stopped 的讨论可以继续，当前状态：{discussion.state}"
+            )
+        with self._discussion_lock:
+            self._reject_if_discussion_running()
+            stop = threading.Event()
+            engine = self._discussion_new_engine(stop)
+            self._discussion_stop = stop
+            self._discussion_engine = engine
+            self._discussion_active_id = discussion_id
+            thread = threading.Thread(
+                target=self._discussion_worker,
+                args=(engine, "resume", discussion_id),
+                name=f"vibe-discussion-{discussion_id}",
+                daemon=True,
+            )
+            self._discussion_thread = thread
+            thread.start()
+        return {"ok": True, "discussionId": discussion_id}
+
+    def discussion_stop(self, discussion_id: str) -> dict[str, Any]:
+        """`POST /api/discussions/{id}/stop`：掐断当前发言并在回合边界收尾。"""
+        from ..agents.discussion import DiscussionError
+
+        self._require_multi_agent()
+        try:
+            discussion = self._discussion_store().load(discussion_id)
+        except DiscussionError as exc:
+            raise AgentError(str(exc)) from exc
+        with self._discussion_lock:
+            if (
+                self._discussion_active_id != discussion_id
+                or self._discussion_stop is None
+            ):
+                raise AgentError("讨论未在进行中")
+            self._discussion_stop.set()
+            rounds = discussion.rounds()
+        # 审计只记元数据：停在哪一轮、停的是哪场。发言正文不落审计。
+        self.agent.audit.record(
+            "multiagent.stop",
+            discussion_id=discussion_id,
+            rounds=rounds,
+        )
+        return {"ok": True, "stopping": True}
+
+    # ------------------------------------------------------------------ E：结论出口
+    def discussion_insert(self, discussion_id: str) -> dict[str, Any]:
+        """`POST /api/discussions/{id}/insert`：把结论作为一条用户消息插入对话。
+
+        不启动新一轮：用户此刻可能只是想「把这段讨论记下来」。写盘只发生在
+        会话库里（与普通消息同一条通道），讨论期间工作区零写盘的口径不变。
+        """
+        text = self._conclusion_text(discussion_id, as_task=False)
+        with self._lock:
+            if self._state != P.STATE_IDLE:
+                raise BusyError("已有任务正在执行，等它结束后再插入结论")
+            self.agent.record_user_message(text)
+        return {
+            "ok": True,
+            "mode": "insert",
+            "discussionId": discussion_id,
+            "chars": len(text),
+        }
+
+    def discussion_dispatch(self, discussion_id: str) -> dict[str, Any]:
+        """`POST /api/discussions/{id}/dispatch`：把结论作为新任务下发。
+
+        走的是普通 `submit` 通道 —— 也就是说结论只是「用户的一次派活」，
+        真要改文件仍由主 Agent 走既有审批漏斗（ADR-008），不新增写盘捷径。
+        """
+        text = self._conclusion_text(discussion_id, as_task=True)
+        run_id = self.submit(text)
+        return {
+            "ok": True,
+            "mode": "dispatch",
+            "discussionId": discussion_id,
+            "runId": run_id,
+        }
+
+    def _conclusion_text(self, discussion_id: str, *, as_task: bool) -> str:
+        """读结论并包装：来源标注 + `wrap_untrusted`，两条出口共用。"""
+        from ..agents.discussion import DiscussionError, conclusion_prompt
+
+        self._require_multi_agent()
+        try:
+            discussion = self._discussion_store().load(discussion_id)
+        except DiscussionError as exc:
+            raise AgentError(str(exc)) from exc
+        # 还在跑的讨论没有「结论」，此刻插入会把半成品当成最终意见。
+        if discussion.state == "running":
+            raise AgentError("讨论还在进行中，结束后才能插入或下发")
+        return conclusion_prompt(discussion, as_task=as_task)
+
+    def _discussion_worker(
+        self,
+        engine: Any,
+        mode: str,
+        discussion_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """讨论工作线程：引擎自身负责逐 Turn 落盘与 failed 收敛。"""
+        try:
+            if mode == "start":
+                engine.start(discussion_id=discussion_id, **kwargs)
+            else:
+                engine.resume(discussion_id)
+        except Exception as exc:  # noqa: BLE001 — 后台线程不能让异常穿出去
+            self.bus.publish(
+                P.event(P.RUN_NOTICE, runId="", text=f"讨论异常结束：{exc}")
+            )
+            # 线程已经退出，记录不能停在 running（否则界面永久「进行中」且无法 resume）。
+            try:
+                engine.settle_aborted(discussion_id)
+            except Exception:  # noqa: BLE001 — 收敛失败也不该盖住原始异常
+                pass
+        finally:
+            with self._discussion_lock:
+                if self._discussion_thread is threading.current_thread():
+                    self._discussion_thread = None
+                    self._discussion_stop = None
+                    self._discussion_engine = None
+                    self._discussion_active_id = ""
+
+    # 引擎事件 → 协议事件。只在这里做一次翻译，引擎不依赖 host 层。
+    _DISCUSSION_EVENT_MAP = {
+        "discussion.round": P.DISCUSSION_ROUND,
+        "discussion.turn_started": P.DISCUSSION_TURN_STARTED,
+        "discussion.agent_state": P.DISCUSSION_AGENT_STATE,
+        "discussion.observe": P.DISCUSSION_OBSERVE,
+        "discussion.delta": P.DISCUSSION_DELTA,
+        "discussion.consensus": P.DISCUSSION_CONSENSUS,
+        "discussion.message": P.DISCUSSION_MESSAGE,
+    }
+
+    def _on_discussion_event(self, event: Mapping[str, Any]) -> None:
+        """引擎的窄回调：翻译成 `discussion.*` 广播，并落**元数据**审计。"""
+        kind = str(event.get("type") or "")
+        payload = {key: value for key, value in event.items() if key != "type"}
+        discussion_id = str(payload.get("discussionId") or "")
+        audit = self.agent.audit
+        if kind == "discussion.started":
+            audit.record(
+                "multiagent.start",
+                discussion_id=discussion_id,
+                participants=len(payload.get("participants") or []),
+                rounds=int(payload.get("maxRounds") or 0),
+            )
+            self.bus.publish(P.event(P.DISCUSSION_STARTED, **payload))
+            return
+        if kind == "discussion.resumed":
+            # 续跑不重复记 start（否则一场讨论会被算成两场）。
+            self.bus.publish(P.event(P.DISCUSSION_STARTED, **payload, resumed=True))
+            return
+        if kind == "turn.done":
+            turn = payload.pop("turn", None)
+            # 引擎发的是 Turn 对象（B1 定稿），这里统一转成 camelCase 视图。
+            turn = turn.to_dict() if hasattr(turn, "to_dict") else (turn or {})
+            view = {
+                **payload,
+                "round": int(turn.get("round") or 0),
+                "agentId": str(turn.get("agentId") or ""),
+                "stance": str(turn.get("stance") or "unknown"),
+                "points": list(turn.get("points") or []),
+                "chars": int(turn.get("chars") or 0),
+                "ok": bool(turn.get("ok", False)),
+                "errorKind": str(turn.get("error") or "").split(":", 1)[0].lower(),
+            }
+            audit.record(
+                "multiagent.turn",
+                discussion_id=discussion_id,
+                round=view["round"],
+                stance=view["stance"],
+                chars=view["chars"],
+                ok=view["ok"],
+            )
+            self.bus.publish(P.event(P.DISCUSSION_TURN, **view))
+            return
+        if kind == "interjection":
+            record = payload.pop("interjection", None) or {}
+            accepted = bool(record.get("accepted", False))
+            chars = int(record.get("chars") or 0)
+            audit.record(
+                "multiagent.interject",
+                discussion_id=discussion_id,
+                round=int(record.get("round") or 0),
+                accepted=accepted,
+                chars=chars,
+            )
+            self.bus.publish(
+                P.event(
+                    P.DISCUSSION_INTERJECTION,
+                    **payload,
+                    accepted=accepted,
+                    chars=chars,
+                    text=str(record.get("text") or ""),
+                    stage=str(record.get("stage") or ""),
+                )
+            )
+            return
+        if kind == "discussion.finished":
+            audit.record(
+                "multiagent.finish",
+                discussion_id=discussion_id,
+                state=str(payload.get("state") or ""),
+                reason=str(payload.get("terminationReason") or ""),
+                rounds=int(payload.get("rounds") or 0),
+                chars=int(payload.get("finalChars") or 0),
+            )
+            self.bus.publish(P.event(P.DISCUSSION_FINISHED, **payload))
+            return
+        if kind == "discussion.failed":
+            audit.record(
+                "multiagent.finish",
+                discussion_id=discussion_id,
+                state=str(payload.get("state") or "interrupted"),
+                reason=str(payload.get("terminationReason") or "failed"),
+                rounds=0,
+                chars=0,
+            )
+            self.bus.publish(
+                P.event(
+                    P.DISCUSSION_FAILED,
+                    **payload,
+                    kind=str(payload.get("kind") or "error"),
+                )
+            )
+            return
+        mapped = self._DISCUSSION_EVENT_MAP.get(kind)
+        if mapped:
+            self.bus.publish(P.event(mapped, **payload))
+
     # ------------------------------------------------------------------ 远程设备工作面（M11）
     # 这一层是**用户面**（ADR-011：用户本人动作），与 Agent 侧的 8 个
     # `tool.remote_*` 工具是两条互不干扰的路：工具面重启始终走审批漏斗，
@@ -978,7 +1492,7 @@ class Session:
 
     def _remote_store(self) -> RemoteStore:
         """载入连接清单并顺手校验每条 —— 一份手动改坏的清单不该等到「用的时候」才炸。"""
-        store = RemoteStore.load(store_path_for(self.agent.config))
+        store = load_store(self.agent.config)
         for conn in store.list():
             conn.validate()
         return store
@@ -1998,7 +2512,15 @@ class Session:
         }
         # 远程工作区（M13 / ADR-042）：本机模式**一个键都不追加** —— `describe()`
         # 的形状必须与未启用时逐字节一致（决策 11）。
-        return {**base, **self._remote_describe()}
+        extra = self._remote_describe()
+        # 多智能体讨论（M14-C）：关闭时同样**一个键都不追加**；开启时只给
+        # 「有没有在跑的那一场」，档案列表走 `/api/agents`（不把正文塞进快照）。
+        if cfg.multi_agent_enabled:
+            extra["multiAgent"] = {
+                "enabled": True,
+                "activeId": self._discussion_active_id,
+            }
+        return {**base, **extra}
 
     def _remote_describe(self) -> dict[str, Any]:
         """`describe()` 里的远程工作区段。非远程工作区时恒返回空字典。"""

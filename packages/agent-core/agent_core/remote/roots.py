@@ -23,9 +23,10 @@
 
 ## 存哪
 
-`<workspace>/.vibe/remote.json` 的**顶层 `roots` 数组**，与连接清单同一份文件、
-同一套原子写与 0600 权限。**不升 `FORMAT_VERSION`**：老客户端把 `roots` 当未知
-键忽略即可，仍能正常读连接。
+`<workspace>/.vibe/remote-roots.json` 的顶层 `roots` 数组（与连接清单分两处：
+连接清单可能被 `remote_config` 钉在别的工作区，而工作区根必须恒随当前工作区）。
+老版本把它写在 `<workspace>/.vibe/remote.json` 的顶层 `roots` 里 —— 同目录下
+没有独立根文件时仍按旧位置读一次，下次落盘自动迁到新文件。
 """
 
 from __future__ import annotations

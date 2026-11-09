@@ -519,7 +519,7 @@ class ServerContext:
             raise ValueError("远程工作面未启用（VIBE_REMOTE=0），无法切到远程目录")
 
         from ..remote.anchor import ensure_anchor
-        from ..remote.store import RemoteStore, store_path_for
+        from ..remote.store import load_store, store_path_for
         from ..remote.workspace import open_workspace
 
         name = str(spec.get("connection") or "").strip()
@@ -530,7 +530,7 @@ class ServerContext:
         except AgentError as exc:
             raise ValueError(str(exc)) from exc
 
-        store = RemoteStore.load(store_path_for(cfg))
+        store = load_store(cfg)
         conn = store.get(name)
         if conn is None:
             available = "、".join(store.names()) or "（无）"
@@ -1037,6 +1037,21 @@ class VibeHandler(BaseHTTPRequestHandler):
         # 投给 M9-D 的后台池，只读工具面与审批纪律原样继承（见 scheduler.runner）。
         if path == "/api/schedules" or path.startswith("/api/schedules/"):
             self._handle_schedules(method, path)
+            return
+
+        # ---- 多智能体讨论（M14-A）：工作区级智能体档案 -------------------
+        # `VIBE_MULTI_AGENT=0`（默认）时门面一律 fail-closed（400），且界面不渲染
+        # 对应页签 —— 与未实现前逐字节一致。档案是**用户本人**维护的配置
+        #（ADR-011 同口径），写盘前校验，坏档案拒收且不落盘。
+        if path == "/api/agents" or path.startswith("/api/agents/"):
+            self._handle_agents(method, path)
+            return
+
+        # ---- 多智能体讨论（M14-C）：HTTP 面 + 事件 + 审计 ------------------
+        # 与档案共用 `VIBE_MULTI_AGENT` 同一道门：关闭时 endpoint 一律 400，
+        # 事件、工具与端点与未实现前逐字节一致（fail-closed）。
+        if path == "/api/discussions" or path.startswith("/api/discussions/"):
+            self._handle_discussions(method, path, query)
             return
 
         # ---- 远程设备文件工作面（M11）：用户本人经界面做远程文件读/审/改/存 ----
@@ -2068,6 +2083,157 @@ class VibeHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"error": "未知定时任务路径"}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_agents(self, method: str, path: str) -> None:
+        """智能体档案端点（M14-A）。
+
+        - `GET  /api/agents`         列表 + 当前可用的只读工具名
+        - `POST /api/agents`         新增 / 更新（`{profile: {...}}`）
+        - `POST /api/agents/delete`  删除（`{id}`）
+
+        无 DELETE 分支（沿用既有约定）；`VIBE_MULTI_AGENT=0` 时门面一律
+        fail-closed（400），不返回空列表。
+        """
+        from ..agents.profile import AgentProfileError
+
+        session = self.server.ctx.session  # type: ignore[attr-defined]
+        parts = [p for p in path.split("/") if p]  # ["api", "agents", ...]
+        try:
+            if len(parts) == 2:
+                if method == "GET":
+                    self._send_json(session.agent_profiles())
+                    return
+                if method == "POST":
+                    body = self._read_json()
+                    profile = body.get("profile") if isinstance(body, dict) else None
+                    if not isinstance(profile, dict):
+                        self._send_json(
+                            {"error": "请求体需包含 profile 对象"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    self._send_json(session.agent_save(profile))
+                    return
+                self._send_json(
+                    {"error": "方法不支持"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                )
+                return
+
+            if len(parts) == 3 and parts[2] == "delete":
+                if method != "POST":
+                    self._send_json(
+                        {"error": "方法不支持"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                body = self._read_json()
+                agent_id = str((body or {}).get("id") or "").strip()
+                if not agent_id:
+                    self._send_json(
+                        {"error": "缺少 id"}, status=HTTPStatus.BAD_REQUEST
+                    )
+                    return
+                deleted = session.agent_delete(agent_id)
+                self._send_json({"ok": True, "deleted": deleted})
+                return
+
+            self._send_json({"error": "未知智能体路径"}, status=HTTPStatus.NOT_FOUND)
+        except (AgentError, AgentProfileError) as exc:
+            # 档案文件被手改坏也回 400（带文件路径的人话），不伪装成 500。
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_discussions(
+        self, method: str, path: str, query: dict[str, list[str]]
+    ) -> None:
+        """多智能体讨论端点（M14-C）。
+
+        - `GET  /api/discussions`                 最近摘要
+        - `POST /api/discussions`                 开一场（`requestId` 必填，幂等）
+        - `GET  /api/discussions/{id}?after=<seq>` 详情 / 增量
+        - `POST /api/discussions/{id}/message`     用户插话
+        - `POST /api/discussions/{id}/resume`      续跑
+        - `POST /api/discussions/{id}/stop`        停止
+        - `POST /api/discussions/{id}/insert`      结论插入对话
+        - `POST /api/discussions/{id}/dispatch`    结论作为任务下发
+
+        `VIBE_MULTI_AGENT=0` 时门面一律 400（fail-closed）。并发起第二场 → 409。
+        """
+        from ..agents.discussion import DiscussionError
+
+        session = self.server.ctx.session  # type: ignore[attr-defined]
+        parts = [p for p in path.split("/") if p]  # ["api", "discussions", ...]
+        try:
+            if len(parts) == 2:
+                if method == "GET":
+                    self._send_json(session.discussion_list())
+                    return
+                if method == "POST":
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        self._send_json(
+                            {"error": "请求体需为 JSON 对象"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    self._send_json(session.discussion_start(body))
+                    return
+                self._send_json(
+                    {"error": "方法不支持"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                )
+                return
+
+            if len(parts) == 3:
+                discussion_id = parts[2]
+                if method != "GET":
+                    self._send_json(
+                        {"error": "方法不支持"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    )
+                    return
+                after = (query.get("after") or [""])[0]
+                self._send_json(session.discussion_detail(discussion_id, after))
+                return
+
+            if len(parts) == 4 and method == "POST":
+                discussion_id, action = parts[2], parts[3]
+                if action == "message":
+                    body = self._read_json()
+                    if not isinstance(body, dict):
+                        self._send_json(
+                            {"error": "请求体需为 JSON 对象"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    text = str(body.get("text") or "")
+                    self._send_json(session.discussion_message(discussion_id, text))
+                    return
+                if action == "resume":
+                    self._send_json(session.discussion_resume(discussion_id))
+                    return
+                if action == "stop":
+                    self._send_json(session.discussion_stop(discussion_id))
+                    return
+                if action == "insert":
+                    self._send_json(session.discussion_insert(discussion_id))
+                    return
+                if action == "dispatch":
+                    self._send_json(session.discussion_dispatch(discussion_id))
+                    return
+                self._send_json(
+                    {"error": "未知讨论动作"}, status=HTTPStatus.NOT_FOUND
+                )
+                return
+
+            if len(parts) == 4:
+                self._send_json(
+                    {"error": "方法不支持"}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                )
+                return
+
+            self._send_json({"error": "未知讨论路径"}, status=HTTPStatus.NOT_FOUND)
+        except BusyError as exc:
+            # 同一时刻只允许一场讨论：并发起第二场是冲突，不是坏参数。
+            self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+        except (AgentError, DiscussionError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def _handle_remote(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         """远程设备工作面端点（M11）：连接管理 + 远程文件面 + 远程审查面。

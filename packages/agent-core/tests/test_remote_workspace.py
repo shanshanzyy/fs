@@ -58,6 +58,14 @@ class _HostCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.ws = Path(self._tmp.name).resolve()
         (self.ws / ".vibe").mkdir(exist_ok=True)
+        # 锚点根必须隔离到临时目录：真实 `~/.vibe/workspaces/remote` 会跨运行留存，
+        # 历史根节点会让「首次登记」用例直接撞上重复登记 400。
+        self._anchor_home = self.ws / "anchors"
+        self._anchor_patch = mock.patch(
+            "agent_core.remote.anchor.anchor_home", return_value=self._anchor_home
+        )
+        self._anchor_patch.start()
+        self.addCleanup(self._anchor_patch.stop)
         self.transport = FakeTransport(dict(self.files))
         self._patch = mock.patch(
             "agent_core.remote.workspace.transport_for",
@@ -569,6 +577,26 @@ class RemoteWorkspaceHttpTest(_HostCase):
         view = self.get_json("/api/workspaces")
         self.assertIs(view.get("remoteEnabled"), True)
         self.assertIn("remoteWorkspaces", view)
+
+    def test_roots_do_not_follow_workspace_switch(self) -> None:
+        """远程根按工作区登记：在远程工作区里加的根，切回本机文件夹时不该跟过来。
+
+        根与连接清单分两处落盘正是为了这个 —— 连接清单被钉在切出去之前的
+        本机工作区（ADR-042 决策 13），根若跟它同文件就会串工作区。
+        """
+        self._start_host(remote=True, conns=[make_conn(allow_write=True)])
+        self._switch({"remote": {"connection": "devbox", "sub": ""}}, code=200)
+        added = self.expect_status(
+            "POST", "/api/remote/roots", {"connection": "devbox", "sub": "app"}, code=200
+        )
+        self.assertEqual([r["nsPath"] for r in added["roots"]], ["@remote/devbox/app"])
+
+        other = Path(self._tmp.name).resolve() / "ws3"
+        other.mkdir()
+        self.expect_status(
+            "POST", "/api/workspaces/open", {"path": str(other)}, code=200
+        )
+        self.assertEqual(self.get_json("/api/remote/roots")["roots"], [])
 
     def test_switch_back_to_local_clears_remote(self) -> None:
         """切回本机后 `remote*` 键必须整体消失 —— 留着就会把改动写到错的机器上。"""

@@ -791,6 +791,68 @@ ADR-042 把它们拆开了，因此 30+ 个 `config.workspace / ".vibe"` 注入�
 
 ---
 
+### 工作区多智能体圆桌讨论（M14，见 ADR-043）
+
+用户在工作区里维护若干**智能体档案**，围绕同一议题让它们**平级、多轮、互相阅读**地讨论，
+由规则判定是否达成一致，最后把结论**插回主对话**或**作为任务下发**。与 M3 子 Agent 的区别：
+子 Agent 是「主 Agent 派一个只读分身查一件事」，彼此不可见；讨论是多方同时在场、可以交叉质询。
+
+| 环境变量 | `Config` 字段 | 默认 | 说明 |
+|---|---|---|---|
+| `VIBE_MULTI_AGENT` | `multi_agent_enabled` | `0` | 总门控；关着时端点一律 400、无页签 / 事件 / 工具，快照与清单逐字节不变 |
+| `VIBE_MULTI_AGENT_MONITOR` | `multi_agent_monitor` | `live` | 互监档位：`status` / `live` / `full`；非法值拒绝开场 |
+| `VIBE_MULTI_AGENT_OBSERVE_CHARS` | `multi_agent_observe_chars` | `600` | 观测块上限（上下文未知时用它）；已知窗口时按比例推导并钳制 400–1200 |
+| `VIBE_MULTI_AGENT_OBSERVE_RATIO` | `multi_agent_observe_ratio` | `0.005` | 观测块占上下文窗口的比例 |
+| `VIBE_MULTI_AGENT_INTERJECT_MAX` | `multi_agent_interject_max` | `2` | 每人每场最多受理几次举手（0 = 一律不受理） |
+| `VIBE_MULTI_AGENT_FIRST_ROUND_LIVE` | `multi_agent_first_round_live` | `0` | 第 1 轮是否放开他人正文（默认只给状态，抑制锚定） |
+
+**落盘**（均在当前工作区，受 PathGuard 约束）：
+
+- 档案：`<workspace>/.vibe/agents.json`（用户配置；写前校验，坏档案拒收且不落盘）
+- 讨论：`<workspace>/.vibe/discussions/<id>.json`（逐 Turn 落盘 + `seq` 游标）
+
+**端点**（`VIBE_MULTI_AGENT` 门控，未启用一律 400）：
+
+| 方法与路径 | 作用 |
+|---|---|
+| `GET /api/agents` | 档案列表 + 可用只读工具名 |
+| `POST /api/agents` / `POST /api/agents/delete` | 新增 / 更新 / 删除档案（用户本人动作） |
+| `GET /api/discussions` | 最近讨论摘要（不含正文） |
+| `POST /api/discussions` | 开场（`moderator` 与 `requestId` 必填；重放同一 `requestId` 返回原场次；已有在跑 → 409） |
+| `GET /api/discussions/{id}?after=<seq>` | 单场详情 / 增量重连 |
+| `POST /api/discussions/{id}/message` | 讨论中插话（下一位发言前送达） |
+| `POST /api/discussions/{id}/resume` | 续跑 `interrupted` / `stopped` |
+| `POST /api/discussions/{id}/stop` | 停止（掐断当前流的生成，回合边界收尾） |
+| `POST /api/discussions/{id}/insert` | 结论插入对话：写一条用户消息、不启动新一轮；在跑 400、正忙 409 |
+| `POST /api/discussions/{id}/dispatch` | 结论作为任务下发：复用普通 `submit`；在跑 400、正忙 409 |
+
+**事件**：`discussion.started / resumed / round / turn_started / agent_state / observe / delta /
+turn / interjection / message / consensus / finished / failed`（SSE 推送；`GET ...?after=`
+用于刷新续播，不重复已有 Turn）。
+
+**三条硬边界**（与 M3 同口径）：
+
+1. **只读**：每个发言者由 `build_readonly_registry()` 再按档案裁剪，`allow_write=False` /
+   `allow_shell=False`；写盘仍回主 Agent 审批。
+2. **不递归**：子表不含 `task`，讨论里不注册任何讨论工具 —— Agent 不能自己开场。
+3. **共用审计**：整场复用同一个 `AuditLog`；审计只记
+   `multiagent.start / turn / interject / finish / stop` 的元数据，议题 / 发言 / 观测正文
+   一个字符都不出机（ADR-006）。
+
+**结论出口**：`conclusion_prompt()` 把结论正文恒套
+`wrap_untrusted(source=discussion:<id>)`，并在头部写明议题、场次、状态与终止原因；
+「插入对话」只写历史、「下发任务」走普通 `submit` —— 讨论本身**零写盘**，
+两条动作都是用户本人发起，不新增工具、不新增审计事件。
+
+**测试**：`tests/test_multi_agent.py`（档案 / 原子写 / 互监 / 观测预算）、
+`tests/test_discussion.py`（引擎判定 / 依据核验 / 结论包装）、
+`tests/test_discussion_http.py`（端点、门控、事件、插入 / 下发、忙碌与运行中拒绝）。
+
+**边界**：不做多场并发（其余 409）、不做线程级并行、不做长时后台讨论、不做 Agent 自主招募、
+不做跨设备讨论真机验证（远程只读工具走 M12 / M13 路由属顺带能力）、档案不承载独立模型端点 / 密钥。
+
+---
+
 ## 代码地图
 
 ```

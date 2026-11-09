@@ -1056,6 +1056,60 @@ _RULES: dict[str, Rule] = {
         note="定时任务一次生命周期动作的元数据。prompt 正文只留本机，"
         "这里只记 job_id 归属、动作与状态枚举、prompt 长度与耗时",
     ),
+    # 多智能体圆桌讨论（M14-C）：五个事件覆盖「开场 / 发言 / 举手 / 收尾 / 停止」。
+    # 只记讨论归属、参与人数、轮次、立场枚举、状态/终止原因、字数与受理结果；
+    # **议题正文、发言正文、观测正文**一个字符都不出机（ADR-006）。
+    "multiagent.start": Rule(
+        upload="multiagent.start",
+        fields={
+            "discussion_id": ("discussion_id", "str"),
+            "participants": ("participants", "int"),
+            "rounds": ("rounds", "int"),
+        },
+        note="一场讨论开场的元数据：讨论 id、参与人数、轮次上限。议题正文只留本机",
+    ),
+    "multiagent.turn": Rule(
+        upload="multiagent.turn",
+        fields={
+            "discussion_id": ("discussion_id", "str"),
+            "round": ("round", "int"),
+            "stance": ("stance", "str"),
+            "chars": ("chars", "int"),
+            "ok": ("ok", "bool"),
+        },
+        note="一条发言的元数据：第几轮、立场枚举、字数、是否成功。"
+        "发言正文只留本机",
+    ),
+    "multiagent.interject": Rule(
+        upload="multiagent.interject",
+        fields={
+            "discussion_id": ("discussion_id", "str"),
+            "round": ("round", "int"),
+            "accepted": ("accepted", "bool"),
+            "chars": ("chars", "int"),
+        },
+        note="一次举手插话的元数据：第几轮、是否受理、字数。插话正文只留本机",
+    ),
+    "multiagent.finish": Rule(
+        upload="multiagent.finish",
+        fields={
+            "discussion_id": ("discussion_id", "str"),
+            "state": ("state", "str"),
+            "reason": ("reason", "str"),
+            "rounds": ("rounds", "int"),
+            "chars": ("chars", "int"),
+        },
+        note="讨论收尾的元数据：终态、终止原因枚举、轮次与结论字数。"
+        "结论正文只留本机",
+    ),
+    "multiagent.stop": Rule(
+        upload="multiagent.stop",
+        fields={
+            "discussion_id": ("discussion_id", "str"),
+            "rounds": ("rounds", "int"),
+        },
+        note="用户停止讨论的元数据：讨论 id 与停在第几轮",
+    ),
     # ---------------------------------------------------------------- 上下文裁剪
     "context.compact": Rule(
         upload="context.compact",

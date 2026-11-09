@@ -469,6 +469,34 @@ _SCHEMA: dict[str, dict[str, str]] = {
         "chars": "int",
         "ms": "int",
     },
+    # 多智能体圆桌讨论（M14-C）。只收讨论归属、参与人数、轮次、立场/状态/原因
+    # 枚举、字数与受理结果；议题、发言、观测的**正文**不出机（ADR-006）。
+    "multiagent.start": {
+        "discussion_id": "str",
+        "participants": "int",
+        "rounds": "int",
+    },
+    "multiagent.turn": {
+        "discussion_id": "str",
+        "round": "int",
+        "stance": "str",
+        "chars": "int",
+        "ok": "bool",
+    },
+    "multiagent.interject": {
+        "discussion_id": "str",
+        "round": "int",
+        "accepted": "bool",
+        "chars": "int",
+    },
+    "multiagent.finish": {
+        "discussion_id": "str",
+        "state": "str",
+        "reason": "str",
+        "rounds": "int",
+        "chars": "int",
+    },
+    "multiagent.stop": {"discussion_id": "str", "rounds": "int"},
     # 上下文裁剪（C4）。只收「压掉了几条」与「摘要多长」——
     # 摘要**正文**必然引述对话里的约束、路径与命令原文，属于 ADR-006 的正文类，
     # 客户端也不会把它放进载荷。

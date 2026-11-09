@@ -115,6 +115,7 @@ python scripts/mock_model_server.py --port 11500
 | **M11**  | 远程设备文件工作面（连接管理 / 文件树与查看 / 代码审查 / 编辑保存）               | ✅ **已完成（A–F 六阶段全部闭合）**（在既有「远程设备接入」链路上补**面向用户的文件工作面**：界面管理连接与权限位、远端文件树与只读查看、**留底 vs 远端**的 unified diff 逐 hunk 审查、编辑保存（写前本机留底 + `expectedDigest` 乐观锁 + 受控覆盖 + 回读校验 + 真实 diff）、`remote_review_changes` 只读自审；**不新增传输协议、不新增门控**，挂在既有 `VIBE_REMOTE` 上；审计新增 `remote.connection` / `remote.file` 只记元数据，**远端正文与 diff 不出机**） → [docs/M11-PLAN.md](docs/M11-PLAN.md) · [docs/REMOTE.md](docs/REMOTE.md) |
 | **M12**  | 远端目录「加入工作区」（命名空间透明路由）                            | ✅ **已完成（A–F 六阶段全部闭合）**（远端文件树里右键目录 →「加入工作区」，即把远端目录登记为**命名空间根** `@remote/<连接名>/<子路径>`；Agent 的 `read_file` / `list_dir` / `find_files` / `grep` / `edit_file` / `write_file` 见到该前缀**透明路由**到远端臂 —— **工具名与 schema 一字不加**、提示词逐字节一致；本地臂走 `PathGuard`、远端臂走 `RemotePathGuard` 两道 Jail；远端写仍守红线（结构化补丁或受控覆盖 + 写前本机留底 + 真实 diff + 审批）；`VIBE_REMOTE` 默认关时无端点 / 无右键 / 无新工具） → [docs/M12-PLAN.md](docs/M12-PLAN.md) |
 | **M13**  | 远端目录「作为工作区」（本地锚点 + 路由默认根）                          | ✅ **已完成（A–F 六阶段全部闭合）**（「切换工作区」弹层新增「远程目录」页签：选连接 → 浏览远端目录（目录行可下钻、**文件行只列出不可选** —— 工作区只能是目录）→「设为工作区并重启」。该远端目录成为**路由默认根**，模型写裸相对路径（`src/app.py`）也落到那台机器上；而 `.vibe` 资产（审计链 / 会话库 / 检查点 / 远端写的本机留底）仍留在**本机锚点** `~/.vibe/workspaces/remote/<连接>/<指纹>/`（ADR-006 不动）。切换**先连后切**（握手 + 目录存在性校验，失败则旧会话原封不动）；本机 Git / LSP / 索引 watch 在该模式下**如实降级**并给出人话原因；**不新增门控**、沿用 `VIBE_REMOTE`（未启用时 `remote` 载荷 400 fail-closed、页签整键隐藏）） → [docs/M13-PLAN.md](docs/M13-PLAN.md) |
+| **M14**  | 工作区多智能体圆桌讨论（档案 / 实时互监 / 规则判定 / 结论出口）              | ✅ **已完成（A–F 六阶段全部闭合）**（用户维护档案 `.vibe/agents.json`；一次性前台讨论逐 Turn 落 `.vibe/discussions/<id>.json`，`seq` 游标 + 显式 `resume`；实时互监折叠为增量摘要并以 `wrap_untrusted(source=agent:<名>)` 注入，首轮默认静默；共识由可组合规则 + 本地 `verify_evidence()` 判定，主持人只汇总、失败**明确降级**；结论只有「插入对话 / 作为任务下发」两条出口，正文恒 `wrap_untrusted(source=discussion:<id>)` 并带议题/场次/状态/终止原因标注；讨论期**零写盘**，只读 / 不递归 / 共用审计三条硬边界；`VIBE_MULTI_AGENT` 默认关、关闭时逐字节不变；审计 `multiagent.*` 只记元数据） → [docs/M14-PLAN.md](docs/M14-PLAN.md) |
 
 ***
 
@@ -267,7 +268,7 @@ python scripts/build_desktop.py --backend --installer
 
 ## 文档
 
-- [整体架构设计](docs/ARCHITECTURE.md) —— 双平面架构、ADR-001\~042、M0–M13 演进路线、选型矩阵
+- [整体架构设计](docs/ARCHITECTURE.md) —— 双平面架构、ADR-001\~043、M0–M14 演进路线、选型矩阵
 - [agent-core 详细文档](packages/agent-core/README.md) —— 代码地图、安全模型、
   三级补丁匹配、审计设计、如何新增工具、M0 的边界
 - [桌面客户端文档](apps/desktop/README.md) —— 配置项、安全边界、排查手册、M1 的边界
@@ -284,6 +285,7 @@ python scripts/build_desktop.py --backend --installer
 - [M11 里程碑（远程设备文件工作面）](docs/M11-PLAN.md) —— 在既有远程链路上补连接管理 / 文件树与查看 / 代码审查（留底 vs 远端的 unified diff）/ 编辑保存（留底 + 乐观锁 + 真实 diff），`VIBE_REMOTE` 默认关、不新增门控
 - [M12 里程碑（远端目录加入工作区）](docs/M12-PLAN.md) —— 远端目录登记为命名空间根 `@remote/<连接名>/<子路径>`，六个工具见到前缀透明路由到远端臂（工具名与 schema 一字不加），本地 `PathGuard` / 远端 `RemotePathGuard` 两道 Jail，`VIBE_REMOTE` 默认关时无端点/无右键/无新工具
 - [M13 里程碑（远端目录作为工作区）](docs/M13-PLAN.md) —— 「切换工作区」弹层新增「远程目录」页签（目录可下钻、文件只列出不可选），选中即成为**路由默认根**、`.vibe` 资产仍落**本机锚点**，先连后切保原子性，本机 Git/LSP/索引如实降级，不新增门控
+- [M14 里程碑（工作区多智能体圆桌讨论）](docs/M14-PLAN.md) —— 档案 + 逐 Turn 落盘 + `seq` 增量重连 + 实时互监（`wrap_untrusted`、首轮静默）+ 规则判定与本地依据核验 + 结论「插入对话 / 下发任务」，讨论期零写盘，`VIBE_MULTI_AGENT` 默认关、只读 / 不递归 / 共用审计
 - [远程设备文件操作](docs/REMOTE.md) —— 连接清单与 CLI、ssh 加固、路径 Jail、9 个 Agent 工具、**界面工作面（面板 / 端点 / 事件 / 保存语义）**、**远端目录作为工作区（M13）**、能力降级与排障
 
 ***

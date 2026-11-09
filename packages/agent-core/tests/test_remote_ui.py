@@ -28,6 +28,7 @@ from agent_core.errors import SandboxViolation, ToolError  # noqa: E402
 from agent_core.remote.store import (  # noqa: E402
     FORMAT_VERSION,
     RemoteStore,
+    roots_path_for,
     store_path_for,
 )
 from tests.test_agent_loop import FakeClient  # noqa: E402
@@ -593,16 +594,32 @@ class RemoteRootApiTest(_HostCase):
         self.assertTrue(root["ok"])
         self.assertEqual(root["reason"], "")
 
-        path = store_path_for(self.config)
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        # 不升 FORMAT_VERSION：老客户端把 roots 当未知键忽略，仍能读连接清单。
+        # 根落**独立文件**（`<workspace>/.vibe/remote-roots.json`）：连接清单可能被
+        # `remote_config` 钉在别的工作区，根跟着清单跑就会串工作区。
+        roots_path = roots_path_for(self.config)
+        raw = json.loads(roots_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["version"], FORMAT_VERSION)
         self.assertEqual([r["connection"] for r in raw["roots"]], ["devbox"])
-        leftovers = [p.name for p in path.parent.glob("*.tmp*")]
+        # 连接清单里不再写 roots（老版本的同名键在迁移后也不再出现）
+        main = json.loads(store_path_for(self.config).read_text(encoding="utf-8"))
+        self.assertNotIn("roots", main)
+        leftovers = [p.name for p in roots_path.parent.glob("*.tmp*")]
         self.assertEqual(leftovers, [], "原子写留下了临时文件残渣")
         self.assertEqual(
-            [root.key for root in RemoteStore.load(path).roots], ["devbox:"]
+            [root.key for root in RemoteStore.load(store_path_for(self.config), roots_path=roots_path).roots],
+            ["devbox:"],
         )
+
+    def test_roots_are_workspace_scoped(self) -> None:
+        """切到另一个本机工作区，上一个工作区的远端根**不该**跟过来。"""
+        self._start_host(remote=True, conns=[make_conn()])
+        self.post_json("/api/remote/roots", {"connection": "devbox", "sub": ""})
+        self.assertEqual(len(self._roots()["roots"]), 1)
+
+        other = Path(self._tmp.name).resolve() / "ws2"
+        other.mkdir()
+        self.post_json("/api/workspaces/open", {"path": str(other)})
+        self.assertEqual(self._roots()["roots"], [])
 
     def test_add_root_with_sub_is_normalized(self) -> None:
         """带尾斜杠 / 反斜杠的写法归一化后再落盘，避免同一目录登记两份。"""

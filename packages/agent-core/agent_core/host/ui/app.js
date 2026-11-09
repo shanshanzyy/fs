@@ -153,6 +153,25 @@ const S = {
     prevEditor: '',        // 打开远程设备之前的活动页签（关闭时回到它）
     degradedOpen: false,   // 能力降级摘要是否展开
   },
+  // 多智能体（M14-D）：档案与讨论都只镜像后端权威视图，界面不自己推断状态。
+  // enabled 由 applySession 按 info.multiAgent 门控（关时两个入口都不渲染）。
+  agents: {
+    enabled: false,
+    loaded: false,
+    list: [],              // GET /api/agents 的 agents
+    tools: [],             // 当前环境下可用的只读工具名
+    editing: '',           // 表单正在编辑的档案 id（'' = 新建）
+  },
+  discussion: {
+    enabled: false,
+    loaded: false,
+    list: [],              // GET /api/discussions 的摘要
+    activeId: '',          // 后端当前在跑的讨论 id
+    openId: '',            // 界面正在看的那一场
+    current: null,         // 最近一次 detail 的完整视图
+    cards: new Map(),      // turnId -> 已渲染的发言卡片
+    streaming: null,       // {turnId, card, body, note, text}：流式发言
+  },
 };
 const stream = $('stream');
 
@@ -329,6 +348,21 @@ function applySession(info) {
   // 点进去只能看到「未启用」的拒绝 —— 那不是入口，只是一次徒劳的点击。
   const wsRemoteTab = $('ws-tab-remote');
   if (wsRemoteTab) wsRemoteTab.hidden = !remoteOn;
+  // 多智能体（M14）：VIBE_MULTI_AGENT=0 时两个入口都不渲染；正在看的面板
+  // 退回资源管理器 —— 与终端/定时任务/远程同一纪律，不留隐形的空壳页签。
+  const multiOn = !!(info.multiAgent && info.multiAgent.enabled);
+  S.agents.enabled = multiOn;
+  S.discussion.enabled = multiOn;
+  for (const panel of ['agents', 'discussions']) {
+    const act = document.querySelector(`.act[data-panel="${panel}"]`);
+    if (act) act.hidden = !multiOn;
+    if (!multiOn && S.activePanel === panel) switchPanel('explorer');
+  }
+  if (multiOn) {
+    S.discussion.activeId = String(info.multiAgent.activeId || '');
+    if (!S.agents.loaded) refreshAgents();
+    if (!S.discussion.loaded) refreshDiscussions(true);
+  }
   if (info.pendingApproval && !S.awaiting) openApproval(info.pendingApproval);
   if (info.notices?.length) {
     for (const text of info.notices) { addNotice(text); termLine('output', text, 'is-dim'); }
@@ -4387,6 +4421,8 @@ const PANEL_TITLES = {
   tasks: '后台任务',
   schedules: '定时任务',
   remote: '远程设备',
+  agents: '智能体',
+  discussions: '讨论',
   welcome: '开始',
 };
 
@@ -4427,6 +4463,11 @@ function switchPanel(name) {
   if (name === 'mcp') refreshMcpPanel();
   if (name === 'tasks') refreshTasks();
   if (name === 'schedules') refreshSchedules();
+  if (name === 'agents') refreshAgents();
+  if (name === 'discussions') {
+    refreshDiscussions();
+    refreshAgents();   // 参与者选择器要用最新的档案列表
+  }
   if (name === 'welcome') activateEditor('welcome');
 }
 
@@ -5679,6 +5720,15 @@ const HANDLERS = {
       S.booted = true;
     } else if (switched) {
       clearSessionView({ closeEditors: true });
+      // 档案与讨论都按工作区隔离（都落在 <workspace>/.vibe 下）：
+      // 不清缓存就会拿旧工作区的档案去开新工作区的讨论。
+      S.agents = { enabled: S.agents.enabled, loaded: false, list: [], tools: [], editing: '' };
+      S.discussion = {
+        enabled: S.discussion.enabled, loaded: false, list: [], activeId: '',
+        openId: '', current: null, cards: new Map(), streaming: null,
+      };
+      if ($('agent-form')) $('agent-form').hidden = true;
+      if ($('disc-live')) $('disc-live').hidden = true;
     }
     applySession(ev);
     if (switched) {
@@ -5866,6 +5916,21 @@ const HANDLERS = {
 
   // 定时任务（M10）：同样与 run.* 分开 —— 说的是「排期本身」发生了什么。
   'schedule.state': (ev) => applyScheduleState(ev),
+
+  // 多智能体讨论（M14-C）：跑在后台线程里，与 run.* 状态机完全隔离。
+  // 每个事件都带 discussionId，只对当前打开的那一场做增量渲染。
+  'discussion.started': (ev) => applyDiscussionEvent('started', ev),
+  'discussion.round': (ev) => applyDiscussionEvent('round', ev),
+  'discussion.turn_started': (ev) => applyDiscussionEvent('turn_started', ev),
+  'discussion.agent_state': (ev) => applyDiscussionEvent('agent_state', ev),
+  'discussion.observe': (ev) => applyDiscussionEvent('observe', ev),
+  'discussion.interjection': (ev) => applyDiscussionEvent('interjection', ev),
+  'discussion.delta': (ev) => applyDiscussionEvent('delta', ev),
+  'discussion.turn': (ev) => applyDiscussionEvent('turn', ev),
+  'discussion.consensus': (ev) => applyDiscussionEvent('consensus', ev),
+  'discussion.finished': (ev) => applyDiscussionEvent('finished', ev),
+  'discussion.message': (ev) => applyDiscussionEvent('message', ev),
+  'discussion.failed': (ev) => applyDiscussionEvent('failed', ev),
 
   // 远程设备工作面（M11）：状态变化（打开/切换连接、切换浏览目录）驱动连接与权限位徽标。
   'remote.state': (ev) => applyRemoteState(ev),
@@ -6834,6 +6899,656 @@ function applyScheduleState(ev) {
     runCount: ev.runCount || 0,
   };
   renderSchedules();
+}
+
+/* ═══════════════════════════════ 多智能体（M14-D） ═══════════════════════════════
+   两块内容：智能体档案（用户本人维护，落盘在 <workspace>/.vibe）与一场圆桌讨论
+   （后台线程跑，界面只镜像后端权威视图 + 增量事件）。门控关闭时入口按钮本身
+   就不渲染（applySession），所以这里的函数不会被调用到。 */
+
+const DISC_STATE_LABELS = {
+  running: '进行中',
+  consensus: '已达成共识',
+  no_consensus: '未达成共识',
+  stopped: '已停止',
+  failed: '失败',
+  interrupted: '中断',
+};
+const STANCE_LABELS = { agree: '赞同', disagree: '反对', revise: '修正', unknown: '未知' };
+
+/* ---- 智能体档案 ---- */
+
+async function refreshAgents() {
+  const list = $('agent-list');
+  try {
+    const res = await api.get('/api/agents');
+    S.agents.list = res.agents || [];
+    S.agents.tools = res.tools || [];
+    S.agents.loaded = true;
+    renderAgents();
+    renderParticipantPicker();
+  } catch (err) {
+    S.agents.loaded = true;
+    if (list) list.replaceChildren(el('div', 'empty', '加载失败：' + err.message));
+  }
+}
+
+function renderAgents() {
+  const list = $('agent-list');
+  if (!list) return;
+  const badge = $('badge-agents');
+  if (badge) badge.textContent = S.agents.list.length;
+  if (!S.agents.list.length) {
+    list.replaceChildren(el('div', 'empty', '暂无智能体档案。'));
+    return;
+  }
+  list.replaceChildren(...S.agents.list.map(agentRow));
+}
+
+function agentRow(agent) {
+  const row = el('div', 'task-item');
+  const head = el('div', 'task-head');
+  head.appendChild(el('span', 'task-id', agent.name));
+  head.appendChild(el('span', `task-state ${agent.enabled ? 'is-running' : 'is-dim'}`,
+    agent.enabled ? '已启用' : '已停用'));
+  head.appendChild(el('span', 'task-chars', `${(agent.tools || []).length} 个工具`));
+  row.appendChild(head);
+  row.appendChild(el('div', 'task-summary', agent.role || '（未指定角色）'));
+  const acts = el('div', 'task-actions');
+  const edit = el('button', 'btn btn-small', '编辑');
+  edit.type = 'button';
+  edit.addEventListener('click', () => openAgentForm(agent.id));
+  const toggle = el('button', 'btn btn-small', agent.enabled ? '停用' : '启用');
+  toggle.type = 'button';
+  toggle.title = '停用后不能参与讨论，但已有讨论记录不受影响';
+  toggle.addEventListener('click', () => toggleAgent(agent));
+  const del = el('button', 'btn btn-small', '删除');
+  del.type = 'button';
+  del.addEventListener('click', () => deleteAgent(agent.id));
+  acts.append(edit, toggle, del);
+  row.appendChild(acts);
+  return row;
+}
+
+function openAgentForm(agentId) {
+  const form = $('agent-form');
+  if (!form) return;
+  const agent = S.agents.list.find((a) => a.id === agentId) || null;
+  S.agents.editing = agent ? agent.id : '';
+  $('agent-form-title').textContent = agent ? '编辑智能体' : '新建智能体';
+  $('agent-name').value = agent ? agent.name : '';
+  $('agent-role').value = agent ? agent.role : '';
+  $('agent-prompt').value = agent ? agent.systemPrompt : '';
+  $('agent-enabled').checked = agent ? agent.enabled : true;
+  // 新建默认勾选全部只读工具（与后端「缺省 = 全部只读」口径一致）。
+  renderAgentTools(agent ? agent.tools : null);
+  form.hidden = false;
+  $('agent-name').focus();
+}
+
+function renderAgentTools(selected) {
+  const box = $('agent-tools');
+  if (!box) return;
+  if (!S.agents.tools.length) {
+    box.replaceChildren(el('div', 'empty', '当前环境没有可用的只读工具。'));
+    return;
+  }
+  const picked = selected == null ? new Set(S.agents.tools) : new Set(selected);
+  box.replaceChildren(...S.agents.tools.map((name) => {
+    const label = el('label');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = name;
+    input.checked = picked.has(name);
+    label.append(input, document.createTextNode(name));
+    return label;
+  }));
+}
+
+async function saveAgent(event) {
+  if (event) event.preventDefault();
+  const name = ($('agent-name').value || '').trim();
+  if (!name) {
+    toast('名称不能为空', 'error');
+    return;
+  }
+  const tools = Array.from($('agent-tools').querySelectorAll('input:checked')).map((i) => i.value);
+  const profile = {
+    name,
+    role: ($('agent-role').value || '').trim(),
+    systemPrompt: $('agent-prompt').value || '',
+    tools,
+    enabled: $('agent-enabled').checked,
+  };
+  if (S.agents.editing) profile.id = S.agents.editing;
+  const btn = $('btn-agent-save');
+  btn.disabled = true;
+  try {
+    await api.post('/api/agents', { profile });
+    $('agent-form').hidden = true;
+    S.agents.editing = '';
+    toast('档案已保存', 'ok');
+    await refreshAgents();
+  } catch (err) {
+    toast(`保存失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function toggleAgent(agent) {
+  const profile = {
+    id: agent.id,
+    name: agent.name,
+    role: agent.role,
+    systemPrompt: agent.systemPrompt,
+    tools: agent.tools || [],
+    enabled: !agent.enabled,
+  };
+  try {
+    await api.post('/api/agents', { profile });
+    await refreshAgents();
+  } catch (err) {
+    toast(`操作失败：${err.message}`, 'error');
+  }
+}
+
+async function deleteAgent(agentId) {
+  if (!confirm('删除这条智能体档案？（已有讨论记录不受影响）')) return;
+  try {
+    await api.post('/api/agents/delete', { id: agentId });
+    if (S.agents.editing === agentId) {
+      $('agent-form').hidden = true;
+      S.agents.editing = '';
+    }
+    toast('已删除', 'ok');
+    await refreshAgents();
+  } catch (err) {
+    toast(`删除失败：${err.message}`, 'error');
+  }
+}
+
+/* ---- 讨论 ---- */
+
+function renderParticipantPicker() {
+  const box = $('disc-participants');
+  const select = $('disc-moderator');
+  if (!box || !select) return;
+  const usable = S.agents.list.filter((a) => a.enabled);
+  // 重新渲染时保留已勾选项与已选主持人（刷新档案列表不该把用户的选择清掉）。
+  const previous = new Set(Array.from(box.querySelectorAll('input:checked')).map((i) => i.value));
+  const prevHost = select.value;
+  if (!usable.length) {
+    box.replaceChildren(el('div', 'empty', '先创建智能体档案。'));
+    select.replaceChildren();
+    updateParticipantCount();
+    return;
+  }
+  box.replaceChildren(...usable.map((agent) => {
+    const label = el('label');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = agent.id;
+    input.checked = previous.has(agent.id);
+    input.addEventListener('change', updateParticipantCount);
+    label.append(input, document.createTextNode(agent.name));
+    return label;
+  }));
+  select.replaceChildren(...usable.map((agent) => {
+    const opt = document.createElement('option');
+    opt.value = agent.id;
+    opt.textContent = agent.name;
+    return opt;
+  }));
+  if (usable.some((a) => a.id === prevHost)) select.value = prevHost;
+  updateParticipantCount();
+}
+
+function updateParticipantCount() {
+  const box = $('disc-participants');
+  const badge = $('disc-participant-count');
+  if (!box || !badge) return;
+  badge.textContent = box.querySelectorAll('input:checked').length;
+}
+
+async function refreshDiscussions(silent) {
+  const list = $('disc-list');
+  try {
+    const res = await api.get('/api/discussions');
+    S.discussion.list = res.discussions || [];
+    S.discussion.activeId = String(res.activeId || '');
+    S.discussion.loaded = true;
+    renderDiscussions();
+  } catch (err) {
+    S.discussion.loaded = true;
+    if (!silent && list) list.replaceChildren(el('div', 'empty', '加载失败：' + err.message));
+  }
+}
+
+function renderDiscussions() {
+  const list = $('disc-list');
+  if (!list) return;
+  const badge = $('badge-discussions');
+  if (badge) badge.textContent = S.discussion.list.length;
+  const actBadge = $('act-badge-discussions');
+  if (actBadge) {
+    // 活动栏徽标只表示「有没有在跑的讨论」，历史条数留在侧栏里，不占活动栏。
+    actBadge.hidden = !S.discussion.activeId;
+    actBadge.textContent = '1';
+  }
+  if (!S.discussion.list.length) {
+    list.replaceChildren(el('div', 'empty', '暂无讨论记录。'));
+    return;
+  }
+  list.replaceChildren(...S.discussion.list.map(discussionRow));
+}
+
+function discussionRow(item) {
+  const row = el('div', 'disc-list-item');
+  if (item.id === S.discussion.openId) row.classList.add('is-active');
+  row.appendChild(el('div', 'disc-list-topic', item.topic || '（无议题）'));
+  const runner = item.id === S.discussion.activeId ? '｜进行中' : '';
+  row.appendChild(el('div', 'disc-list-meta',
+    `${DISC_STATE_LABELS[item.state] || item.state}｜${item.rounds || 0} 轮｜`
+    + `${(item.participants || []).length} 位${runner}`));
+  row.addEventListener('click', () => openDiscussion(item.id));
+  return row;
+}
+
+function makeRequestId() {
+  return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function startDiscussion() {
+  const topic = ($('disc-topic').value || '').trim();
+  if (!topic) { toast('先写个议题', 'error'); return; }
+  const box = $('disc-participants');
+  const participants = Array.from(box.querySelectorAll('input:checked')).map((i) => i.value);
+  if (participants.length < 2) { toast('至少选 2 位参与者', 'error'); return; }
+  const moderator = $('disc-moderator').value || '';
+  if (!moderator) { toast('必须指定主持人', 'error'); return; }
+  const maxRounds = Number($('disc-rounds').value || 2);
+  const btn = $('btn-disc-start');
+  btn.disabled = true;
+  try {
+    const res = await api.post('/api/discussions', {
+      topic, participants, moderator, maxRounds, requestId: makeRequestId(),
+    });
+    $('disc-topic').value = '';
+    S.discussion.openId = res.discussionId || '';
+    toast(res.reused ? '这场讨论已经开过，已为你打开' : '讨论已开始', 'ok');
+    await refreshDiscussions(true);
+    await openDiscussion(S.discussion.openId);
+  } catch (err) {
+    toast(`开始失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function openDiscussion(id, attempt) {
+  if (!id) return;
+  const retry = Number(attempt || 0);
+  try {
+    const res = await api.get(`/api/discussions/${id}`);
+    S.discussion.openId = id;
+    S.discussion.current = res;
+    renderDiscussion();
+    renderDiscussions();
+  } catch (err) {
+    // 刚点「开始讨论」时后台线程可能还没把首条记录落盘：短暂重试，
+    // 别把这种时序 404 当成错误弹给用户。
+    if (retry < 6 && /不存在|not found/i.test(String(err.message || ''))) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return openDiscussion(id, retry + 1);
+    }
+    toast(`加载讨论失败：${err.message}`, 'error');
+  }
+}
+
+function renderDiscussion() {
+  const live = $('disc-live');
+  if (!live) return;
+  const data = S.discussion.current;
+  if (!data) { live.hidden = true; return; }
+  live.hidden = false;
+  const state = data.state || 'running';
+  const running = state === 'running';
+  $('disc-live-topic').textContent = data.topic || '';
+  $('disc-live-state').textContent = DISC_STATE_LABELS[state] || state;
+  $('disc-live-state').className = `chip${running ? ' is-running' : ''}`;
+  $('disc-live-rounds').textContent = `${discRounds(data)}/${data.maxRounds || 0} 轮`;
+  $('btn-disc-stop').hidden = !running;
+  $('btn-disc-resume').hidden = running || state === 'consensus';
+  // 结论出口（E）：终态即可用 —— 没有汇总结论时后端会回退到立场依据清单，
+  // 仍在跑时置灰（后端对 running 一律 400）。
+  $('btn-disc-insert').disabled = running;
+  $('btn-disc-dispatch').disabled = running;
+  // 结论：进行中只提示等待；终态渲染最终答案（Markdown，与对话区同一个渲染器）。
+  const final = $('disc-final');
+  if (!data.finalAnswer) {
+    final.replaceChildren(el('span', 'empty', running ? '讨论进行中…' : '本场没有产生结论。'));
+  } else {
+    final.replaceChildren(render(data.finalAnswer));
+    if (data.summaryDegraded) {
+      final.appendChild(el('div', 'disc-turn-obs', '（汇总失败，已降级为规则合并）'));
+    }
+  }
+  renderFeed(data);
+}
+
+function renderFeed(data) {
+  const feed = $('disc-feed');
+  if (!feed) return;
+  S.discussion.cards = new Map();
+  S.discussion.streaming = null;
+  const turns = data.turns || [];
+  if (!turns.length) {
+    feed.replaceChildren(el('div', 'empty', '尚无发言。'));
+    return;
+  }
+  feed.replaceChildren(...turns.map((turn) => {
+    const card = buildTurnCard(turn);
+    S.discussion.cards.set(turn.turnId, card);
+    return card;
+  }));
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function buildTurnCard(turn) {
+  const card = el('div', `disc-turn ${stanceClass(turn.stance)}`);
+  const head = el('div', 'disc-turn-head');
+  head.appendChild(el('b', '', agentName(turn.agentId)));
+  head.appendChild(el('span', '', `第 ${turn.round || 1} 轮`));
+  head.appendChild(el('span', '', STANCE_LABELS[turn.stance] || turn.stance || ''));
+  if (turn.ok === false) head.appendChild(el('span', '', '失败'));
+  card.appendChild(head);
+  const body = el('div', 'disc-turn-body');
+  renderAnswerBody(body, turn.text || pointsText(turn) || '（无输出）');
+  card.appendChild(body);
+  if ((turn.evidence || []).length) {
+    card.appendChild(el('div', 'disc-turn-obs', evidenceText(turn.evidence)));
+  }
+  return card;
+}
+
+function stanceClass(stance) {
+  if (stance === 'agree') return 'is-agree';
+  if (stance === 'disagree') return 'is-disagree';
+  if (stance === 'revise') return 'is-revise';
+  return 'is-unknown';
+}
+
+function pointsText(turn) {
+  const points = turn.points || [];
+  return points.length ? points.map((p) => `- ${p}`).join('\n') : '';
+}
+
+/* detail 视图不带 rounds 字段（它在后端是方法，只有列表摘要带数值），
+   这里按已落盘发言的最大轮次算；还没发言时退回列表口径。 */
+function discRounds(data) {
+  const turns = data.turns || [];
+  if (!turns.length) return Number(data.rounds || 0);
+  return Math.max(...turns.map((turn) => Number(turn.round || 0)));
+}
+
+function agentName(agentId) {
+  const hit = S.agents.list.find((a) => a.id === agentId);
+  return hit ? hit.name : (agentId || '未知智能体');
+}
+
+function evidenceText(evidence) {
+  const items = evidence.map((item) => {
+    const path = String(item.path || '');
+    const line = Number(item.line || 0);
+    return line ? `${path}:${line}` : path;
+  }).filter(Boolean);
+  return items.length ? '证据：' + items.join(' · ') : '';
+}
+
+function appendSystemLine(text) {
+  const feed = $('disc-feed');
+  if (!feed) return;
+  feed.querySelectorAll('.empty').forEach((node) => node.remove());
+  const card = el('div', 'disc-turn is-system');
+  card.appendChild(el('div', 'disc-turn-body', text));
+  feed.appendChild(card);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function feedScroll() {
+  const feed = $('disc-feed');
+  if (!feed) return;
+  // 用户往回翻看历史时不硬拽到底部。
+  if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60) {
+    feed.scrollTop = feed.scrollHeight;
+  }
+}
+
+/* discussion.* 事件（M14-C）：与 run.* 分开 —— 讨论跑在后台线程里，不是 Agent 一轮。
+   只处理「用户正在看的那一场」的增量；其余事件只用来刷新列表与徽标。 */
+function applyDiscussionEvent(kind, ev) {
+  const id = String(ev.discussionId || '');
+  if (!id) return;
+  const viewing = id === S.discussion.openId;
+  if (!viewing) {
+    if (kind === 'started' || kind === 'finished' || kind === 'failed') refreshDiscussions(true);
+    return;
+  }
+  if (kind === 'started') {
+    openDiscussion(id);
+    refreshDiscussions(true);
+    return;
+  }
+  if (kind === 'round') {
+    $('disc-live-rounds').textContent = `第 ${ev.index || 0}/${ev.total || 0} 轮`;
+    appendSystemLine(`— 第 ${ev.index} 轮 —`);
+    return;
+  }
+  if (kind === 'turn_started') {
+    const feed = $('disc-feed');
+    if (!feed) return;
+    feed.querySelectorAll('.empty').forEach((node) => node.remove());
+    const card = el('div', 'disc-turn is-unknown');
+    const head = el('div', 'disc-turn-head');
+    head.appendChild(el('b', '', ev.name || agentName(ev.agentId)));
+    head.appendChild(el('span', '', `第 ${ev.round || 1} 轮`));
+    const note = el('span', '', '发言中…');
+    head.appendChild(note);
+    card.appendChild(head);
+    const body = el('div', 'disc-turn-body');
+    card.appendChild(body);
+    feed.appendChild(card);
+    S.discussion.streaming = {
+      turnId: `${id}/r${ev.round || 1}/${ev.agentId || ''}`, card, body, note, text: '',
+    };
+    feed.scrollTop = feed.scrollHeight;
+    return;
+  }
+  if (kind === 'delta') {
+    const stream = S.discussion.streaming;
+    if (!stream || stream.turnId !== ev.turnId) return;
+    stream.text += String(ev.text || '');
+    // 流式阶段先按纯文本滚动（Markdown 每增量重解析会闪烁）；收尾时整段重渲染。
+    stream.body.textContent = stream.text;
+    feedScroll();
+    return;
+  }
+  if (kind === 'agent_state') {
+    const stream = S.discussion.streaming;
+    if (!stream) return;
+    stream.note.textContent = ev.state === 'tool' ? `调用 ${ev.tool || '工具'}…` : '思考中…';
+    return;
+  }
+  if (kind === 'observe') {
+    const stream = S.discussion.streaming;
+    if (!stream) return;
+    const names = (ev.from || []).map(agentName).join('、');
+    // 观测内容本身不进事件（只报「谁看了谁、折了多少字」），这里也只展示元数据。
+    stream.card.querySelector('.disc-turn-obs')?.remove();
+    const obs = el('div', 'disc-turn-obs',
+      `已同步 ${names || '其他发言者'} 的要点（${Number(ev.chars || 0)} 字）`);
+    obs.dataset.role = 'observe';
+    stream.card.appendChild(obs);
+    return;
+  }
+  if (kind === 'turn') {
+    // 就地定稿这一条（事件已带 stance/points），避免「收尾重拉」把下一条的
+    // 流式卡片冲掉；若流式卡片已丢失（重连/被清理），再退回整场重拉。
+    const stream = S.discussion.streaming;
+    const turnId = `${id}/r${ev.round || 1}/${ev.agentId || ''}`;
+    if (!stream || stream.turnId !== turnId) {
+      openDiscussion(id);
+      return;
+    }
+    stream.card.className = `disc-turn ${stanceClass(ev.stance)}`;
+    const head = stream.card.querySelector('.disc-turn-head');
+    head.replaceChildren();
+    head.appendChild(el('b', '', agentName(ev.agentId)));
+    head.appendChild(el('span', '', `第 ${ev.round || 1} 轮`));
+    head.appendChild(el('span', '', STANCE_LABELS[ev.stance] || ev.stance || ''));
+    if (ev.ok === false) head.appendChild(el('span', '', '失败'));
+    renderAnswerBody(stream.body,
+      stream.text || pointsText({ points: ev.points }) || '（无输出）');
+    S.discussion.streaming = null;
+    feedScroll();
+    return;
+  }
+  if (kind === 'consensus') {
+    appendSystemLine(`已达成共识（${(ev.agreed || []).length} 条可核验依据）`);
+    return;
+  }
+  if (kind === 'interjection') {
+    const who = agentName(ev.from || '');
+    const verdict = ev.accepted ? '插话已受理' : '插话被拒绝';
+    const extra = ev.accepted ? '' : `（${ev.reason || '超出配额'}）`;
+    appendSystemLine(`${who} ${verdict}${extra}`);
+    return;
+  }
+  if (kind === 'message') {
+    const chars = Number(ev.chars || 0);
+    appendSystemLine(ev.delivered
+      ? `你的插话已送达（${chars} 字）`
+      : `你的插话已登记（${chars} 字），将在下一个模型边界送达`);
+    return;
+  }
+  if (kind === 'finished') {
+    openDiscussion(id);
+    refreshDiscussions(true);
+    const label = DISC_STATE_LABELS[ev.state] || ev.state || '已结束';
+    toast(`讨论结束：${label}`, ev.state === 'consensus' ? 'ok' : '');
+    return;
+  }
+  if (kind === 'failed') {
+    openDiscussion(id);
+    refreshDiscussions(true);
+    toast(`讨论异常结束：${ev.kind || 'error'}`, 'error');
+  }
+}
+
+async function stopDiscussion() {
+  const id = S.discussion.openId;
+  if (!id) return;
+  const btn = $('btn-disc-stop');
+  btn.disabled = true;
+  try {
+    await api.post(`/api/discussions/${id}/stop`, {});
+    toast('已请求停止，正在收尾…', 'ok');
+    await openDiscussion(id);
+  } catch (err) {
+    toast(`停止失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function resumeDiscussion() {
+  const id = S.discussion.openId;
+  if (!id) return;
+  const btn = $('btn-disc-resume');
+  btn.disabled = true;
+  try {
+    await api.post(`/api/discussions/${id}/resume`, {});
+    toast('已继续讨论', 'ok');
+    await openDiscussion(id);
+  } catch (err) {
+    toast(`继续失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function sendInterjection() {
+  const id = S.discussion.openId;
+  const input = $('disc-user-input');
+  const text = (input.value || '').trim();
+  if (!id || !text) return;
+  const btn = $('btn-disc-send');
+  btn.disabled = true;
+  try {
+    const res = await api.post(`/api/discussions/${id}/message`, { text });
+    input.value = '';
+    appendSystemLine(`你插了一句（${res.chars || text.length} 字），将在下一个模型边界送达`);
+  } catch (err) {
+    toast(`插话失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function copyConclusion() {
+  const data = S.discussion.current;
+  const text = data ? String(data.finalAnswer || '') : '';
+  if (!text) { toast('还没有结论可复制', 'error'); return; }
+  let ok = false;
+  if (navigator.clipboard) {
+    try {
+      ok = await Promise.race([
+        navigator.clipboard.writeText(text).then(() => true).catch(() => false),
+        new Promise((resolve) => setTimeout(() => resolve(false), 1500)),
+      ]);
+    } catch {
+      ok = false;
+    }
+  }
+  if (!ok) ok = legacyCopyText(text);
+  toast(ok ? '结论已复制' : '复制失败（浏览器拒绝了剪贴板访问）', ok ? 'ok' : 'error');
+}
+
+/* 结论出口（M14-E）：插入对话只写一条用户消息，不启动新一轮；下发任务
+   走与「发送」同一个 /api/run 通道，SSE 事件会把对话区与按钮状态带上。
+   两者都由后端做门控（讨论未开 / 还在跑 / 正忙都会报错），界面只做前置置灰。 */
+async function insertConclusion() {
+  const data = S.discussion.current;
+  const id = data && data.id;
+  if (!id) return;
+  const btn = $('btn-disc-insert');
+  btn.disabled = true;
+  try {
+    await api.post(`/api/discussions/${encodeURIComponent(id)}/insert`, {});
+    await restoreHistoryView();
+    toast('结论已插入对话', 'ok');
+  } catch (err) {
+    toast(`插入失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function dispatchConclusion() {
+  const data = S.discussion.current;
+  const id = data && data.id;
+  if (!id) return;
+  const btn = $('btn-disc-dispatch');
+  btn.disabled = true;
+  try {
+    await api.post(`/api/discussions/${encodeURIComponent(id)}/dispatch`, {});
+    toast('结论已作为任务下发', 'ok');
+  } catch (err) {
+    toast(`下发失败：${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 /* ═══════════════════════ 远程设备文件工作面（M11-E） ═══════════════════════
@@ -9723,6 +10438,28 @@ function bind() {
   // 定时任务（M10）：新建 / 刷新按钮（页签切换时也会刷新）
   $('btn-job-submit').addEventListener('click', submitJob);
   $('btn-job-refresh').addEventListener('click', refreshSchedules);
+  // 多智能体（M14-D）：档案表单 / 讨论操作。按钮只在门控开启时可见，
+  // 但这些监听器无条件绑定 —— 元素始终在文档里，隐藏不等于不存在。
+  $('btn-agent-new').addEventListener('click', () => openAgentForm(''));
+  $('btn-agent-cancel').addEventListener('click', () => {
+    $('agent-form').hidden = true;
+    S.agents.editing = '';
+  });
+  $('agent-form').addEventListener('submit', saveAgent);
+  $('btn-disc-start').addEventListener('click', startDiscussion);
+  $('btn-disc-refresh').addEventListener('click', () => refreshDiscussions());
+  $('btn-disc-stop').addEventListener('click', stopDiscussion);
+  $('btn-disc-resume').addEventListener('click', resumeDiscussion);
+  $('btn-disc-send').addEventListener('click', sendInterjection);
+  $('btn-disc-copy').addEventListener('click', copyConclusion);
+  $('btn-disc-insert').addEventListener('click', insertConclusion);
+  $('btn-disc-dispatch').addEventListener('click', dispatchConclusion);
+  $('disc-user-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      sendInterjection();
+    }
+  });
   // 远程设备工作面（M11-E）：连接 / 目录树 / 页签 / 编辑保存 / 审查
   bindRemote();
   $('mcp-f-transport').addEventListener('change', syncMcpTransportFields);

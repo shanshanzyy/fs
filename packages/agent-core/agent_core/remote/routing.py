@@ -40,7 +40,7 @@ from .roots import (
     is_ns_path,
     parse_ns_root,
 )
-from .store import RemoteStore, store_path_for
+from .store import RemoteStore, load_store
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查用，避免 tools ↔ remote 模块级成环
     from ..tools.base import ToolSpec
@@ -97,7 +97,7 @@ class RemoteRouter:
     def store(self) -> RemoteStore:
         with self._lock:
             if self._store is None:
-                self._store = RemoteStore.load(store_path_for(self.config))
+                self._store = load_store(self.config)
             return self._store
 
     def roots(self) -> list[RemoteRoot]:

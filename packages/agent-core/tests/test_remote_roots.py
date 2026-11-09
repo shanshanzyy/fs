@@ -128,6 +128,37 @@ class StoreRootsTest(unittest.TestCase):
         self.assertIn("roots", raw)
         self.assertEqual(raw["roots"][0]["connection"], "devbox")
 
+    def test_split_roots_file_keeps_list_clean(self) -> None:
+        """指定独立根文件时，连接清单里**不再写** roots，根只落它自己的文件。"""
+        roots_path = self.path.parent / "remote-roots.json"
+        store = RemoteStore.load(self.path, roots_path=roots_path)
+        store.upsert(make_conn())
+        store.add_root("devbox", "a")
+
+        main = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotIn("roots", main)
+        raw = json.loads(roots_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["version"], FORMAT_VERSION)
+        self.assertEqual([r["sub"] for r in raw["roots"]], ["a"])
+        self.assertEqual(
+            [r.sub for r in RemoteStore.load(self.path, roots_path=roots_path).roots],
+            ["a"],
+        )
+
+    def test_legacy_roots_read_only_inside_same_workspace(self) -> None:
+        """旧数据（roots 写在清单里）只在**同一工作区目录**下兼容读取；
+        清单被钉在别的工作区时一条都不读 —— 那是「打开新文件夹还挂着旧远端目录」。"""
+        store = self._seed()
+        store.add_root("devbox", "a")
+
+        same = self.path.parent / "remote-roots.json"
+        self.assertEqual(
+            [r.sub for r in RemoteStore.load(self.path, roots_path=same).roots], ["a"]
+        )
+
+        shared = Path(self._tmp.name) / "other" / ".vibe" / "remote-roots.json"
+        self.assertEqual(RemoteStore.load(self.path, roots_path=shared).roots, [])
+
     def test_duplicate_add_rejected(self) -> None:
         store = self._seed()
         store.add_root("devbox", "a")

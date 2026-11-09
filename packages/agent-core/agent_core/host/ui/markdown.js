@@ -160,11 +160,15 @@ function render(md) {
     const line = lines[i];
 
     // ---- 围栏代码 ----
-    const fence = line.match(/^\s*```(\w*)\s*$/);
+    // 语言名后面允许跟正文：` ```json {"a":1} ` 这种「围栏与内容同一行」的写法
+    // 在模型输出里很常见。这里必须吃掉整行，否则下面段落分支的排除条件
+    // （/^\s*```/）会把这一行挡在外面，外层 while 原地空转 —— 主线程假死。
+    const fence = line.match(/^\s*```\s*([A-Za-z0-9_+#.-]*)\s*(.*)$/);
     if (fence) {
       closeList();
       const lang = fence[1];
       const body = [];
+      if (fence[2]) body.push(fence[2]);
       i += 1;
       while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
         body.push(lines[i]); i += 1;
@@ -276,6 +280,9 @@ function render(md) {
       inline(p, lines[i]);
       i += 1;
     }
+    // 兜底：走到这里说明上一段分支都不认、段落也没吃这一行。必须强制消费，
+    // 否则外层 while 会永远停在同一个 i 上（浏览器主线程假死）。
+    if (!p.childNodes.length) { inline(p, line); i += 1; }
     root.appendChild(p);
   }
   return root;
